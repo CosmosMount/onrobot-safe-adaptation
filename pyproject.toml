@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-x"
+version = "0.1.0"
+description = "Reinforcement-learning algorithms and experiment runner for safe robot adaptation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Common runner and numerical dependencies.
+    "absl-py>=2.0",
+    "ml-collections>=0.1.1",
+    "numpy>=1.26",
+    "gymnasium[mujoco]>=1.0",
+
+    # PyTorch implementations and TensorBoard logging.
+    "torch>=2.1",
+    "tensorboard>=2.14",
+
+    # JAX/Flax implementations and checkpointing.
+    "jax>=0.6",
+    "flax>=0.10",
+    "optax>=0.2",
+    "orbax-checkpoint>=0.11",
+    "dm-tree>=0.1.8",
+
+    # Experiment tracking. Algorithms import wandb even when tracking is disabled.
+    "wandb>=0.18",
+]
+
+[tool.setuptools.packages.find]
+include = ["rl_x*"]
