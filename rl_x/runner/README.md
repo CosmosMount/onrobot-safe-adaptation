@@ -22,8 +22,8 @@
 **runner.py**
 - Parses all configs to run an experiment
 - Sets the default algorithm, environment and runner mode
-    - Default algorithm: ```ppo.pytorch```
-    - Default environment: ```gym.mujoco.humanoid_v4```
+    - Default algorithm: ```ppo.flax```
+    - Default environment: none; pass ```--environment.name=<registered_environment>```
     - Default runner mode: ```train```
 
 

@@ -9,24 +9,23 @@ description = "Reinforcement-learning algorithms and experiment runner for safe 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    # Common runner and numerical dependencies.
+    # Runner and environment interfaces shared by all targets.
     "absl-py>=2.0",
     "ml-collections>=0.1.1",
     "numpy>=1.26",
-    "gymnasium[mujoco]>=1.0",
+]
 
-    # PyTorch implementations and TensorBoard logging.
-    "torch>=2.1",
-    "tensorboard>=2.14",
-
-    # JAX/Flax implementations and checkpointing.
+[project.optional-dependencies]
+mujoco = [
+    "mujoco>=3.1",
+]
+inference = [
     "jax>=0.6",
     "flax>=0.10",
     "optax>=0.2",
     "orbax-checkpoint>=0.11",
     "dm-tree>=0.1.8",
-
-    # Experiment tracking. Algorithms import wandb even when tracking is disabled.
+    # Current RL-X Flax algorithms import wandb at module import time.
     "wandb>=0.18",
 ]
 

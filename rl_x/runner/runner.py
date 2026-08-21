@@ -23,8 +23,8 @@ from rl_x.environments.environment_manager import get_environment_config, get_en
 from rl_x.environments.simulation_type import SimulationType
 from rl_x.algorithms.deep_learning_framework_type import DeepLearningFrameworkType
 
-DEFAULT_ALGORITHM = "ppo.pytorch"
-DEFAULT_ENVIRONMENT = "gym.mujoco.humanoid_v4"
+DEFAULT_ALGORITHM = "ppo.flax"
+DEFAULT_ENVIRONMENT = None
 DEFAULT_RUNNER_MODE = "train"
 
 # Silence jax logging
@@ -100,10 +100,6 @@ class Runner:
         algorithm_uses_jax = DeepLearningFrameworkType.JAX == algorithm_general_properties.deep_learning_framework_type
         environment_uses_jax = SimulationType.JAX_BASED == environment_general_properties.simulation_type
         environment_uses_torch = SimulationType.ISAAC_LAB == environment_general_properties.simulation_type or SimulationType.MANISKILL == environment_general_properties.simulation_type or SimulationType.WARP == environment_general_properties.simulation_type
-
-        import gymnasium as gym
-        # Silences the box bound precision warning for cartpole
-        gym.logger.set_level(40)
 
         if algorithm_uses_torch:  
             # Avoids warning when TensorFloat32 is available
@@ -219,6 +215,9 @@ class Runner:
             del sys.argv[sys.argv.index("--environment.name=" + environment_name)]
         else:
             environment_name = DEFAULT_ENVIRONMENT
+
+        if environment_name is None:
+            raise ValueError("No default environment is configured. Pass --environment.name=<registered_jax_environment>.")
         
         if runner_mode:
             runner_mode = runner_mode[0].split("=")[1]
