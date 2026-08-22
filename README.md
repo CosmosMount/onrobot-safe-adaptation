@@ -21,8 +21,8 @@ python -m pip install "isaacsim[all,extscache]==5.1.0" \
   --extra-index-url https://pypi.nvidia.com
 
 git clone --depth 1 --branch v2.3.2 \
-  https://github.com/isaac-sim/IsaacLab.git ../IsaacLab-v2.3.2
-cd ../IsaacLab-v2.3.2
+  https://github.com/isaac-sim/IsaacLab.git /opt/IsaacLab-v2.3.2
+cd /opt/IsaacLab-v2.3.2
 ./isaaclab.sh -i
 
 cd /path/to/onrobot-safe-adaptation
