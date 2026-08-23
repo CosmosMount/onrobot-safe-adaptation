@@ -1,5 +1,7 @@
-tests/
-_tests/
 .pytest_cache/
+_tests/
 __pycache__/
 *.egg-info/
+runs/
+*.sock
+*.log

@@ -26,6 +26,19 @@ from rl_x.algorithms.qsafe.common import (
     validate_safety_rollout_environment,
 )
 from rl_x.algorithms.qsafe.flax import QSafe
+from rl_x.algorithms.qsafe.flax.projection import resolve_action_projectors
+from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
+    load_policy_artifact,
+    make_native_policy_artifact,
+    validate_policy_contract,
+)
+from rl_x.algorithms.sac_qsafe.flax.distributions import (
+    squashed_gaussian_log_probability,
+)
+from rl_x.algorithms.sac_qsafe.flax.observation_normalizer import (
+    ObservationNormalizer,
+)
+from rl_x.environments.safety_rollout import InvalidTransitionError
 
 rlx_logger = logging.getLogger("rl_x")
 
@@ -102,6 +115,23 @@ class SAC_QSafe:
         self.env_as_low = self.train_env.single_action_space.low
         self.env_as_high = self.train_env.single_action_space.high
 
+        self.observation_normalizer = ObservationNormalizer(
+            self.train_env.single_observation_space.shape[0],
+            enabled=bool(config.algorithm.enable_observation_normalization),
+            epsilon=float(config.algorithm.normalizer_epsilon),
+        )
+        (
+            self._jax_project_actions,
+            self._host_project_actions,
+            self._projector_is_jax,
+        ) = resolve_action_projectors(self.train_env)
+        if self._host_project_actions is not None and not self._projector_is_jax:
+            rlx_logger.warning(
+                "Environment project_actions is NumPy-only. Rollout candidates "
+                "will be projected on the host, while differentiable SAC actor "
+                "and target kernels must use identity projection."
+            )
+
         self.policy, self.get_processed_action = get_policy(config, self.train_env)
         self.critic = get_critic(config, self.train_env)
         
@@ -158,6 +188,23 @@ class SAC_QSafe:
         )
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
+            self.observation_normalizer.freeze()
+
+        self._build_action_kernels()
+        self._warm_up_action_kernels()
+
+        self._learner_deadline_seconds = None
+        for owner in (self.train_env, getattr(self.train_env, "config", None)):
+            if owner is None:
+                continue
+            for attribute in ("policy_period_seconds", "control_dt"):
+                value = getattr(owner, attribute, None)
+                if value is not None and float(value) > 0:
+                    self._learner_deadline_seconds = float(value)
+                    break
+            if self._learner_deadline_seconds is not None:
+                break
+        self._deadline_misses = 0
 
         if self.save_model:
             os.makedirs(self.save_path, exist_ok=True)
@@ -167,42 +214,190 @@ class SAC_QSafe:
     def _load_pretrained_policy(self, file_path):
         if not file_path:
             raise ValueError("algorithm.pretrained_policy_path is required for finetune.")
-        with open(file_path, "rb") as policy_file:
-            params = serialization.from_bytes(self.policy_state.params, policy_file.read())
-        self.policy_state = self.policy_state.replace(params=params)
-
-    def _sample_unconstrained_action(self, states):
-        states = jnp.asarray(states, dtype=jnp.float32)
-        action_mean, action_logstd = self.policy.apply(self.policy_state.params, states)
-        self.key, action_key = jax.random.split(self.key)
-        actions = jnp.tanh(
-            action_mean
-            + jnp.exp(action_logstd)
-            * jax.random.normal(action_key, shape=action_mean.shape)
+        artifact = load_policy_artifact(
+            file_path,
+            self.policy_state.params,
+            self.train_env.single_observation_space.shape[0],
+            self.train_env.single_action_space.shape[0],
         )
+        self.policy_state = self.policy_state.replace(
+            params=artifact["policy_params"]
+        )
+        self.observation_normalizer.load_state_dict(
+            artifact["normalizer_state"], artifact["normalizer_metadata"]
+        )
+        if not hasattr(self.train_env, "validate_checkpoint_manifest"):
+            raise ValueError(
+                "Fine-tuning environment must validate the policy checkpoint manifest"
+            )
+        self.train_env.validate_checkpoint_manifest(
+            artifact["environment_manifest"], self.observation_normalizer.metadata()
+        )
+        self.observation_normalizer.freeze()
+
+    @staticmethod
+    def _normalize_kernel(states, mean, std, epsilon):
+        return (states - mean) / (std + epsilon)
+
+    def _project_flat_candidates(self, raw_states, candidate_actions):
+        nr_envs, nr_candidates = candidate_actions.shape[:2]
+        repeated_states = jnp.repeat(raw_states[:, None, :], nr_candidates, axis=1)
+        projected = self._jax_project_actions(
+            repeated_states.reshape((nr_envs * nr_candidates, -1)),
+            candidate_actions.reshape((nr_envs * nr_candidates, -1)),
+        )
+        return projected.reshape(candidate_actions.shape)
+
+    def _build_action_kernels(self):
+        def unconstrained(params, raw_states, mean, std, epsilon, key):
+            states = self._normalize_kernel(raw_states, mean, std, epsilon)
+            action_mean, action_logstd = self.policy.apply(params, states)
+            key, action_key = jax.random.split(key)
+            actions = jnp.tanh(
+                action_mean
+                + jnp.exp(action_logstd)
+                * jax.random.normal(action_key, shape=action_mean.shape)
+            )
+            actions = self._jax_project_actions(raw_states, actions)
+            return actions, key
+
+        def candidates(params, raw_states, mean, std, epsilon, key):
+            states = self._normalize_kernel(raw_states, mean, std, epsilon)
+            action_mean, action_logstd = self.policy.apply(params, states)
+            action_mean = jnp.repeat(
+                action_mean[:, None, :], self.qsafe.candidate_actions, axis=1
+            )
+            action_logstd = jnp.repeat(
+                action_logstd[:, None, :], self.qsafe.candidate_actions, axis=1
+            )
+            key, action_key, selection_key = jax.random.split(key, 3)
+            action_std = jnp.exp(action_logstd)
+            pretanh = action_mean + action_std * jax.random.normal(
+                action_key, shape=action_mean.shape
+            )
+            candidate_actions = jnp.tanh(pretanh)
+            candidate_actions = self._project_flat_candidates(
+                raw_states, candidate_actions
+            )
+            log_probs = squashed_gaussian_log_probability(
+                pretanh, action_mean, action_logstd
+            )
+            return states, candidate_actions, log_probs, key, selection_key
+
+        self._unconstrained_action_jit = jax.jit(unconstrained)
+        self._candidate_distribution_jit = jax.jit(candidates)
+
+    def _normalizer_parameters(self):
+        return self.observation_normalizer.parameters()
+
+    def _warm_up_action_kernels(self):
+        nr_envs = int(self.nr_envs)
+        dummy_states = jnp.zeros(
+            (nr_envs,) + tuple(self.train_env.single_observation_space.shape),
+            dtype=jnp.float32,
+        )
+        mean, std, epsilon = self._normalizer_parameters()
+        rlx_logger.info("Compiling Flax policy and QSafe action kernels before rollout")
+        actions, _ = self._unconstrained_action_jit(
+            self.policy_state.params,
+            dummy_states,
+            mean,
+            std,
+            epsilon,
+            self.key,
+        )
+        states, candidates, log_probs, _, selection_key = (
+            self._candidate_distribution_jit(
+                self.policy_state.params,
+                dummy_states,
+                mean,
+                std,
+                epsilon,
+                self.key,
+            )
+        )
+        select = (
+            self.qsafe._select_pretrain_jit
+            if self.phase == "pretrain"
+            else self.qsafe._select_finetune_jit
+        )
+        selected, _, _ = select(
+            self.qsafe.state.params,
+            states,
+            candidates,
+            log_probs,
+            selection_key,
+        )
+        jax.block_until_ready((actions, selected))
+
+    def _host_project(self, raw_states, actions):
+        if self._projector_is_jax or self._host_project_actions is None:
+            return actions
+        return jnp.asarray(
+            self._host_project_actions(
+                np.asarray(raw_states, dtype=np.float32), jax.device_get(actions)
+            ),
+            dtype=jnp.float32,
+        )
+
+    def _sample_unconstrained_action(self, states, update_normalizer=False):
+        if update_normalizer:
+            self.observation_normalizer.update(states)
+        raw_states = jnp.asarray(states, dtype=jnp.float32)
+        mean, std, epsilon = self._normalizer_parameters()
+        actions, self.key = self._unconstrained_action_jit(
+            self.policy_state.params,
+            raw_states,
+            mean,
+            std,
+            epsilon,
+            self.key,
+        )
+        actions = self._host_project(states, actions)
         return actions, self.get_processed_action(actions)
 
     def _sample_policy_candidates(self, states, phase=None):
-        states = jnp.asarray(states, dtype=jnp.float32)
-        nr_candidates = self.qsafe.candidate_actions
-        action_mean, action_logstd = self.policy.apply(self.policy_state.params, states)
-        action_mean = jnp.repeat(action_mean[:, None, :], nr_candidates, axis=1)
-        action_logstd = jnp.repeat(action_logstd[:, None, :], nr_candidates, axis=1)
-        self.key, action_key = jax.random.split(self.key)
-        action_std = jnp.exp(action_logstd)
-        pretanh = action_mean + action_std * jax.random.normal(
-            action_key, shape=action_mean.shape
+        raw_states = jnp.asarray(states, dtype=jnp.float32)
+        mean, std, epsilon = self._normalizer_parameters()
+        (
+            normalized_states,
+            candidate_actions,
+            log_probs,
+            self.key,
+            selection_key,
+        ) = self._candidate_distribution_jit(
+            self.policy_state.params,
+            raw_states,
+            mean,
+            std,
+            epsilon,
+            self.key,
         )
-        candidate_actions = jnp.tanh(pretanh)
-        log_probs = (
-            -0.5 * ((pretanh - action_mean) / action_std) ** 2
-            - 0.5 * jnp.log(2.0 * jnp.pi)
-            - action_logstd
-        )
-        log_probs -= jnp.log(1.0 - candidate_actions ** 2 + 1e-6)
-        log_probs = jnp.sum(log_probs, axis=-1)
-        selected_actions, _, metrics = self.qsafe.select_safe_action(
-            states, candidate_actions, log_probs, phase or self.phase
+        if not self._projector_is_jax and self._host_project_actions is not None:
+            nr_envs, nr_candidates = candidate_actions.shape[:2]
+            repeated_states = np.repeat(
+                np.asarray(states, dtype=np.float32)[:, None, :], nr_candidates, axis=1
+            )
+            projected = self._host_project_actions(
+                repeated_states.reshape((nr_envs * nr_candidates, -1)),
+                jax.device_get(candidate_actions).reshape((nr_envs * nr_candidates, -1)),
+            )
+            candidate_actions = jnp.asarray(projected, dtype=jnp.float32).reshape(
+                candidate_actions.shape
+            )
+        phase = phase or self.phase
+        if phase == "pretrain":
+            select = self.qsafe._select_pretrain_jit
+        elif phase == "finetune":
+            select = self.qsafe._select_finetune_jit
+        else:
+            raise ValueError(f"Unknown SQRL phase: {phase}")
+        selected_actions, _, metrics = select(
+            self.qsafe.state.params,
+            normalized_states,
+            candidate_actions,
+            log_probs,
+            selection_key,
         )
         return selected_actions, self.get_processed_action(selected_actions), metrics
         
@@ -212,20 +407,41 @@ class SAC_QSafe:
         def update(
                 policy_state: TrainState, critic_state: RLTrainState, entropy_coefficient_state: TrainState,
                 states: np.ndarray, next_states: np.ndarray, actions: np.ndarray, rewards: np.ndarray, terminations: np.ndarray,
-                qsafe_params: flax.core.FrozenDict, nu: float, key: jax.random.PRNGKey
+                normalizer_mean: np.ndarray, normalizer_std: np.ndarray,
+                normalizer_epsilon: float, qsafe_params: flax.core.FrozenDict,
+                nu: float, key: jax.random.PRNGKey
             ):
+            raw_states = jnp.asarray(states, dtype=jnp.float32)
+            raw_next_states = jnp.asarray(next_states, dtype=jnp.float32)
+            states = self._normalize_kernel(
+                raw_states, normalizer_mean, normalizer_std, normalizer_epsilon
+            )
+            next_states = self._normalize_kernel(
+                raw_next_states,
+                normalizer_mean,
+                normalizer_std,
+                normalizer_epsilon,
+            )
+
             def loss_fn(policy_params: flax.core.FrozenDict, critic_params: flax.core.FrozenDict, entropy_coefficient_params: flax.core.FrozenDict,
-                        state: np.ndarray, next_state: np.ndarray, action: np.ndarray, reward: np.ndarray, terminated: np.ndarray,
+                        state: np.ndarray, next_state: np.ndarray,
+                        raw_state: np.ndarray, raw_next_state: np.ndarray,
+                        action: np.ndarray, reward: np.ndarray, terminated: np.ndarray,
                         key1: jax.random.PRNGKey, key2: jax.random.PRNGKey
                 ):
                 # Critic loss
                 next_action_mean, next_action_logstd = self.policy.apply(stop_gradient(policy_params), next_state)
                 next_action_std = jnp.exp(next_action_logstd)
                 next_action_pretanh = next_action_mean + next_action_std * jax.random.normal(key1, shape=next_action_mean.shape)
-                next_action = jnp.tanh(next_action_pretanh)
-                next_log_prob = -0.5 * ((next_action_pretanh - next_action_mean) / next_action_std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - next_action_logstd
-                next_log_prob -= jnp.log(1.0 - next_action ** 2 + 1e-6)
-                next_log_prob = jnp.sum(next_log_prob, axis=-1)
+                next_policy_action = jnp.tanh(next_action_pretanh)
+                next_action = self._jax_project_actions(
+                    raw_next_state[None, :], next_policy_action[None, :]
+                )[0]
+                next_log_prob = squashed_gaussian_log_probability(
+                    next_action_pretanh,
+                    next_action_mean,
+                    next_action_logstd,
+                )
 
                 alpha_with_grad = self.entropy_coefficient.apply(entropy_coefficient_params)
                 alpha = stop_gradient(alpha_with_grad)
@@ -242,10 +458,15 @@ class SAC_QSafe:
                 current_action_mean, current_action_logstd = self.policy.apply(policy_params, state)
                 current_action_std = jnp.exp(current_action_logstd)
                 current_action_pretanh = current_action_mean + current_action_std * jax.random.normal(key2, shape=current_action_mean.shape)
-                current_action = jnp.tanh(current_action_pretanh)
-                current_log_prob = -0.5 * ((current_action_pretanh - current_action_mean) / current_action_std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - current_action_logstd
-                current_log_prob -= jnp.log(1.0 - current_action ** 2 + 1e-6)
-                current_log_prob = jnp.sum(current_log_prob, axis=-1)
+                current_policy_action = jnp.tanh(current_action_pretanh)
+                current_action = self._jax_project_actions(
+                    raw_state[None, :], current_policy_action[None, :]
+                )[0]
+                current_log_prob = squashed_gaussian_log_probability(
+                    current_action_pretanh,
+                    current_action_mean,
+                    current_action_logstd,
+                )
                 entropy = stop_gradient(-current_log_prob)
 
                 q = self.critic.apply(stop_gradient(critic_params), state, current_action)
@@ -281,7 +502,11 @@ class SAC_QSafe:
                 return loss, (metrics)
             
 
-            vmap_loss_fn = jax.vmap(loss_fn, in_axes=(None, None, None, 0, 0, 0, 0, 0, 0, 0), out_axes=0)
+            vmap_loss_fn = jax.vmap(
+                loss_fn,
+                in_axes=(None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                out_axes=0,
+            )
             safe_mean = lambda x: jnp.mean(x) if x is not None else x
             mean_vmapped_loss_fn = lambda *a, **k: tree.map_structure(safe_mean, vmap_loss_fn(*a, **k))
             grad_loss_fn = jax.value_and_grad(mean_vmapped_loss_fn, argnums=(0, 1, 2), has_aux=True)
@@ -291,7 +516,8 @@ class SAC_QSafe:
 
             (loss, (metrics)), (policy_gradients, critic_gradients, entropy_gradients) = grad_loss_fn(
                 policy_state.params, critic_state.params, entropy_coefficient_state.params,
-                states, next_states, actions, rewards, terminations, keys1, keys2)
+                states, next_states, raw_states, raw_next_states, actions, rewards,
+                terminations, keys1, keys2)
 
             policy_state = policy_state.apply_gradients(grads=policy_gradients)
             critic_state = critic_state.apply_gradients(grads=critic_gradients)
@@ -307,6 +533,35 @@ class SAC_QSafe:
 
             return policy_state, critic_state, entropy_coefficient_state, metrics, key
         
+
+        rlx_logger.info("Compiling Flax SAC learner kernel before rollout")
+        dummy_states = jnp.zeros(
+            (self.batch_size,) + tuple(self.train_env.single_observation_space.shape),
+            dtype=jnp.float32,
+        )
+        dummy_actions = jnp.zeros(
+            (self.batch_size,) + tuple(self.train_env.single_action_space.shape),
+            dtype=jnp.float32,
+        )
+        dummy_scalars = jnp.zeros((self.batch_size,), dtype=jnp.float32)
+        mean, std, epsilon = self._normalizer_parameters()
+        warm_result = update(
+            self.policy_state,
+            self.critic_state,
+            self.entropy_coefficient_state,
+            dummy_states,
+            dummy_states,
+            dummy_actions,
+            dummy_scalars,
+            dummy_scalars,
+            mean,
+            std,
+            epsilon,
+            self.qsafe.state.params,
+            self.nu,
+            self.key,
+        )
+        jax.block_until_ready(warm_result[3])
 
         self.set_train_mode()
 
@@ -359,16 +614,36 @@ class SAC_QSafe:
                     acting_state, phase="finetune"
                 )
             else:
-                action, processed_action = self._sample_unconstrained_action(acting_state)
+                action, processed_action = self._sample_unconstrained_action(
+                    acting_state, update_normalizer=True
+                )
                 action_safety_metrics = None
             if action_safety_metrics is not None:
                 for key, value in action_safety_metrics.items():
                     safety_metrics_collection.setdefault(key, []).append(value)
             
-            next_state, reward, terminated, truncated, info = interaction_env.step(
-                jax.device_get(processed_action)
-            )
+            try:
+                next_state, reward, terminated, truncated, info = interaction_env.step(
+                    jax.device_get(processed_action)
+                )
+            except InvalidTransitionError as exc:
+                rlx_logger.warning(
+                    "Discarding invalid environment transition: %s", exc
+                )
+                recovered_state, _ = interaction_env.reset()
+                if is_safety_step:
+                    safety_state = recovered_state
+                    safety_collector = CompletedTrajectoryCollector(
+                        self.nr_envs, self.n_safe
+                    )
+                else:
+                    state = recovered_state
+                continue
             failure = extract_failure_signal(info, terminated, self.nr_envs)
+            host_action = jax.device_get(action)
+            applied_action = np.asarray(
+                info.get("applied_action", host_action), dtype=np.float32
+            ).reshape(host_action.shape)
             done = terminated | truncated
             actual_next_state = next_state.copy()
             for i, single_done in enumerate(done):
@@ -387,12 +662,11 @@ class SAC_QSafe:
                 for key, info_value in self.train_env.get_logging_info_dict(info).items():
                     step_info_collection.setdefault(key, []).extend(info_value)
 
-            host_action = jax.device_get(action)
             if is_safety_step:
                 completed_trajectories = safety_collector.add_step(
                     acting_state,
                     actual_next_state,
-                    host_action,
+                    applied_action,
                     failure,
                     terminated,
                     truncated,
@@ -420,7 +694,9 @@ class SAC_QSafe:
                 else:
                     safety_state = next_state
             else:
-                offline_replay_buffer.add(state, actual_next_state, host_action, reward, terminated)
+                offline_replay_buffer.add(
+                    state, actual_next_state, applied_action, reward, terminated
+                )
                 global_step += self.nr_envs
                 nr_episodes += dones_this_rollout
                 nr_failures += int(np.sum(failure))
@@ -473,6 +749,8 @@ class SAC_QSafe:
 
             # Optimizing - Q-functions, policy and entropy coefficient
             if should_optimize:
+                learner_start_time = time.perf_counter()
+                mean, std, epsilon = self._normalizer_parameters()
                 self.policy_state, self.critic_state, self.entropy_coefficient_state, optimization_metrics, self.key = update(
                     self.policy_state,
                     self.critic_state,
@@ -482,10 +760,31 @@ class SAC_QSafe:
                     batch_actions,
                     batch_rewards,
                     batch_terminations,
+                    mean,
+                    std,
+                    epsilon,
                     self.qsafe.state.params,
                     self.nu,
                     self.key,
                 )
+                jax.block_until_ready(optimization_metrics)
+                learner_update_time = time.perf_counter() - learner_start_time
+                optimization_metrics["time/learner_update_time"] = learner_update_time
+                if self._learner_deadline_seconds is not None:
+                    missed_deadline = float(
+                        learner_update_time > self._learner_deadline_seconds
+                    )
+                    optimization_metrics["time/learner_deadline_miss"] = missed_deadline
+                    if missed_deadline:
+                        self._deadline_misses += 1
+                        if self._deadline_misses == 1 or self._deadline_misses % 100 == 0:
+                            rlx_logger.warning(
+                                "Flax learner update %.6fs exceeded control deadline "
+                                "%.6fs (%d misses)",
+                                learner_update_time,
+                                self._learner_deadline_seconds,
+                                self._deadline_misses,
+                            )
                 if self.phase == "finetune":
                     safety_value = float(optimization_metrics["qsafe/actor_value"])
                     nu_before_update = jnp.asarray(self.nu, dtype=jnp.float32)
@@ -524,7 +823,12 @@ class SAC_QSafe:
                     )
 
                 for _ in range(self.qsafe_updates_per_iteration):
-                    qsafe_metrics = self.qsafe.update(sample_unconstrained_action)
+                    qsafe_metrics = self.qsafe.update(
+                        sample_unconstrained_action,
+                        state_transform=lambda value: self.observation_normalizer.normalize(
+                            value, update=False
+                        ),
+                    )
                     for key, value in qsafe_metrics.items():
                         safety_metrics_collection.setdefault(key, []).append(value)
             
@@ -539,7 +843,16 @@ class SAC_QSafe:
                 eval_nr_episodes = 0
                 while True:
                     _, eval_processed_action, _ = self._sample_policy_candidates(eval_state)
-                    eval_state, eval_reward, eval_terminated, eval_truncated, eval_info = self.eval_env.step(jax.device_get(eval_processed_action))
+                    try:
+                        eval_state, eval_reward, eval_terminated, eval_truncated, eval_info = self.eval_env.step(
+                            jax.device_get(eval_processed_action)
+                        )
+                    except InvalidTransitionError as exc:
+                        rlx_logger.warning(
+                            "Discarding invalid evaluation transition: %s", exc
+                        )
+                        eval_state, _ = self.eval_env.reset()
+                        continue
                     eval_failure = extract_failure_signal(
                         eval_info, eval_terminated, self.nr_envs
                     )
@@ -656,6 +969,22 @@ class SAC_QSafe:
 
 
     def save(self, model_file_name="best.model"):
+        if not hasattr(self.train_env, "checkpoint_manifest"):
+            raise ValueError(
+                "SAC-QSafe environments must provide checkpoint_manifest()"
+            )
+        normalizer_state = self.observation_normalizer.state_dict()
+        normalizer_metadata = self.observation_normalizer.metadata()
+        environment_manifest = self.train_env.checkpoint_manifest(
+            normalizer_metadata
+        )
+        validate_policy_contract(
+            normalizer_state,
+            normalizer_metadata,
+            environment_manifest,
+            self.train_env.single_observation_space.shape[0],
+            self.train_env.single_action_space.shape[0],
+        )
         checkpoint = {
             "policy": self.policy_state,
             "critic": self.critic_state,
@@ -668,13 +997,25 @@ class SAC_QSafe:
             "config_algorithm": self.config.algorithm.to_dict(),
             "checkpoint": serialization.to_state_dict(checkpoint),
             "qsafe_metadata": self.qsafe.metadata(),
+            "normalizer_state": normalizer_state,
+            "normalizer_metadata": normalizer_metadata,
+            "environment_manifest": environment_manifest,
         }
         model_file_path = os.path.join(self.save_path, model_file_name)
         with open(model_file_path, "wb") as model_file:
             model_file.write(serialization.msgpack_serialize(payload))
 
         with open(f"{self.save_path}/policy.msgpack", "wb") as policy_file:
-            policy_file.write(serialization.to_bytes(self.policy_state.params))
+            policy_file.write(
+                serialization.msgpack_serialize(
+                    make_native_policy_artifact(
+                        self.policy_state.params,
+                        normalizer_state,
+                        normalizer_metadata,
+                        environment_manifest,
+                    )
+                )
+            )
         with open(f"{self.save_path}/task_critic.msgpack", "wb") as critic_file:
             critic_file.write(serialization.to_bytes(self.critic_state))
         self.qsafe.save(
@@ -704,6 +1045,35 @@ class SAC_QSafe:
                 "cannot be safely resumed."
             )
         model.qsafe._validate_metadata(payload["qsafe_metadata"])
+        transfer_fields = {
+            "normalizer_state",
+            "normalizer_metadata",
+            "environment_manifest",
+        }
+        missing = transfer_fields.difference(payload)
+        if missing:
+            raise ValueError(
+                "The Flax SAC-QSafe checkpoint is missing transfer contract "
+                f"fields: {sorted(missing)}"
+            )
+        validate_policy_contract(
+            payload["normalizer_state"],
+            payload["normalizer_metadata"],
+            payload["environment_manifest"],
+            train_env.single_observation_space.shape[0],
+            train_env.single_action_space.shape[0],
+        )
+        model.observation_normalizer.load_state_dict(
+            payload["normalizer_state"], payload["normalizer_metadata"]
+        )
+        if not hasattr(train_env, "validate_checkpoint_manifest"):
+            raise ValueError(
+                "SAC-QSafe environment must validate the checkpoint manifest"
+            )
+        train_env.validate_checkpoint_manifest(
+            payload["environment_manifest"],
+            model.observation_normalizer.metadata(),
+        )
 
         target = {
             "policy": model.policy_state,
@@ -721,6 +1091,7 @@ class SAC_QSafe:
         model.qsafe.state = checkpoint["qsafe"]
         if model.phase == "finetune":
             model.qsafe.freeze()
+            model.observation_normalizer.freeze()
         model.nu = float(checkpoint["nu"])
         model.dual_optimizer_state = checkpoint["dual_optimizer_state"]
 
@@ -735,7 +1106,17 @@ class SAC_QSafe:
             state, _ = self.eval_env.reset()
             while not done:
                 _, processed_action, _ = self._sample_policy_candidates(state)
-                state, reward, terminated, truncated, info = self.eval_env.step(jax.device_get(processed_action))
+                try:
+                    state, reward, terminated, truncated, info = self.eval_env.step(
+                        jax.device_get(processed_action)
+                    )
+                except InvalidTransitionError as exc:
+                    rlx_logger.warning(
+                        "Discarding invalid evaluation transition: %s", exc
+                    )
+                    state, _ = self.eval_env.reset()
+                    episode_return = 0
+                    continue
                 extract_failure_signal(info, terminated, self.nr_envs)
                 done = terminated | truncated
                 episode_return += reward

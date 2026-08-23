@@ -22,7 +22,12 @@ def get_config(algorithm_name):
     config.log_std_min = -20
     config.log_std_max = 2
     config.nr_hidden_units = 256
-    config.logging_frequency = 300
+    config.enable_observation_normalization = True
+    config.normalizer_epsilon = 1e-8
+    # Frequencies are measured in task transitions. With hundreds of parallel
+    # environments, logging every few hundred transitions would mean printing
+    # almost every vector step.
+    config.logging_frequency = 50000
     config.evaluation_frequency = -1
     config.evaluation_episodes = 10
 
@@ -34,6 +39,13 @@ def get_config(algorithm_name):
     # n_safe complete safety-constrained trajectories per pretrain iteration.
     config.n_off = 1
     config.n_safe = 1
+    config.rollout_mode = "serial_reference"  # serial_reference, partitioned
+    config.checkpoint_frequency = 50000
+    # Task gradient updates per newly committed task transition. Fractional
+    # values are accumulated as credit, making the budget independent of pool
+    # size. ``qsafe.updates_per_iteration`` remains the single QSafe control and
+    # means updates per atomically completed trajectory in partitioned mode.
+    config.task_utd_ratio = 1.0
 
     config.qsafe = config_dict.ConfigDict()
     config.qsafe.checkpoint_path = ""

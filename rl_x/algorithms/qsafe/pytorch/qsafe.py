@@ -103,7 +103,7 @@ class QSafe:
         # replacement permits the configured batch size from the first block.
         return not self.frozen and self.replay_buffer.nr_transitions > 0
 
-    def update(self, policy_sampler):
+    def update(self, policy_sampler, state_transform=None, action_transform=None):
         if self.frozen or self.optimizer is None:
             raise RuntimeError("Frozen QSafe cannot be updated during fine-tuning.")
         arrays = self.replay_buffer.sample(self.batch_size)
@@ -111,8 +111,14 @@ class QSafe:
             torch.as_tensor(value, dtype=torch.float32, device=self.device)
             for value in arrays
         ]
+        raw_next_states = next_states
+        if state_transform is not None:
+            states = state_transform(states)
+            next_states = state_transform(next_states)
         with torch.no_grad():
             next_actions = policy_sampler(next_states)
+            if action_transform is not None:
+                next_actions = action_transform(raw_next_states, next_actions)
             next_q = self.target(next_states, next_actions)
             failures = failures.reshape(-1, 1)
             target = safety_bellman_target(

@@ -51,10 +51,16 @@ class Runner:
             def get_env_config_value(arg_name):
                 arg_value = [arg for arg in sys.argv if arg.startswith(f"--environment.{arg_name}=")]
                 if arg_value:
-                    arg_value = arg_value[0].split("=")[1]
+                    arg_value = arg_value[0].split("=", 1)[1]
                 else:
                     arg_value = getattr(get_environment_config(environment_name), arg_name, None)
                 return arg_value
+
+            def set_optional_launcher_arg(arg_name):
+                """Let AppLauncher apply its own default when RL-X has no value."""
+                arg_value = get_env_config_value(arg_name)
+                if arg_value is not None:
+                    setattr(app_launcher_args, arg_name, arg_value)
             
             app_launcher_args.disable_fabric = get_env_config_value("disable_fabric")
             app_launcher_args.num_envs = get_env_config_value("nr_envs")
@@ -70,9 +76,9 @@ class Runner:
             app_launcher_args.cpu = get_env_config_value("cpu")
             app_launcher_args.verbose = get_env_config_value("verbose")
             app_launcher_args.info = get_env_config_value("info")
-            app_launcher_args.experience = get_env_config_value("experience")
-            app_launcher_args.rendering_mode = get_env_config_value("rendering_mode")
-            app_launcher_args.kit_args = get_env_config_value("kit_args")
+            set_optional_launcher_arg("experience")
+            set_optional_launcher_arg("rendering_mode")
+            set_optional_launcher_arg("kit_args")
             app_launcher_args.anim_recording_enabled = get_env_config_value("anim_recording_enabled")
             app_launcher_args.anim_recording_start_time = get_env_config_value("anim_recording_start_time")
             app_launcher_args.anim_recording_stop_time = get_env_config_value("anim_recording_stop_time")
@@ -340,6 +346,7 @@ class Runner:
             model.train()
         except Exception:
             rlx_logger.error("Uncaught exception", exc_info=True)
+            raise
         finally:
             train_env.close()
             eval_env.close()
@@ -376,6 +383,7 @@ class Runner:
             model.test(self._config.runner.nr_test_episodes)
         except Exception:
             rlx_logger.error("Uncaught exception", exc_info=True)
+            raise
         finally:
             train_env.close()
             eval_env.close()
