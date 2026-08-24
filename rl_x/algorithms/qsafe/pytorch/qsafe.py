@@ -68,6 +68,7 @@ class QSafe:
             self.observation_shape,
             self.action_shape,
             rng,
+            max_trajectories=int(self.config.max_trajectories),
         )
         self.trajectory_accumulator = VectorTrajectoryAccumulator(
             config.environment.nr_envs
@@ -216,6 +217,7 @@ class QSafe:
             "nr_hidden_units": int(self.config.nr_hidden_units),
             "gamma": self.gamma,
             "epsilon": self.epsilon,
+            "max_trajectories": int(self.config.max_trajectories),
         }
 
     def state_dict(self, include_optimizer=True):
@@ -239,6 +241,7 @@ class QSafe:
             "nr_hidden_units",
             "gamma",
             "epsilon",
+            "max_trajectories",
         ):
             checkpoint_value = metadata[key]
             expected_value = expected[key]

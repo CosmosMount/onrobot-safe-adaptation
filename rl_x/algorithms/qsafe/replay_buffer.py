@@ -11,12 +11,23 @@ class SafetyReplayBuffer:
     fragments of an old episode.
     """
 
-    def __init__(self, capacity, nr_envs, observation_shape, action_shape, rng):
+    def __init__(
+        self,
+        capacity,
+        nr_envs,
+        observation_shape,
+        action_shape,
+        rng,
+        max_trajectories=None,
+    ):
         self.observation_shape = tuple(observation_shape)
         self.action_shape = tuple(action_shape)
         self.capacity = max(1, int(capacity))
         self.nr_envs = nr_envs
         self.rng = rng
+        self.max_trajectories = (
+            None if max_trajectories is None else max(1, int(max_trajectories))
+        )
         self.trajectories = deque()
         self.size = 0
 
@@ -47,6 +58,13 @@ class SafetyReplayBuffer:
 
     def _append_trajectory(self, trajectory):
         trajectory_length = trajectory[0].shape[0]
+        while (
+            self.trajectories
+            and self.max_trajectories is not None
+            and len(self.trajectories) >= self.max_trajectories
+        ):
+            evicted = self.trajectories.popleft()
+            self.size -= evicted[0].shape[0]
         while self.trajectories and self.size + trajectory_length > self.capacity:
             evicted = self.trajectories.popleft()
             self.size -= evicted[0].shape[0]

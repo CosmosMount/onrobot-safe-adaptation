@@ -4,12 +4,11 @@ import time
 from collections import deque
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast
 import wandb
 
-from rl_x.algorithms.sac_qsafe.pytorch.general_properties import GeneralProperties
+from rl_x.algorithms.droq_qsafe.pytorch.general_properties import GeneralProperties
 from rl_x.algorithms.sac_qsafe.pytorch.observation_normalizer import (
     ObservationNormalizer,
 )
@@ -19,10 +18,10 @@ from rl_x.algorithms.sac_qsafe.pytorch.rollout import (
     TransitionUpdateBudget,
     preserve_policy_outputs,
 )
-from rl_x.algorithms.sac.pytorch.policy import get_policy
-from rl_x.algorithms.sac.pytorch.critic import get_critic
-from rl_x.algorithms.sac.pytorch.entropy_coefficient import get_entropy_coefficient
-from rl_x.algorithms.sac.pytorch.replay_buffer import ReplayBuffer
+from rl_x.algorithms.droq.pytorch.policy import get_policy
+from rl_x.algorithms.droq.pytorch.critic import get_critic
+from rl_x.algorithms.droq.pytorch.entropy_coefficient import get_entropy_coefficient
+from rl_x.algorithms.droq.pytorch.replay_buffer import ReplayBuffer
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
     extract_failure_signal,
@@ -35,7 +34,7 @@ from rl_x.environments.safety_rollout import InvalidTransitionError
 rlx_logger = logging.getLogger("rl_x")
 
 
-class SAC_QSafe:
+class DroQ_QSafe:
     def __init__(
         self, config, train_env, eval_env, run_path, writer, _defer_transfer_load=False
     ):
@@ -70,6 +69,20 @@ class SAC_QSafe:
         self.batch_size = config.algorithm.batch_size
         self.tau = config.algorithm.tau
         self.gamma = config.algorithm.gamma
+        self.ensemble_size = int(config.algorithm.ensemble_size)
+        self.in_target_minimization_size = int(
+            config.algorithm.in_target_minimization_size
+        )
+        self.q_update_steps = int(config.algorithm.q_update_steps)
+        if self.ensemble_size < 1:
+            raise ValueError("algorithm.ensemble_size must be at least 1.")
+        if not 1 <= self.in_target_minimization_size <= self.ensemble_size:
+            raise ValueError(
+                "algorithm.in_target_minimization_size must be between 1 and "
+                "algorithm.ensemble_size."
+            )
+        if self.q_update_steps < 1:
+            raise ValueError("algorithm.q_update_steps must be at least 1.")
         self.target_entropy = config.algorithm.target_entropy
         self.nr_hidden_units = config.algorithm.nr_hidden_units
         self.logging_frequency = config.algorithm.logging_frequency
@@ -139,10 +152,12 @@ class SAC_QSafe:
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
             self.observation_normalizer.freeze()
-        
+
         fused = self.device.type == "cuda"
         self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=self.learning_rate, fused=fused)
-        self.q_optimizer = optim.Adam(list(self.critic.q1.parameters()) + list(self.critic.q2.parameters()), lr=self.learning_rate, fused=fused)
+        self.q_optimizer = optim.Adam(
+            self.critic.q.parameters(), lr=self.learning_rate, fused=fused
+        )
         self.entropy_optimizer = optim.Adam([self.entropy_coefficient.log_alpha], lr=self.learning_rate, fused=fused)
         self.nu = torch.tensor(
             float(config.algorithm.initial_nu),
@@ -177,7 +192,7 @@ class SAC_QSafe:
                 self.q_optimizer,
                 start_factor=1.0,
                 end_factor=0.0,
-                total_iters=scheduler_updates,
+                total_iters=scheduler_updates * self.q_update_steps,
             )
             self.policy_scheduler = optim.lr_scheduler.LinearLR(
                 self.policy_optimizer,
@@ -308,7 +323,7 @@ class SAC_QSafe:
         ]
         return selected_actions, selected_processed_actions, metrics
 
-    
+
     def train(self):
         if str(self.config.algorithm.rollout_mode) == "partitioned":
             return self._train_partitioned()
@@ -321,10 +336,7 @@ class SAC_QSafe:
                     raw_batch_states, current_actions
                 )
 
-                q1 = self.critic.q1(batch_states, current_actions)
-                q2 = self.critic.q2(batch_states, current_actions)
-
-                min_q = torch.minimum(q1, q2)
+                min_q = self.critic.q(batch_states, current_actions).min(dim=0).values
 
                 alpha = self.entropy_coefficient()
                 alpha_detach = alpha.detach()
@@ -357,7 +369,7 @@ class SAC_QSafe:
             entropy_loss.backward()
 
             entropy_grad_norm = self.entropy_coefficient.log_alpha.grad.detach().data.norm(2) ** 2
-            
+
             self.entropy_optimizer.step()
 
             dual_loss = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -381,7 +393,7 @@ class SAC_QSafe:
                 dual_loss.detach(),
                 self.nu.detach(),
             )
-        
+
 
         @torch.compile(mode=self.compile_mode)
         def critic_loss_fn(
@@ -393,28 +405,24 @@ class SAC_QSafe:
                     next_actions = self._project_actions(
                         raw_next_states, next_actions
                     )
-                    next_q1_target = self.critic.q1_target(next_states, next_actions)
-                    next_q2_target = self.critic.q2_target(next_states, next_actions)
-                    min_next_q_target = torch.minimum(next_q1_target, next_q2_target)
+                    target_indices = torch.randperm(
+                        self.ensemble_size, device=self.device
+                    )[: self.in_target_minimization_size]
+                    min_next_q_target = self.critic.q_target(
+                        next_states, next_actions
+                    )[target_indices].min(dim=0).values
                     alpha = self.entropy_coefficient().detach()
                     y = rewards.reshape(-1, 1) + self.gamma * (1 - dones.reshape(-1, 1)) * (min_next_q_target - alpha * next_log_probs)
 
-                q1 = self.critic.q1(states, actions)
-                q2 = self.critic.q2(states, actions)
-                q1_loss = F.mse_loss(q1, y)
-                q2_loss = F.mse_loss(q2, y)
-                q_loss = (q1_loss + q2_loss) / 2
-            
+                q_values = self.critic.q(states, actions)
+                q_loss = ((q_values - y.unsqueeze(0)) ** 2).mean()
+
             self.q_optimizer.zero_grad()
             q_loss.backward()
 
-            q1_grad_norm = 0.0
-            q2_grad_norm = 0.0
-            for param in self.critic.q1.parameters():
-                q1_grad_norm += param.grad.detach().data.norm(2) ** 2
-            for param in self.critic.q2.parameters():
-                q2_grad_norm += param.grad.detach().data.norm(2) ** 2
-            critic_grad_norm = q1_grad_norm ** 0.5 + q2_grad_norm ** 0.5
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.critic.q.parameters(), float("inf")
+            )
 
             self.q_optimizer.step()
 
@@ -447,7 +455,7 @@ class SAC_QSafe:
         steps_metrics = {}
         prev_saving_end_time = None
         logging_time_prev = None
-        
+
         while global_step < self.total_timesteps or (
             self.phase == "pretrain" and pretrain_stage == "safe"
         ):
@@ -485,7 +493,7 @@ class SAC_QSafe:
             if action_safety_metrics is not None:
                 for key, value in action_safety_metrics.items():
                     safety_metrics_collection.setdefault(key, []).append(value)
-            
+
             try:
                 next_state, reward, terminated, truncated, info = interaction_env.step(
                     processed_action
@@ -609,10 +617,12 @@ class SAC_QSafe:
                 not is_safety_step and global_step % self.logging_frequency == 0
             )
 
-            
+
             # Optimizing - Prepare batches
             if should_optimize:
-                batch_states, batch_next_states, batch_actions, batch_rewards, batch_terminations = offline_replay_buffer.sample(self.batch_size)
+                batch_states, batch_next_states, batch_actions, batch_rewards, batch_terminations = offline_replay_buffer.sample(
+                    self.batch_size, self.q_update_steps
+                )
                 normalized_batch_states = self._normalize_states(
                     batch_states, update=False
                 )
@@ -623,22 +633,29 @@ class SAC_QSafe:
 
             # Optimizing - Q-functions, policy and entropy coefficient
             if should_optimize:
-                # Critic loss
-                q_loss, critic_grad_norm = critic_loss_fn(
-                    normalized_batch_states,
-                    normalized_batch_next_states,
-                    batch_actions,
-                    batch_rewards,
-                    batch_terminations,
-                    batch_next_states,
-                )
-
-                # Update critic targets
-                with torch.no_grad():
-                    for param, target_param in zip(self.critic.q1.parameters(), self.critic.q1_target.parameters()):
-                        target_param.data.mul_(1.0 - self.tau).add_(param.data, alpha=self.tau)
-                    for param, target_param in zip(self.critic.q2.parameters(), self.critic.q2_target.parameters()):
-                        target_param.data.mul_(1.0 - self.tau).add_(param.data, alpha=self.tau)
+                q_losses = []
+                critic_grad_norms = []
+                for q_update_step in range(self.q_update_steps):
+                    q_loss, critic_grad_norm = critic_loss_fn(
+                        normalized_batch_states[q_update_step],
+                        normalized_batch_next_states[q_update_step],
+                        batch_actions[q_update_step],
+                        batch_rewards[q_update_step],
+                        batch_terminations[q_update_step],
+                        batch_next_states[q_update_step],
+                    )
+                    q_losses.append(q_loss.item())
+                    critic_grad_norms.append(critic_grad_norm.item())
+                    with torch.no_grad():
+                        for param, target_param in zip(
+                            self.critic.q.parameters(),
+                            self.critic.q_target.parameters(),
+                        ):
+                            target_param.data.mul_(1.0 - self.tau).add_(
+                                param.data, alpha=self.tau
+                            )
+                    if self.anneal_learning_rate:
+                        self.q_scheduler.step()
 
                 # Policy and entropy loss
                 (
@@ -653,7 +670,7 @@ class SAC_QSafe:
                     dual_loss,
                     nu,
                 ) = policy_and_entropy_loss_fn(
-                    normalized_batch_states, batch_states
+                    normalized_batch_states[0], batch_states[0]
                 )
 
                 # Create metrics
@@ -661,9 +678,9 @@ class SAC_QSafe:
                     "entropy/alpha": alpha.item(),
                     "entropy/entropy": entropy.item(),
                     "gradients/policy_grad_norm": policy_grad_norm.item(),
-                    "gradients/critic_grad_norm": critic_grad_norm.item(),
+                    "gradients/critic_grad_norm": np.mean(critic_grad_norms),
                     "gradients/entropy_grad_norm": entropy_grad_norm.item(),
-                    "loss/q_loss": q_loss.item(),
+                    "loss/q_loss": np.mean(q_losses),
                     "loss/policy_loss": policy_loss.item(),
                     "loss/entropy_loss": entropy_loss.item(),
                     "lr/learning_rate": self.learning_rate if not self.anneal_learning_rate else self.q_scheduler.get_last_lr()[0],
@@ -676,9 +693,8 @@ class SAC_QSafe:
                 for key, value in optimization_metrics.items():
                     optimization_metrics_collection.setdefault(key, []).append(value)
                 nr_updates += 1
-            
+
                 if self.anneal_learning_rate:
-                    self.q_scheduler.step()
                     self.policy_scheduler.step()
                     self.entropy_scheduler.step()
 
@@ -698,7 +714,7 @@ class SAC_QSafe:
                     )
                     for key, value in qsafe_metrics.items():
                         safety_metrics_collection.setdefault(key, []).append(value)
-            
+
             optimizing_end_time = time.time()
             time_metrics_collection.setdefault("time/optimizing_time", []).append(optimizing_end_time - acting_end_time)
 
@@ -730,7 +746,7 @@ class SAC_QSafe:
                     if eval_nr_episodes == self.evaluation_episodes:
                         break
                 self.set_train_mode()
-            
+
             evaluating_end_time = time.time()
             time_metrics_collection.setdefault("time/evaluating_time", []).append(evaluating_end_time - optimizing_end_time)
 
@@ -741,7 +757,7 @@ class SAC_QSafe:
                 if mean_return > self.best_mean_return:
                     self.best_mean_return = mean_return
                     self.save()
-            
+
             saving_end_time = time.time()
             if prev_saving_end_time:
                 time_metrics_collection.setdefault("time/sps", []).append(self.nr_envs / (saving_end_time - prev_saving_end_time))
@@ -772,7 +788,7 @@ class SAC_QSafe:
                         mean_value = np.mean(step_info_collection[info_name])
                         if mean_value == mean_value:  # Check if mean_value is NaN
                             metric_dict[f"{metric_group}/{info_name}"] = mean_value
-                
+
                 time_metrics = {key: np.mean(value) for key, value in time_metrics_collection.items()}
                 optimization_metrics = {key: np.mean(value) for key, value in optimization_metrics_collection.items()}
                 evaluation_metrics = {key: np.mean(value) for key, value in evaluation_metrics_collection.items()}
@@ -790,7 +806,7 @@ class SAC_QSafe:
                 evaluation_metrics_collection = {}
 
                 self.end_logging()
-            
+
             logging_end_time = time.time()
             logging_time_prev = logging_end_time - saving_end_time
 
@@ -800,61 +816,68 @@ class SAC_QSafe:
     def _partitioned_task_update(self, replay_buffer):
         torch.compiler.cudagraph_mark_step_begin()
         raw_states, raw_next_states, actions, rewards, terminations = replay_buffer.sample(
-            self.batch_size
+            self.batch_size, self.q_update_steps
         )
         states = self._normalize_states(raw_states, update=False)
         next_states = self._normalize_states(raw_next_states, update=False)
-
-        with autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-            enabled=self.bf16_mixed_precision_training,
-        ):
-            with torch.no_grad():
-                next_actions, _, next_log_probs = self.policy.get_action(next_states)
-                next_actions = self._project_actions(
-                    raw_next_states, next_actions
-                )
-                next_q = torch.minimum(
-                    self.critic.q1_target(next_states, next_actions),
-                    self.critic.q2_target(next_states, next_actions),
-                )
-                target = rewards[:, None] + self.gamma * (
-                    1.0 - terminations[:, None]
-                ) * (
-                    next_q
-                    - self.entropy_coefficient().detach() * next_log_probs
-                )
-            q1 = self.critic.q1(states, actions)
-            q2 = self.critic.q2(states, actions)
-            q_loss = 0.5 * (F.mse_loss(q1, target) + F.mse_loss(q2, target))
-        self.q_optimizer.zero_grad()
-        q_loss.backward()
-        self.q_optimizer.step()
-
-        with torch.no_grad():
-            for online, target_network in (
-                (self.critic.q1, self.critic.q1_target),
-                (self.critic.q2, self.critic.q2_target),
+        q_losses = []
+        critic_grad_norms = []
+        for q_update_step in range(self.q_update_steps):
+            with autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=self.bf16_mixed_precision_training,
             ):
+                with torch.no_grad():
+                    next_actions, _, next_log_probs = self.policy.get_action(
+                        next_states[q_update_step]
+                    )
+                    next_actions = self._project_actions(
+                        raw_next_states[q_update_step], next_actions
+                    )
+                    target_indices = torch.randperm(
+                        self.ensemble_size, device=self.device
+                    )[: self.in_target_minimization_size]
+                    next_q = self.critic.q_target(
+                        next_states[q_update_step], next_actions
+                    )[target_indices].min(dim=0).values
+                    target = rewards[q_update_step, :, None] + self.gamma * (
+                        1.0 - terminations[q_update_step, :, None]
+                    ) * (
+                        next_q
+                        - self.entropy_coefficient().detach() * next_log_probs
+                    )
+                q_values = self.critic.q(
+                    states[q_update_step], actions[q_update_step]
+                )
+                q_loss = ((q_values - target.unsqueeze(0)) ** 2).mean()
+            self.q_optimizer.zero_grad()
+            q_loss.backward()
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.critic.q.parameters(), float("inf")
+            )
+            self.q_optimizer.step()
+            q_losses.append(q_loss.detach())
+            critic_grad_norms.append(critic_grad_norm.detach())
+
+            with torch.no_grad():
                 for parameter, target_parameter in zip(
-                    online.parameters(), target_network.parameters()
+                    self.critic.q.parameters(), self.critic.q_target.parameters()
                 ):
                     target_parameter.data.mul_(1.0 - self.tau).add_(
                         parameter.data, alpha=self.tau
                     )
+            if self.anneal_learning_rate:
+                self.q_scheduler.step()
 
         with autocast(
             device_type="cuda",
             dtype=torch.bfloat16,
             enabled=self.bf16_mixed_precision_training,
         ):
-            current_actions, _, log_probs = self.policy.get_action(states)
-            current_actions = self._project_actions(raw_states, current_actions)
-            task_q = torch.minimum(
-                self.critic.q1(states, current_actions),
-                self.critic.q2(states, current_actions),
-            )
+            current_actions, _, log_probs = self.policy.get_action(states[0])
+            current_actions = self._project_actions(raw_states[0], current_actions)
+            task_q = self.critic.q(states[0], current_actions).min(dim=0).values
             policy_loss = (
                 self.entropy_coefficient().detach() * log_probs - task_q
             ).mean()
@@ -867,20 +890,16 @@ class SAC_QSafe:
         entropy_loss.backward()
         self.entropy_optimizer.step()
         if self.anneal_learning_rate:
-            self.q_scheduler.step()
             self.policy_scheduler.step()
             self.entropy_scheduler.step()
         return {
             # Keep optimizer metrics on-device. The partitioned loop aggregates
             # them and performs one host synchronization per logging interval,
             # rather than one ``item()`` synchronization per gradient update.
-            "loss/q_loss": q_loss.detach(),
+            "loss/q_loss": torch.stack(q_losses).mean(),
             "loss/policy_loss": policy_loss.detach(),
             "loss/entropy_loss": entropy_loss.detach(),
-            # Read from the parameter instead of the compiled forward output;
-            # CUDA Graph outputs are reused and cannot be retained by the
-            # interval accumulator across optimizer calls.
-            "entropy/alpha": self.entropy_coefficient.log_alpha.detach().exp(),
+            "gradients/critic_grad_norm": torch.stack(critic_grad_norms).mean(),
             "lr/learning_rate": (
                 self.learning_rate
                 if not self.anneal_learning_rate
@@ -1041,20 +1060,6 @@ class SAC_QSafe:
                     "failures/safety_rate": np.mean(safety_failure),
                 }
             )
-            for pool_name, rollout_step in (
-                ("task", task_step),
-                ("safety", safety_step),
-            ):
-                for metric_name, values in self.train_env.get_logging_info_dict(
-                    rollout_step.info
-                ).items():
-                    values = np.asarray(values, dtype=np.float32)
-                    if values.size:
-                        record_interval_metrics(
-                            {
-                                f"env/{pool_name}/{metric_name}": np.mean(values)
-                            }
-                        )
             for index in np.flatnonzero(task_done):
                 final_info = task_step.info["final_info"][index]
                 if final_info is not None:
@@ -1233,7 +1238,7 @@ class SAC_QSafe:
             self.writer.add_scalar(name, value, step)
         if self.track_console:
             self.log_console(name, value)
-    
+
 
     def log_console(self, name, value):
         value = np.format_float_positional(value, trim="-")
@@ -1266,10 +1271,8 @@ class SAC_QSafe:
         save_dict = {
             "config_algorithm": self.config.algorithm,
             "policy_state_dict": self.policy.state_dict(),
-            "q1_state_dict": self.critic.q1.state_dict(),
-            "q2_state_dict": self.critic.q2.state_dict(),
-            "q1_target_state_dict": self.critic.q1_target.state_dict(),
-            "q2_target_state_dict": self.critic.q2_target.state_dict(),
+            "q_state_dict": self.critic.q.state_dict(),
+            "q_target_state_dict": self.critic.q_target.state_dict(),
             "log_alpha": self.entropy_coefficient.log_alpha,
             "policy_optimizer_state_dict": self.policy_optimizer.state_dict(),
             "q_optimizer_state_dict": self.q_optimizer.state_dict(),
@@ -1296,10 +1299,8 @@ class SAC_QSafe:
         )
         torch.save(
             {
-                "q1_state_dict": self.critic.q1.state_dict(),
-                "q2_state_dict": self.critic.q2.state_dict(),
-                "q1_target_state_dict": self.critic.q1_target.state_dict(),
-                "q2_target_state_dict": self.critic.q2_target.state_dict(),
+                "q_state_dict": self.critic.q.state_dict(),
+                "q_target_state_dict": self.critic.q_target.state_dict(),
                 "q_optimizer_state_dict": self.q_optimizer.state_dict(),
             },
             self.save_path + "/task_critic.model",
@@ -1310,7 +1311,7 @@ class SAC_QSafe:
         )
         if self.track_wandb:
             wandb.save(file_path, base_path=os.path.dirname(file_path))
-    
+
 
     def load(config, train_env, eval_env, run_path, writer, explicitly_set_algorithm_params):
         checkpoint = torch.load(
@@ -1322,14 +1323,12 @@ class SAC_QSafe:
             loaded_algorithm_config,
             explicitly_set_algorithm_params,
         )
-        model = SAC_QSafe(
+        model = DroQ_QSafe(
             config, train_env, eval_env, run_path, writer, _defer_transfer_load=True
         )
         model.policy.load_state_dict(checkpoint["policy_state_dict"])
-        model.critic.q1.load_state_dict(checkpoint["q1_state_dict"])
-        model.critic.q2.load_state_dict(checkpoint["q2_state_dict"])
-        model.critic.q1_target.load_state_dict(checkpoint["q1_target_state_dict"])
-        model.critic.q2_target.load_state_dict(checkpoint["q2_target_state_dict"])
+        model.critic.q.load_state_dict(checkpoint["q_state_dict"])
+        model.critic.q_target.load_state_dict(checkpoint["q_target_state_dict"])
         # Preserve the Parameter object already referenced by entropy_optimizer.
         # Replacing it would leave the optimizer updating a stale parameter and,
         # because the checkpoint is initially mapped to CPU, can also introduce
@@ -1367,76 +1366,28 @@ class SAC_QSafe:
             model.dual_optimizer.load_state_dict(checkpoint["dual_optimizer_state_dict"])
         return model
 
-    
+
     def test(self, episodes):
         self.set_eval_mode()
-        eval_policy = str(self.config.algorithm.eval_policy)
-        if eval_policy not in ("task", "safe"):
-            raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
         for i in range(episodes):
             done = False
             episode_return = 0
-            episode_steps = 0
-            episode_failures = 0
-            forward_velocity_sum = 0.0
-            target_velocity_error_sum = 0.0
             state, _ = self.eval_env.reset()
             while not done:
                 torch.compiler.cudagraph_mark_step_begin()
                 with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
-                    if eval_policy == "task":
-                        raw_state = torch.as_tensor(
-                            state, dtype=torch.float32, device=self.device
-                        )
-                        normalized_state = self._normalize_states(
-                            raw_state, update=False
-                        )
-                        action = self.policy.get_deterministic_action(
-                            normalized_state
-                        )
-                        action = self._project_actions(raw_state, action)
-                        processed_action = self._process_normalized_actions(action)
-                    else:
-                        _, processed_action, _ = self._sample_policy_candidates(
-                            state
-                        )
+                    _, processed_action, _ = self._sample_policy_candidates(state)
                 state, reward, terminated, truncated, info = self.eval_env.step(processed_action.cpu().numpy())
-                failures = extract_failure_signal(info, terminated, self.nr_envs)
+                extract_failure_signal(info, terminated, self.nr_envs)
                 done = terminated | truncated
                 episode_return += reward
-                episode_steps += 1
-                episode_failures += int(np.sum(failures))
-                if "forward_velocity" in info:
-                    forward_velocity_sum += float(
-                        np.mean(np.asarray(info["forward_velocity"]))
-                    )
-                if "target_velocity_error" in info:
-                    target_velocity_error_sum += float(
-                        np.mean(np.asarray(info["target_velocity_error"]))
-                    )
-            summary = (
-                f"Episode {i + 1} - Return: {float(np.mean(episode_return)):.6f}, "
-                f"Length: {episode_steps}, Failures: {episode_failures}"
-            )
-            if episode_steps and "forward_velocity" in info:
-                summary += (
-                    f", Mean forward velocity: "
-                    f"{forward_velocity_sum / episode_steps:.6f}"
-                )
-            if episode_steps and "target_velocity_error" in info:
-                summary += (
-                    f", Mean target error: "
-                    f"{target_velocity_error_sum / episode_steps:.6f}"
-                )
-            rlx_logger.info(summary)
+            rlx_logger.info(f"Episode {i + 1} - Return: {episode_return}")
 
 
     def set_train_mode(self):
         self.policy.train()
-        self.critic.q1.train()
-        self.critic.q2.train()
-        self.critic.q1_target.train()
-        self.critic.q2_target.train()
+        self.critic.q.train()
+        self.critic.q_target.train()
         if self.phase == "pretrain" and not self.observation_normalizer.frozen:
             self.observation_normalizer.train()
         if not self.qsafe.frozen:
@@ -1446,14 +1397,12 @@ class SAC_QSafe:
 
     def set_eval_mode(self):
         self.policy.eval()
-        self.critic.q1.eval()
-        self.critic.q2.eval()
-        self.critic.q1_target.eval()
-        self.critic.q2_target.eval()
+        self.critic.q.eval()
+        self.critic.q_target.eval()
         self.observation_normalizer.eval()
         self.qsafe.online.eval()
         self.qsafe.target.eval()
 
-    
+
     def general_properties():
         return GeneralProperties

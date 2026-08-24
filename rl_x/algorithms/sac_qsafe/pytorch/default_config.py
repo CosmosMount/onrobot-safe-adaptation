@@ -6,15 +6,18 @@ def get_config(algorithm_name):
     config.name = algorithm_name
     config.device = "gpu"
     config.compile_mode = "reduce-overhead"
-    config.bf16_mixed_precision_training = True
+    # The SQRL reproduction uses full precision. In the Go2 flat baseline,
+    # bf16 caused the SAC critic loss to diverge by 10k transitions.
+    config.bf16_mixed_precision_training = False
     # SQRL Appendix B uses 5e5 steps for both pre-training and fine-tuning.
     config.total_timesteps = 5e5
     config.learning_rate = 3e-4
     config.anneal_learning_rate = False
     config.buffer_size = 1e6
-    # Algorithm 1 applies a SAC update in every task step. A non-zero value is
-    # still accepted as an explicit engineering override for replay warm-up.
-    config.learning_starts = 0
+    # Match the independently validated Go2 reproduction: collect one thousand
+    # task transitions before sampling replay. Starting from the first 256-way
+    # vector step repeatedly overfits a nearly empty buffer.
+    config.learning_starts = 1000
     config.batch_size = 256
     config.tau = 0.005
     config.gamma = 0.99
@@ -30,6 +33,7 @@ def get_config(algorithm_name):
     config.logging_frequency = 50000
     config.evaluation_frequency = -1
     config.evaluation_episodes = 10
+    config.eval_policy = "safe"  # safe, task
 
     config.phase = "pretrain"  # pretrain, finetune
     config.pretrained_policy_path = ""
@@ -37,7 +41,9 @@ def get_config(algorithm_name):
     config.initial_nu = 0.0
     # Algorithm 1: n_off unconstrained task-policy vector steps followed by
     # n_safe complete safety-constrained trajectories per pretrain iteration.
-    config.n_off = 1
+    # Not reported by the paper.  Use the independently validated Go2
+    # reproduction's explicit choice for the serial Algorithm-1 reference.
+    config.n_off = 1000
     config.n_safe = 1
     config.rollout_mode = "serial_reference"  # serial_reference, partitioned
     config.checkpoint_frequency = 50000
@@ -55,7 +61,10 @@ def get_config(algorithm_name):
     config.qsafe.tau = 0.005
     config.qsafe.buffer_size = 100000
     config.qsafe.batch_size = 256
-    config.qsafe.candidate_actions = 10
+    # The paper does not publish the finite rejection pool size.  The verified
+    # Go2 reproduction uses 100 candidates and ten recent complete rollouts.
+    config.qsafe.candidate_actions = 100
+    config.qsafe.max_trajectories = 10
     config.qsafe.nr_hidden_units = 256
     config.qsafe.updates_per_iteration = 1
     return config
