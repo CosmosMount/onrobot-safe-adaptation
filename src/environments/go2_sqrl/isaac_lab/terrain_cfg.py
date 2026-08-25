@@ -1,6 +1,21 @@
 """The selected six-terrain distribution, colocated with the Isaac env."""
 
 
+def configure_terrain_mode(terrain, curriculum, mode):
+    """Select the generated rough map or Isaac Lab's infinite ground plane."""
+
+    mode = str(mode).lower()
+    if mode == "rough":
+        return
+    if mode != "flat":
+        raise ValueError(
+            f"Unsupported terrain_mode {mode!r}; expected 'rough' or 'flat'."
+        )
+    terrain.terrain_type = "plane"
+    terrain.terrain_generator = None
+    curriculum.terrain_levels = None
+
+
 def configure_terrain(terrain_generator, terrain_gen):
     sub_terrains = terrain_generator.sub_terrains
     for name in (
@@ -40,4 +55,3 @@ def configure_terrain(terrain_generator, terrain_gen):
         platform_width=2.0,
         border_width=0.25,
     )
-

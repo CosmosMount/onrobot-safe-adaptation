@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import numpy as np
 from gymnasium.spaces import Box
@@ -18,8 +19,9 @@ from ..common.termination import EpisodeTracker
 from ..common.manifest import build_manifest, validate_manifest
 from .fall_detector import FallDetector
 from .general_properties import GeneralProperties
+from .reset_controller import MujocoResetController
 from .sdk_client import SDKClient
-from .state_buffer import StateBufferError
+from .state_buffer import StateBufferError, StateTimeout
 
 
 logger = logging.getLogger("rl_x")
@@ -31,10 +33,19 @@ class Go2SDKMujocoEnv:
     critic_observation_indices = np.arange(OBSERVATION_SIZE)
     safety_critic_observation_indices = np.arange(OBSERVATION_SIZE)
 
-    def __init__(self, config, client: SDKClient | None = None, role: str = "train"):
+    def __init__(
+        self,
+        config,
+        client: SDKClient | None = None,
+        role: str = "train",
+        reset_controller: MujocoResetController | None = None,
+    ):
         environment = config.environment
         self.config = environment
         self.role = role
+        runner = getattr(config, "runner", None)
+        runner_mode = str(getattr(runner, "mode", "train"))
+        self._startup_reset_role = "eval" if runner_mode == "test" else "train"
         self.nr_envs = 1
         self.num_envs = 1
         self.single_observation_space = Box(
@@ -46,15 +57,24 @@ class Go2SDKMujocoEnv:
         self.observation_space = self.single_observation_space
         self.action_space = self.single_action_space
         self.client = client or SDKClient(environment.domain_id, environment.interface)
+        if reset_controller is None and isinstance(self.client, SDKClient):
+            reset_controller = MujocoResetController(
+                window_title=environment.mujoco_window_title
+            )
+        self.reset_controller = reset_controller
         self.action_mapper = ActionMapper()
         self.observation_builder = ObservationBuilder()
         self.fall_detector = FallDetector(
-            environment.fall_angle_threshold, environment.fall_consecutive_frames
+            environment.fall_angle_threshold,
+            environment.fall_consecutive_frames,
+            environment.reset_min_base_height,
         )
         self.episode = EpisodeTracker(environment.episode_steps)
         self._last_tick: int | None = None
         self._generation = 0
         self._last_observation: np.ndarray | None = None
+        self._policy_blend_elapsed = 0.0
+        self._initial_simulator_reset_done = False
 
     @staticmethod
     def project_actions(states, actions):
@@ -82,42 +102,182 @@ class Go2SDKMujocoEnv:
         self._last_tick = int(frames[-1].tick)
         return frames
 
+    def _reset_pose_ready(self, state) -> bool:
+        joint_error = np.max(
+            np.abs(
+                np.asarray(state.joint_q, dtype=np.float32)
+                - DEFAULT_JOINT_POSITION
+            )
+        )
+        max_joint_velocity = np.max(
+            np.abs(np.asarray(state.joint_dq, dtype=np.float32))
+        )
+        orientation_ready = self.fall_detector.is_stable(state.imu_quat)
+        joints_ready = joint_error <= float(self.config.reset_joint_tolerance)
+        joints_still = max_joint_velocity <= float(
+            self.config.reset_max_joint_velocity
+        )
+
+        # Roll and pitch alone cannot distinguish a standing robot from one
+        # lying flat on its belly.  The simulator-only high-state topic exposes
+        # base height without leaking it into the policy observation.
+        height_ready = True
+        latest_training_state = getattr(self.client, "latest_training_state", None)
+        truth = latest_training_state() if callable(latest_training_state) else None
+        if truth is not None and truth.base_position is not None:
+            position = np.asarray(truth.base_position, dtype=np.float32)
+            height_ready = (
+                position.size >= 3
+                and np.isfinite(position[2])
+                and float(position[2]) >= float(self.config.reset_min_base_height)
+            )
+        return orientation_ready and joints_ready and joints_still and height_ready
+
+    def _duration_steps(self, seconds: float) -> int:
+        period = float(self.config.policy_period_seconds)
+        if period <= 0.0:
+            raise ValueError("environment.policy_period_seconds must be positive")
+        return max(0, int(np.ceil(float(seconds) / period)))
+
+    def _publish_and_wait(self, target: np.ndarray):
+        self._last_tick = self.client.state_buffer.last_tick
+        target = np.asarray(target, dtype=np.float32)
+        if isinstance(self.client, SDKClient):
+            self.client.publish_joint_target(
+                target,
+                kp=float(self.config.reset_kp),
+                kd=float(self.config.reset_kd),
+            )
+        else:
+            self.client.publish_joint_target(target)
+        return self._wait_window()[-1]
+
+    def _wait_for_simulator_restart(self, reason: str) -> None:
+        logger.warning("%s Press Backspace in the unitree_mujoco window to reset.", reason)
+        timeout = float(self.config.manual_reset_timeout)
+        timeout = None if timeout < 0 else timeout
+        self._generation = self.client.state_buffer.wait_for_restart(
+            self._generation, timeout=timeout
+        )
+        self._last_tick = None
+        self.fall_detector.reset()
+
+    def _auto_reset_simulator(self, reason: str, delay_seconds: float = 0.0) -> None:
+        if self.reset_controller is None:
+            self._wait_for_simulator_restart(reason)
+            return
+        if delay_seconds > 0.0:
+            logger.warning(
+                f"{reason} Automatic MuJoCo reset in {delay_seconds:.1f} seconds."
+            )
+            time.sleep(delay_seconds)
+        else:
+            logger.info(f"{reason} Automatically resetting MuJoCo.")
+
+        generation = self.client.state_buffer.generation
+        self.reset_controller.reset()
+        try:
+            self._generation = self.client.state_buffer.wait_for_restart(
+                generation,
+                timeout=float(self.config.auto_reset_timeout_seconds),
+            )
+        except StateTimeout as exc:
+            raise RuntimeError(
+                "MuJoCo received the automatic reset key, but no simulator "
+                "tick restart was observed."
+            ) from exc
+        self._last_tick = None
+        self.fall_detector.reset()
+
+    def _interpolate_reset_pose(self, state, start, target, seconds):
+        steps = self._duration_steps(seconds)
+        start = np.asarray(start, dtype=np.float32)
+        target = np.asarray(target, dtype=np.float32)
+        for index in range(steps):
+            alpha = float(index + 1) / float(steps)
+            state = self._publish_and_wait((1.0 - alpha) * start + alpha * target)
+        return state
+
+    def _hold_reset_pose(self, initial_state):
+        """Linearly stand up before handing control directly to the policy."""
+
+        state = initial_state
+        while True:
+            pose_1 = np.asarray(self.config.standup_pose_1, dtype=np.float32)
+            state = self._interpolate_reset_pose(
+                state,
+                state.joint_q,
+                pose_1,
+                self.config.standup_phase_1_seconds,
+            )
+            state = self._interpolate_reset_pose(
+                state,
+                pose_1,
+                DEFAULT_JOINT_POSITION,
+                self.config.standup_phase_2_seconds,
+            )
+            for _ in range(self._duration_steps(self.config.standup_hold_seconds)):
+                state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
+
+            for _ in range(
+                self._duration_steps(self.config.reset_sync_timeout_seconds)
+            ):
+                if self._reset_pose_ready(state):
+                    return state
+                state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
+            if self._reset_pose_ready(state):
+                return state
+
+            self._auto_reset_simulator(
+                "Go2 did not reach the standing pose after interpolation."
+            )
+            state = self.client.state_buffer.latest_state
+            if state is None:
+                state = self._wait_window(count=1)[-1]
+
     def reset(self, *, seed=None, options=None):
         del seed, options
         self.client.start()
         self._generation = self.client.state_buffer.generation
+        if (
+            self.role == self._startup_reset_role
+            and bool(self.config.auto_reset_on_start)
+            and self.reset_controller is not None
+            and not self._initial_simulator_reset_done
+        ):
+            # Observe a pre-reset tick first so StateBuffer can recognize the
+            # simulator tick rollback caused by Backspace.
+            self._last_tick = self.client.state_buffer.last_tick
+            if self._last_tick is None:
+                self._wait_window(count=1)
+            self._auto_reset_simulator("Initial policy startup.")
+            self._initial_simulator_reset_done = True
         self.action_mapper.reset()
         self.observation_builder.reset()
         self.fall_detector.reset()
         self.episode.reset()
-        # Anchor immediately before publishing.  Frames accumulated while the
-        # learner was busy belong to the preceding action and must not form the
-        # next transition window.
-        self._last_tick = self.client.state_buffer.last_tick
-        self.client.publish_joint_target(DEFAULT_JOINT_POSITION)
-        frames = self._wait_window()
-        observation, _ = self.observation_builder.build(frames[-1])
+        self._policy_blend_elapsed = 0.0
+        # Capture the measured reset pose before issuing any command. Stand-up
+        # interpolation begins from this feedback, not from an assumed pose.
+        state = self.client.state_buffer.latest_state
+        if state is None:
+            self._last_tick = None
+            state = self._wait_window(count=1)[-1]
+        else:
+            self._last_tick = int(state.tick)
+        state = self._hold_reset_pose(state)
+        observation, _ = self.observation_builder.build(state)
         self._last_observation = observation
         return observation[None, :], {}
 
     def _manual_failure_reset(self):
-        logger.warning(
-            "Go2 fall detected. Press Backspace in the unitree_mujoco window to reset."
-        )
-        timeout = float(self.config.manual_reset_timeout)
-        timeout = None if timeout < 0 else timeout
-        generation = self.client.state_buffer.wait_for_restart(
-            self._generation, timeout=timeout
-        )
-        self._generation = generation
-        self._last_tick = None
-        stable = 0
-        while stable < int(self.config.stable_reset_frames):
-            frames = self._wait_window(count=1)
-            if self.fall_detector.is_stable(frames[-1].imu_quat):
-                stable += 1
-            else:
-                stable = 0
+        if bool(self.config.auto_reset_after_fall):
+            self._auto_reset_simulator(
+                "Go2 fall detected.",
+                delay_seconds=float(self.config.fall_auto_reset_delay_seconds),
+            )
+        else:
+            self._wait_for_simulator_restart("Go2 fall detected.")
         return self.reset()[0][0]
 
     def _logical_reset(self, state):
@@ -125,17 +285,42 @@ class Go2SDKMujocoEnv:
         self.observation_builder.reset()
         self.fall_detector.reset()
         self.episode.reset()
+        self._policy_blend_elapsed = 0.0
         observation, _ = self.observation_builder.build(state)
         return observation
 
     def step(self, actions):
         action = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_SIZE)[0]
-        mapped = self.action_mapper.apply(action)
+        blend_seconds = float(self.config.policy_blend_seconds)
+        if blend_seconds <= 0.0:
+            alpha = 1.0
+        else:
+            self._policy_blend_elapsed = min(
+                blend_seconds,
+                self._policy_blend_elapsed
+                + float(self.config.policy_period_seconds),
+            )
+            alpha = self._policy_blend_elapsed / blend_seconds
+        # The home action is zero in the normalized contract because zero
+        # maps exactly to DEFAULT_JOINT_POSITION.
+        home_action = np.zeros_like(action)
+        blended_action = np.asarray(
+            (1.0 - alpha) * home_action + alpha * action,
+            dtype=np.float32,
+        )
+        mapped = self.action_mapper.apply(blended_action)
         # JAX updates can take longer than one control interval while the C++
         # simulator continues publishing LowState.  Discard that backlog by
         # anchoring the next ten-frame window at the latest pre-command tick.
         self._last_tick = self.client.state_buffer.last_tick
-        self.client.publish_joint_target(mapped.q_target)
+        if isinstance(self.client, SDKClient):
+            self.client.publish_joint_target(
+                mapped.q_target,
+                kp=float(self.config.policy_kp),
+                kd=float(self.config.policy_kd),
+            )
+        else:
+            self.client.publish_joint_target(mapped.q_target)
         self.observation_builder.set_previous_q_target(mapped.q_target)
         frames = self._wait_window()
 
@@ -149,10 +334,19 @@ class Go2SDKMujocoEnv:
         if truth is None:
             rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
             world_velocity = rotation @ estimated_body_velocity
-            torque = np.zeros(ACTION_SIZE, dtype=np.float32)
         else:
             world_velocity = np.asarray(truth.world_velocity)
-            torque = np.asarray(truth.actuator_torque)
+        rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
+        truth_body_velocity = rotation.T @ np.asarray(world_velocity)
+        base_height = None
+        if truth is not None and truth.base_position is not None:
+            base_height = float(np.asarray(truth.base_position)[2])
+            failure = self.fall_detector.update_base_height(base_height) or failure
+        torque = (
+            np.zeros(ACTION_SIZE, dtype=np.float32)
+            if truth is None or truth.actuator_torque is None
+            else np.asarray(truth.actuator_torque)
+        )
         terms = compute_reward(
             world_velocity,
             final_state.imu_quat,
@@ -162,11 +356,10 @@ class Go2SDKMujocoEnv:
         )
         terminated, truncated = self.episode.advance(terms.total, failure)
 
-        rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
-        truth_body_velocity = rotation.T @ np.asarray(world_velocity)
         info = {
             "failure": np.asarray([int(failure)], dtype=np.float32),
             "applied_action": mapped.applied_action[None, :],
+            "policy_blend_alpha": np.asarray([alpha], dtype=np.float32),
             "velocity_estimation_error": np.asarray(
                 [np.linalg.norm(truth_body_velocity - estimated_body_velocity)],
                 dtype=np.float32,

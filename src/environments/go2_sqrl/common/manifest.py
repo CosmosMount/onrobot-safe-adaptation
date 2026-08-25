@@ -5,12 +5,18 @@ from __future__ import annotations
 from typing import Any
 
 from .reward import REWARD_VERSION
-from .specs import ACTION_SPEC, OBSERVATION_SPEC, PHYSICS_DT
+from .specs import (
+    ACTION_SPEC,
+    DEFAULT_BASE_HEIGHT,
+    OBSERVATION_SPEC,
+    PHYSICS_DT,
+)
 
 
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 5
 VELOCITY_ESTIMATOR_VERSION = "proprioceptive-support-v2"
 FAILURE_CONTRACT_VERSION = "imu-roll-pitch-sustained-v1"
+ACTION_PIPELINE_VERSION = "sdk-absolute-position-v2"
 
 
 def build_manifest(
@@ -40,12 +46,26 @@ def build_manifest(
         },
         "action": {
             "version": ACTION_SPEC.version,
+            "pipeline_version": ACTION_PIPELINE_VERSION,
             "size": ACTION_SPEC.size,
+            "joint_order": list(ACTION_SPEC.joint_order),
             "scale": ACTION_SPEC.scale,
+            "default_position": list(ACTION_SPEC.default_position),
+            "target_semantics": "absolute_joint_position",
+            "backend_offset_semantics": "shared_default_position",
             "max_target_rate": ACTION_SPEC.max_target_rate,
             "kp": ACTION_SPEC.kp,
             "kd": ACTION_SPEC.kd,
+            "effort_limit": ACTION_SPEC.effort_limit,
+            "velocity_limit": ACTION_SPEC.velocity_limit,
+            "armature": ACTION_SPEC.armature,
+            "joint_damping": ACTION_SPEC.joint_damping,
+            "joint_friction": ACTION_SPEC.joint_friction,
             "control_dt": ACTION_SPEC.control_dt,
+        },
+        "reset": {
+            "joint_position": list(ACTION_SPEC.default_position),
+            "base_height": DEFAULT_BASE_HEIGHT,
         },
         "reward_version": REWARD_VERSION,
         "failure": {

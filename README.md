@@ -12,6 +12,7 @@ algorithm and environment-interface layer. The workflow has one entrypoint:
 ```bash
 python -m src.run sim
 python -m src.run pretrain
+python -m src.run isaac-eval --checkpoint /path/to/models/step_000300032.model
 python -m src.run zero-shot
 python -m src.run finetune
 python -m src.run eval
@@ -81,7 +82,11 @@ one update per newly collected transition; changing the number of parallel
 environments therefore no longer silently changes the optimization budget.
 QSafe updates are credited only when complete safety trajectories are committed.
 
-The Go2 transfer manifest is deliberately strict. Checkpoints created before
-the contact-free IMU failure contract (manifest v2) are rejected; run
-`python -m src.run pretrain` again instead of reusing an incompatible safety
-critic.
+The Go2 transfer manifest is deliberately strict. Manifest v5 records the SDK
+joint order, shared reset pose, absolute joint-target semantics, PD gains and
+torque limits. Older checkpoints are rejected because their Isaac action term
+used a different joint ordering and articulation-default offset; run
+`python -m src.run pretrain` again instead of reusing those policy and safety
+critic weights. The parity checkpoint and default MuJoCo transfer gate both use
+flat ground. Rough terrain and domain randomization should be enabled only
+after that deterministic task-policy gate passes.

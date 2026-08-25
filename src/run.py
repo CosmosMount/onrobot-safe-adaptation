@@ -51,7 +51,11 @@ def _simulator_command(args) -> int:
 def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     if checkpoint is None and command in ("zero-shot", "finetune"):
         checkpoint_path = (
-            PROJECT_ROOT / "runs/go2_sqrl/pretrain/isaac/models"
+            PROJECT_ROOT / "runs/go2_sqrl/pretrain/isaac_action_v5/models"
+        )
+    elif checkpoint is None and command == "isaac-eval":
+        checkpoint_path = (
+            PROJECT_ROOT / "runs/go2_sqrl/pretrain/isaac_action_v5/models"
         )
     elif checkpoint is None and command == "eval":
         checkpoint_path = PROJECT_ROOT / "runs/go2_sqrl/finetune/mujoco/models"
@@ -60,7 +64,7 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     else:
         checkpoint_path = Path(checkpoint).expanduser().resolve()
 
-    if command in ("pretrain", "eval"):
+    if command in ("pretrain", "isaac-eval", "eval"):
         if checkpoint_path.is_dir():
             preferred = checkpoint_path / "final.model"
             if not preferred.exists():
@@ -103,7 +107,7 @@ def _run_rlx(args, remaining: list[str]) -> int:
             ) from exc
     flags = list(RUN_PRESETS[args.command])
     flags.append(f"--environment.seed={args.seed}")
-    if args.command != "pretrain":
+    if args.command in ("zero-shot", "finetune", "eval"):
         flags.extend(
             (
                 f"--environment.domain_id={args.domain_id}",
@@ -126,7 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Go2 SQRL pre-training and SDK2/MuJoCo adaptation",
     )
     parser.add_argument(
-        "command", choices=("sim", "pretrain", "zero-shot", "finetune", "eval")
+        "command",
+        choices=(
+            "sim",
+            "pretrain",
+            "isaac-eval",
+            "zero-shot",
+            "finetune",
+            "eval",
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint")

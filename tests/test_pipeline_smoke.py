@@ -18,7 +18,8 @@ class FakeSDKClient:
         self.last_target = None
 
     def start(self):
-        pass
+        if self.state_buffer.last_tick is None:
+            self.publish_joint_target(DEFAULT_JOINT_POSITION)
 
     def publish_joint_target(self, target):
         self.last_target = np.asarray(target).copy()

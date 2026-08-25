@@ -20,7 +20,12 @@ from ..common.specs import (
 from ..common.manifest import build_manifest, validate_manifest
 from ..common.estimation import TorchVelocityEstimator
 from .general_properties import GeneralProperties
-from .mdp import build_observation_tensor, default_joint_target, sdk_joint_indices
+from .mdp import (
+    build_observation_tensor,
+    default_joint_target,
+    sdk_joint_indices,
+    validate_action_term_contract,
+)
 
 
 def project_action_targets_tensor(previous_q_target, actions):
@@ -111,8 +116,16 @@ class Go2IsaacEnv:
         if backend is None:
             from isaaclab.envs import ManagerBasedRLEnv
             from .env_cfg import make_env_cfg
+            from .randomization_cfg import format_domain_randomization_report
 
             backend = ManagerBasedRLEnv(cfg=make_env_cfg(config))
+            print(
+                format_domain_randomization_report(
+                    enabled=bool(config.environment.domain_randomization),
+                    friction=float(config.environment.friction),
+                ),
+                flush=True,
+            )
         self.backend = backend
         self.config = config.environment
         self.nr_envs = int(self.config.nr_envs)
@@ -133,6 +146,9 @@ class Go2IsaacEnv:
         self.critic_observation_indices = np.arange(OBSERVATION_SIZE)
         self.safety_critic_observation_indices = np.arange(OBSERVATION_SIZE)
         robot = self.backend.scene["robot"]
+        validate_action_term_contract(
+            self.backend.action_manager.get_term("joint_pos")
+        )
         self._joint_indices = sdk_joint_indices(robot.joint_names, robot.device)
         self._previous_target = default_joint_target(self.nr_envs, robot.device)
         self._previous_quaternion = None

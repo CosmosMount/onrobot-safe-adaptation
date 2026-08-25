@@ -13,7 +13,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DDS_DOMAIN_ID = 1
 DEFAULT_DDS_INTERFACE = "lo"
-DEFAULT_MUJOCO_SCENE = "scene_terrain.xml"
+# Keep the default transfer gate on the flat scene.  Terrain evaluation remains
+# available explicitly through ``--scene scene_terrain.xml`` after flat
+# zero-shot locomotion passes.
+DEFAULT_MUJOCO_SCENE = str(
+    PROJECT_ROOT / "assets" / "robots" / "go2" / "mjcf" / "scene.xml"
+)
 
 
 def find_unitree_mujoco_root() -> Path:
@@ -55,11 +60,29 @@ RUN_PRESETS = {
     + (
         "--runner.mode=train",
         "--runner.exp_name=pretrain",
-        "--runner.run_name=isaac",
+        "--runner.run_name=isaac_action_v5",
         "--runner.save_model=true",
         "--environment.name=go2_sqrl.isaac_lab",
+        # Train the first transfer checkpoint on the same flat-ground task as
+        # the canonical MuJoCo scene.  Rough-terrain robustness is a later
+        # training/evaluation gate, not part of the simulator parity check.
+        "--environment.terrain_mode=flat",
         "--algorithm.phase=pretrain",
         "--algorithm.rollout_mode=partitioned",
+    ),
+    "isaac-eval": TORCH_PRETRAIN_FLAGS
+    + (
+        "--runner.mode=test",
+        "--runner.exp_name=evaluation",
+        "--runner.run_name=isaac_action_v5",
+        "--runner.nr_test_episodes=5",
+        "--environment.name=go2_sqrl.isaac_lab",
+        "--environment.nr_envs=1",
+        "--environment.nr_task_envs=1",
+        "--environment.nr_safety_envs=0",
+        "--environment.terrain_mode=flat",
+        "--algorithm.phase=pretrain",
+        "--algorithm.eval_policy=task",
     ),
     "zero-shot": JAX_ONLINE_FLAGS
     + (
@@ -68,6 +91,10 @@ RUN_PRESETS = {
         "--runner.run_name=mujoco",
         "--environment.name=go2_sqrl.sdk2_mujoco",
         "--algorithm.phase=finetune",
+        # The first transfer gate evaluates the deterministic task policy.
+        # QSafe candidate sampling is a separate gate because it is stochastic
+        # and depends on a correctly transferred safety-action contract.
+        "--algorithm.eval_policy=task",
     ),
     "finetune": JAX_ONLINE_FLAGS
     + (

@@ -1,13 +1,13 @@
 <mujoco model="go2">
   <compiler angle="radian" meshdir="./meshes/"/>
 
-  <option cone="elliptic" impratio="100"/>
+  <option timestep="0.002" cone="elliptic" impratio="100"/>
 
   <default>
     <default class="go2">
-      <geom friction="0.6" margin="0.001" condim="1"/>
-      <joint axis="0 1 0" damping="2" armature="0.01" frictionloss="0.2"/>
-      <motor ctrlrange="-23.7 23.7"/>
+      <geom friction="0.4" margin="0.001" condim="1"/>
+      <joint axis="0 1 0" damping="0" armature="0" frictionloss="0"/>
+      <motor ctrlrange="-23.5 23.5"/>
       <default class="abduction">
         <joint axis="1 0 0" range="-1.0472 1.0472"/>
       </default>
@@ -21,7 +21,7 @@
       </default>
       <default class="knee">
         <joint range="-2.7227 -0.83776"/>
-        <motor ctrlrange="-45.43 45.43"/>
+        <motor ctrlrange="-23.5 23.5"/>
       </default>
       <default class="visual">
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
@@ -30,7 +30,7 @@
         <geom group="3"/>
         <default class="foot">
           <geom size="0.022" pos="-0.002 0 -0.213" priority="1" solimp="0.015 1 0.022" condim="6"
-            friction="1.2 0.02 0.01"/>
+            friction="0.4 0.02 0.01"/>
         </default>
       </default>
     </default>
@@ -61,7 +61,8 @@
   </asset>
 
   <worldbody>
-    <body name="base" pos="0 0 0.445" childclass="go2">
+    <body name="base_link" pos="0 0 0.27" childclass="go2">
+      <freejoint/>
       <inertial pos="0.021112 0 -0.005366" quat="-0.000543471 0.713435 -0.00173769 0.700719" mass="6.921"
         diaginertia="0.107027 0.0980771 0.0244531"/>
       <geom mesh="base_0" material="black" class="visual"/>
@@ -197,18 +198,18 @@
   </worldbody>
 
   <actuator>
-    <motor class="abduction" name="FR_hip" joint="FR_hip_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="hip" name="FR_thigh" joint="FR_thigh_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="knee" name="FR_calf" joint="FR_calf_joint" ctrlrange="-45.43 45.43"/>
-    <motor class="abduction" name="FL_hip" joint="FL_hip_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="hip" name="FL_thigh" joint="FL_thigh_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="knee" name="FL_calf" joint="FL_calf_joint" ctrlrange="-45.43 45.43"/>
-    <motor class="abduction" name="RR_hip" joint="RR_hip_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="hip" name="RR_thigh" joint="RR_thigh_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="knee" name="RR_calf" joint="RR_calf_joint" ctrlrange="-45.43 45.43"/>
-    <motor class="abduction" name="RL_hip" joint="RL_hip_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="hip" name="RL_thigh" joint="RL_thigh_joint" ctrlrange="-23.7 23.7"/>
-    <motor class="knee" name="RL_calf" joint="RL_calf_joint" ctrlrange="-45.43 45.43"/>
+    <motor class="abduction" name="FR_hip" joint="FR_hip_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="hip" name="FR_thigh" joint="FR_thigh_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="knee" name="FR_calf" joint="FR_calf_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="abduction" name="FL_hip" joint="FL_hip_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="hip" name="FL_thigh" joint="FL_thigh_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="knee" name="FL_calf" joint="FL_calf_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="abduction" name="RR_hip" joint="RR_hip_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="hip" name="RR_thigh" joint="RR_thigh_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="knee" name="RR_calf" joint="RR_calf_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="abduction" name="RL_hip" joint="RL_hip_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="hip" name="RL_thigh" joint="RL_thigh_joint" ctrlrange="-23.5 23.5"/>
+    <motor class="knee" name="RL_calf" joint="RL_calf_joint" ctrlrange="-23.5 23.5"/>
   </actuator>
 
   <sensor>
@@ -252,11 +253,16 @@
     <jointactuatorfrc name="RL_thigh_torque" joint="RL_thigh_joint" noise="0.01"/>
     <jointactuatorfrc name="RL_calf_torque" joint="RL_calf_joint" noise="0.01"/>
 
-    <accelerometer name="accelerometer" site="imu"/>
-    <gyro name="sensor_gyro" site="imu"/>
-    <velocimeter name="velocimeter" site="imu"/>
-    <framequat name="framequat" objtype="site" objname="imu"/>
+    <accelerometer name="imu_acc" site="imu"/>
+    <gyro name="imu_gyro" site="imu"/>
+    <framequat name="imu_quat" objtype="site" objname="imu"/>
     <framepos name="frame_pos" objtype="site" objname="imu"/>
     <framelinvel name="frame_vel" objtype="site" objname="imu"/>
   </sensor>
+
+  <keyframe>
+    <key name="home"
+      qpos="0 0 0.27 1 0 0 0 0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8"
+      ctrl="0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8"/>
+  </keyframe>
 </mujoco>

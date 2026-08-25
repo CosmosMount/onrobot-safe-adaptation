@@ -44,6 +44,11 @@ class StateBuffer:
         with self._condition:
             return self._last_tick
 
+    @property
+    def latest_state(self) -> RobotState | None:
+        with self._condition:
+            return self._frames[-1] if self._frames else None
+
     def push(self, state: RobotState) -> bool:
         if state.tick is None:
             raise ValueError("LowState must contain tick")
@@ -116,4 +121,3 @@ class StateBuffer:
                     raise StateTimeout("Timed out waiting for manual simulator reset")
                 self._condition.wait(remaining)
             return self._generation
-

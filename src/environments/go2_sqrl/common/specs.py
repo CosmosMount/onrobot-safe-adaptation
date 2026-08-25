@@ -19,6 +19,7 @@ CONTROL_DT: Final = 0.02
 PHYSICS_DT: Final = 0.002
 PHYSICS_STEPS_PER_ACTION: Final = 10
 EPISODE_STEPS: Final = 500
+DEFAULT_BASE_HEIGHT: Final = 0.27
 
 DEFAULT_JOINT_POSITION = np.tile(
     np.asarray([0.0, 0.9, -1.8], dtype=np.float32), 4
@@ -64,8 +65,15 @@ class ActionSpecV1:
     scale: float = 0.25
     control_dt: float = CONTROL_DT
     max_target_rate: float = 12.0
+    # Training/checkpoint actuator contract. MuJoCo-only PD sensitivity
+    # experiments use environment.policy_kp/policy_kd instead.
     kp: float = 25.0
     kd: float = 0.5
+    effort_limit: float = 23.5
+    velocity_limit: float = 1000.0
+    armature: float = 0.0
+    joint_damping: float = 0.0
+    joint_friction: float = 0.0
     default_position: tuple[float, ...] = tuple(DEFAULT_JOINT_POSITION.tolist())
     joint_order: tuple[str, ...] = JOINT_NAMES
 

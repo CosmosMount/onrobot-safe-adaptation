@@ -145,18 +145,26 @@ class SDKClient:
                 actuator_torque=np.asarray(state.actuator_torque).copy(),
             )
 
-    def publish_joint_target(self, q_target: np.ndarray) -> None:
+    def publish_joint_target(
+        self,
+        q_target: np.ndarray,
+        *,
+        kp: float | None = None,
+        kd: float | None = None,
+    ) -> None:
         self.start()
         q_target = np.asarray(q_target, dtype=np.float32)
         if q_target.shape != (ACTION_SIZE,):
             raise ValueError(f"q_target must have shape (12,), got {q_target.shape}")
+        kp = ACTION_SPEC.kp if kp is None else float(kp)
+        kd = ACTION_SPEC.kd if kd is None else float(kd)
         for index in range(ACTION_SIZE):
             motor = self._command.motor_cmd[index]
             motor.mode = 0x01
             motor.q = float(q_target[index])
-            motor.kp = ACTION_SPEC.kp
+            motor.kp = kp
             motor.dq = 0.0
-            motor.kd = ACTION_SPEC.kd
+            motor.kd = kd
             motor.tau = 0.0
         self._command.crc = self._crc.Crc(self._command)
         self._publisher.Write(self._command)

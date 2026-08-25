@@ -11,6 +11,9 @@ def get_config(environment_name):
     config.rollout_mode = "partitioned"
     config.device = "gpu"
     config.target_velocity_x = 0.3
+    config.terrain_mode = "rough"
+    config.domain_randomization = False
+    config.friction = 0.4
     config.episode_steps = 500
     config.fall_angle_threshold = 0.8
     config.fall_consecutive_frames = 5
