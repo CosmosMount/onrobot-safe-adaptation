@@ -37,20 +37,24 @@ class ActionResult:
 
 @dataclass(slots=True)
 class RewardTerms:
-    track_x: float
-    track_xy: float
-    yaw: float
-    upright: float
-    energy: float
+    tracking_lin_vel: float
+    velocity_error: float
+    tracking_ang_vel: float
+    lin_vel_z: float
+    base_height: float
+    action_rate: float
+    similar_to_default: float
     total: float
 
     def as_dict(self) -> dict[str, float]:
         return {
-            "reward/track_x": self.track_x,
-            "reward/track_xy": self.track_xy,
-            "reward/yaw": self.yaw,
-            "reward/upright": self.upright,
-            "reward/energy": self.energy,
+            "reward/tracking_lin_vel": self.tracking_lin_vel,
+            "reward/velocity_error": self.velocity_error,
+            "reward/tracking_ang_vel": self.tracking_ang_vel,
+            "reward/lin_vel_z": self.lin_vel_z,
+            "reward/base_height": self.base_height,
+            "reward/action_rate": self.action_rate,
+            "reward/similar_to_default": self.similar_to_default,
             "reward/total": self.total,
         }
 

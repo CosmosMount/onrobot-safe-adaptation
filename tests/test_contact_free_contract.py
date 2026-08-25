@@ -75,10 +75,18 @@ def test_mujoco_reset_pd_defaults_settle_before_policy_takeover():
 
 def test_manifest_versions_sensor_free_estimator_and_imu_failure():
     manifest = build_manifest({"observation_size": 46})
-    assert manifest["manifest_version"] == MANIFEST_VERSION == 5
+    assert manifest["manifest_version"] == MANIFEST_VERSION == 7
+    assert manifest["reward_version"] == "flashsac-go2-walk-easy-command-v3"
+    assert manifest["reward_contract"]["command"]["linear_velocity_x"] == 0.5
+    np.testing.assert_allclose(
+        manifest["reward_contract"]["similar_to_default_joint_position"],
+        [0.0, 0.8, -1.5] * 2 + [0.0, 1.0, -1.5] * 2,
+    )
     estimator = manifest["observation"]["velocity_estimator"]
     assert estimator["version"] == VELOCITY_ESTIMATOR_VERSION
+    assert estimator["policy_visible"] is False
     assert estimator["external_contact_sensor"] is False
+    assert manifest["observation"]["velocity_command"]["indices"] == [27, 30]
     assert manifest["failure"]["version"] == FAILURE_CONTRACT_VERSION
     assert manifest["failure"]["external_contact_sensor"] is False
     assert manifest["failure"]["frame_unit"] == "physics_frames"

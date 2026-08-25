@@ -112,7 +112,8 @@ def project_actions_from_observation(
     observation_array = xp.asarray(observations)
     if observation_array.shape[-1] != OBSERVATION_SPEC.size:
         raise ValueError(
-            f"Observation must end in 46 values, got {observation_array.shape}"
+            f"Observation must end in {OBSERVATION_SPEC.size} values, "
+            f"got {observation_array.shape}"
         )
     applied, _ = project_action_targets(
         observation_array[..., OBSERVATION_SPEC.previous_action_q_target],

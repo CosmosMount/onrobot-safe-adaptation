@@ -18,6 +18,13 @@ from ..common.specs import (
     PHYSICS_STEPS_PER_ACTION,
 )
 from ..common.manifest import build_manifest, validate_manifest
+from ..common.reward import (
+    BASE_HEIGHT_TARGET,
+    REWARD_DT,
+    REWARD_DEFAULT_JOINT_POSITION,
+    REWARD_SCALES,
+    TRACKING_SIGMA,
+)
 from ..common.estimation import TorchVelocityEstimator
 from .general_properties import GeneralProperties
 from .mdp import (
@@ -151,6 +158,9 @@ class Go2IsaacEnv:
         )
         self._joint_indices = sdk_joint_indices(robot.joint_names, robot.device)
         self._previous_target = default_joint_target(self.nr_envs, robot.device)
+        self._previous_reward_action = torch.zeros(
+            (self.nr_envs, ACTION_SIZE), device=robot.device
+        )
         self._previous_quaternion = None
         self._velocity_estimator = TorchVelocityEstimator(
             self.nr_envs, robot.device
@@ -199,18 +209,22 @@ class Go2IsaacEnv:
         imu = self.backend.scene["imu"]
         joint_q = robot.data.joint_pos[:, self._joint_indices]
         joint_dq = robot.data.joint_vel[:, self._joint_indices]
-        body_velocity = self._velocity_estimator.update(
+        self._latest_estimated_body_velocity = self._velocity_estimator.update(
             joint_q,
             joint_dq,
             imu.data.ang_vel_b,
             imu.data.quat_w,
             imu.data.lin_acc_b,
         )
+        velocity_command = torch.zeros(
+            (self.nr_envs, 3), dtype=joint_q.dtype, device=joint_q.device
+        )
+        velocity_command[:, 0] = float(self.config.target_velocity_x)
         observation, quaternion = build_observation_tensor(
             joint_q,
             joint_dq,
             imu.data.ang_vel_b,
-            body_velocity,
+            velocity_command,
             imu.data.quat_w,
             self._previous_target,
             self._previous_quaternion,
@@ -227,6 +241,7 @@ class Go2IsaacEnv:
             dtype=self._previous_target.dtype,
             device=self._previous_target.device,
         )
+        self._previous_reward_action[env_ids] = 0.0
         self._velocity_estimator.reset(env_ids)
         self._fall_detector.reset(env_ids)
         if self._previous_quaternion is not None:
@@ -243,6 +258,7 @@ class Go2IsaacEnv:
         self._previous_target = default_joint_target(
             self.nr_envs, self._robot.device
         )
+        self._previous_reward_action.zero_()
         self._previous_quaternion = None
         self._velocity_estimator.reset()
         self._fall_detector.reset()
@@ -271,6 +287,7 @@ class Go2IsaacEnv:
         applied_action, target = project_action_targets_tensor(
             self._previous_target, action
         )
+        reward_action = action.clamp(-1.0, 1.0)
         self._previous_target = target
 
         _, _, backend_terminated, truncated, extras = self.backend.step(applied_action)
@@ -282,56 +299,92 @@ class Go2IsaacEnv:
         del extras
 
         # Capture all training-only truth before resetting IMU-failed bodies.
-        w, x, y, z = robot.data.root_quat_w.unbind(dim=-1)
-        roll = torch.atan2(
-            2.0 * (w * x + y * z), 1.0 - 2.0 * (x.square() + y.square())
-        )
-        pitch = torch.asin(
-            (2.0 * (w * y - z * x)).clamp(-1.0, 1.0)
-        )
-        roll_pitch = torch.stack((roll, pitch), dim=-1)
+        # The policy observes the proprioceptive estimator, not this simulator
+        # value, so retain a snapshot for sim-to-sim diagnostics.
         target_velocity = float(self.config.target_velocity_x)
-        body_velocity = robot.data.root_lin_vel_b
-        track_x = 1.0 - torch.abs(body_velocity[:, 0] - target_velocity) / (
-            2.0 * target_velocity
+        body_velocity = robot.data.root_lin_vel_b.clone()
+        tracking_lin_vel = torch.exp(
+            -(
+                (target_velocity - body_velocity[:, 0]).square()
+                + body_velocity[:, 1].square()
+            )
+            / TRACKING_SIGMA
         )
-        track_x = torch.where(
-            (body_velocity[:, 0] >= target_velocity)
-            & (body_velocity[:, 0] <= 2.0 * target_velocity),
-            torch.ones_like(track_x),
-            track_x,
+        velocity_error = (
+            (target_velocity - body_velocity[:, 0]).square()
+            + body_velocity[:, 1].square()
         )
-        track_x = torch.where(
-            (body_velocity[:, 0] <= -target_velocity)
-            | (body_velocity[:, 0] >= 4.0 * target_velocity),
-            torch.zeros_like(track_x),
-            track_x,
+        tracking_ang_vel = torch.exp(
+            -robot.data.root_ang_vel_b[:, 2].square() / TRACKING_SIGMA
         )
-        torque = robot.data.applied_torque[:, self._joint_indices]
-        reward = torch.clamp(
-            track_x
-            - torch.abs(body_velocity[:, 1])
-            - 0.1 * robot.data.root_ang_vel_b[:, 2].square()
-            - 10.0 * roll_pitch.square().sum(dim=-1)
-            - 0.0003 * torque.square().sum(dim=-1),
-            min=0.0,
+        lin_vel_z = body_velocity[:, 2].square()
+        base_height = robot.data.root_pos_w[:, 2]
+        base_height_error = (base_height - BASE_HEIGHT_TARGET).square()
+        action_rate = (
+            reward_action - self._previous_reward_action
+        ).square().sum(dim=-1)
+        joint_q = robot.data.joint_pos[:, self._joint_indices]
+        default_joint_q = torch.as_tensor(
+            REWARD_DEFAULT_JOINT_POSITION,
+            dtype=joint_q.dtype,
+            device=joint_q.device,
         )
+        similar_to_default = torch.abs(joint_q - default_joint_q).sum(dim=-1)
+        reward_terms = {
+            "tracking_lin_vel": REWARD_DT
+            * REWARD_SCALES["tracking_lin_vel"]
+            * tracking_lin_vel,
+            "velocity_error": REWARD_DT
+            * REWARD_SCALES["velocity_error"]
+            * velocity_error,
+            "tracking_ang_vel": REWARD_DT
+            * REWARD_SCALES["tracking_ang_vel"]
+            * tracking_ang_vel,
+            "lin_vel_z": REWARD_DT * REWARD_SCALES["lin_vel_z"] * lin_vel_z,
+            "base_height": REWARD_DT
+            * REWARD_SCALES["base_height"]
+            * base_height_error,
+            "action_rate": REWARD_DT
+            * REWARD_SCALES["action_rate"]
+            * action_rate,
+            "similar_to_default": REWARD_DT
+            * REWARD_SCALES["similar_to_default"]
+            * similar_to_default,
+        }
+        reward = torch.stack(tuple(reward_terms.values()), dim=0).sum(dim=0)
+        self._previous_reward_action.copy_(reward_action)
         failure = self._fall_detector.update(
             self.backend.scene["imu"].data.quat_w
-        ).clone()
+        )
+        failure = failure.clone()
         terminated = backend_terminated | failure
         already_reset = backend_terminated | truncated
         self._reset_failed_backend_envs(failure, already_reset)
         done = terminated | truncated
         self._reset_done_state(done)
         observation = self._observation()
+        estimated_body_velocity = self._latest_estimated_body_velocity.clone()
 
         self._episode_return += reward
         self._episode_length += 1
         info = {
             "failure": failure.float().cpu().numpy(),
             "applied_action": applied_action.detach().cpu().numpy(),
-            "velocity_estimation_error": np.zeros(self.nr_envs, dtype=np.float32),
+            "forward_velocity": body_velocity[:, 0].detach().cpu().numpy(),
+            "estimated_forward_velocity": estimated_body_velocity[
+                :, 0
+            ].detach().cpu().numpy(),
+            "target_velocity_error": (
+                body_velocity[:, 0] - target_velocity
+            ).abs().detach().cpu().numpy(),
+            "velocity_estimation_error": torch.linalg.vector_norm(
+                estimated_body_velocity - body_velocity, dim=-1
+            ).detach().cpu().numpy(),
+            **{
+                f"reward/{name}": value.detach().cpu().numpy()
+                for name, value in reward_terms.items()
+            },
+            "reward/total": reward.detach().cpu().numpy(),
             "final_observation": [None] * self.nr_envs,
             "final_info": [None] * self.nr_envs,
         }
@@ -409,6 +462,7 @@ class Go2IsaacEnv:
             normalizer,
             fall_angle_threshold=float(self.config.fall_angle_threshold),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
+            target_velocity_x=float(self.config.target_velocity_x),
         )
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):

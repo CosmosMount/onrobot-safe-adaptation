@@ -51,11 +51,13 @@ def _simulator_command(args) -> int:
 def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     if checkpoint is None and command in ("zero-shot", "finetune"):
         checkpoint_path = (
-            PROJECT_ROOT / "runs/go2_sqrl/pretrain/isaac_action_v5/models"
+            PROJECT_ROOT
+            / "runs/go2_sqrl/pretrain/isaac_flashsac_cmd_reward_v3/models"
         )
     elif checkpoint is None and command == "isaac-eval":
         checkpoint_path = (
-            PROJECT_ROOT / "runs/go2_sqrl/pretrain/isaac_action_v5/models"
+            PROJECT_ROOT
+            / "runs/go2_sqrl/pretrain/isaac_flashsac_cmd_reward_v3/models"
         )
     elif checkpoint is None and command == "eval":
         checkpoint_path = PROJECT_ROOT / "runs/go2_sqrl/finetune/mujoco/models"

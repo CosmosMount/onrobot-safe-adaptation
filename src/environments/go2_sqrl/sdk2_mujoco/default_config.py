@@ -51,7 +51,7 @@ def get_config(environment_name):
     config.episode_steps = 500
     # The policy has no command input, so evaluation must use the fixed velocity
     # objective on which it was pre-trained.
-    config.target_velocity_x = 0.3
+    config.target_velocity_x = 0.5
     config.fall_angle_threshold = 0.8
     config.fall_consecutive_frames = 5
 

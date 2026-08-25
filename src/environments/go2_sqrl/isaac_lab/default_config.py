@@ -10,7 +10,7 @@ def get_config(environment_name):
     config.nr_safety_envs = 64
     config.rollout_mode = "partitioned"
     config.device = "gpu"
-    config.target_velocity_x = 0.3
+    config.target_velocity_x = 0.5
     config.terrain_mode = "rough"
     config.domain_randomization = False
     config.friction = 0.4

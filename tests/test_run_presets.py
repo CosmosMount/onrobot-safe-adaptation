@@ -30,7 +30,10 @@ def test_zero_shot_is_a_flat_deterministic_task_policy_gate():
 
 def test_pretrain_parity_checkpoint_uses_flat_ground():
     assert "--environment.terrain_mode=flat" in RUN_PRESETS["pretrain"]
-    assert "--runner.run_name=isaac_action_v5" in RUN_PRESETS["pretrain"]
+    assert (
+        "--runner.run_name=isaac_flashsac_cmd_reward_v3"
+        in RUN_PRESETS["pretrain"]
+    )
 
 
 def test_isaac_eval_is_single_environment_deterministic_task_policy():

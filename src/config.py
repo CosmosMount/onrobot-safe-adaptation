@@ -60,7 +60,7 @@ RUN_PRESETS = {
     + (
         "--runner.mode=train",
         "--runner.exp_name=pretrain",
-        "--runner.run_name=isaac_action_v5",
+        "--runner.run_name=isaac_flashsac_cmd_reward_v3",
         "--runner.save_model=true",
         "--environment.name=go2_sqrl.isaac_lab",
         # Train the first transfer checkpoint on the same flat-ground task as
@@ -74,7 +74,7 @@ RUN_PRESETS = {
     + (
         "--runner.mode=test",
         "--runner.exp_name=evaluation",
-        "--runner.run_name=isaac_action_v5",
+        "--runner.run_name=isaac_flashsac_cmd_reward_v3",
         "--runner.nr_test_episodes=5",
         "--environment.name=go2_sqrl.isaac_lab",
         "--environment.nr_envs=1",

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .reward import REWARD_VERSION
+from .reward import (
+    BASE_HEIGHT_TARGET,
+    REWARD_DT,
+    REWARD_DEFAULT_JOINT_POSITION,
+    REWARD_SCALES,
+    REWARD_VERSION,
+    TRACKING_SIGMA,
+)
 from .specs import (
     ACTION_SPEC,
     DEFAULT_BASE_HEIGHT,
@@ -13,7 +20,7 @@ from .specs import (
 )
 
 
-MANIFEST_VERSION = 5
+MANIFEST_VERSION = 7
 VELOCITY_ESTIMATOR_VERSION = "proprioceptive-support-v2"
 FAILURE_CONTRACT_VERSION = "imu-roll-pitch-sustained-v1"
 ACTION_PIPELINE_VERSION = "sdk-absolute-position-v2"
@@ -24,6 +31,7 @@ def build_manifest(
     *,
     fall_angle_threshold: float = 0.8,
     fall_consecutive_frames: int = 5,
+    target_velocity_x: float = 0.5,
 ) -> dict[str, Any]:
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -32,8 +40,18 @@ def build_manifest(
             "size": OBSERVATION_SPEC.size,
             "joint_order": list(OBSERVATION_SPEC.joint_order),
             "quaternion_order": OBSERVATION_SPEC.quaternion_order,
+            "velocity_command": {
+                "indices": [
+                    OBSERVATION_SPEC.velocity_command.start,
+                    OBSERVATION_SPEC.velocity_command.stop,
+                ],
+                "linear_velocity_x": float(target_velocity_x),
+                "linear_velocity_y": 0.0,
+                "angular_velocity_z": 0.0,
+            },
             "velocity_estimator": {
                 "version": VELOCITY_ESTIMATOR_VERSION,
+                "policy_visible": False,
                 "inputs": [
                     "joint_q",
                     "joint_dq",
@@ -68,6 +86,29 @@ def build_manifest(
             "base_height": DEFAULT_BASE_HEIGHT,
         },
         "reward_version": REWARD_VERSION,
+        "reward_contract": {
+            "source": (
+                "https://github.com/Holiday-Robot/FlashSAC/blob/main/"
+                "flash_rl/envs/genesis_envs/go2_walk_easy.py"
+            ),
+            "dt": REWARD_DT,
+            "tracking_sigma": TRACKING_SIGMA,
+            "base_height_target": BASE_HEIGHT_TARGET,
+            "reward_scales_before_dt": dict(REWARD_SCALES),
+            "similar_to_default_joint_position": list(
+                REWARD_DEFAULT_JOINT_POSITION.tolist()
+            ),
+            "linear_velocity_frame": "full_quaternion_body_frame",
+            "command": {
+                "linear_velocity_x": float(target_velocity_x),
+                "linear_velocity_y": 0.0,
+                "angular_velocity_z": 0.0,
+            },
+            "failure_reward_shaping": False,
+            "stationary_local_optimum_fix": (
+                "negative_squared_xy_velocity_command_error"
+            ),
+        },
         "failure": {
             "version": FAILURE_CONTRACT_VERSION,
             "signal": "imu_quaternion_roll_pitch",

@@ -45,13 +45,13 @@ JOINT_UPPER_LIMIT = np.asarray(
 
 
 @dataclass(frozen=True)
-class ObservationSpecV1:
-    version: str = "go2-observation-v1"
+class ObservationSpecV2:
+    version: str = "go2-observation-v2-command"
     size: int = OBSERVATION_SIZE
     joint_q: slice = field(default_factory=lambda: slice(0, 12))
     joint_dq: slice = field(default_factory=lambda: slice(12, 24))
     imu_gyro: slice = field(default_factory=lambda: slice(24, 27))
-    body_velocity: slice = field(default_factory=lambda: slice(27, 30))
+    velocity_command: slice = field(default_factory=lambda: slice(27, 30))
     imu_quat: slice = field(default_factory=lambda: slice(30, 34))
     previous_action_q_target: slice = field(default_factory=lambda: slice(34, 46))
     quaternion_order: str = "WXYZ"
@@ -78,7 +78,7 @@ class ActionSpecV1:
     joint_order: tuple[str, ...] = JOINT_NAMES
 
 
-OBSERVATION_SPEC = ObservationSpecV1()
+OBSERVATION_SPEC = ObservationSpecV2()
 ACTION_SPEC = ActionSpecV1()
 
 

@@ -1379,6 +1379,9 @@ class SAC_QSafe:
             episode_steps = 0
             episode_failures = 0
             forward_velocity_sum = 0.0
+            forward_velocity_samples = []
+            estimated_forward_velocity_sum = 0.0
+            velocity_estimation_error_sum = 0.0
             target_velocity_error_sum = 0.0
             state, _ = self.eval_env.reset()
             while not done:
@@ -1407,8 +1410,18 @@ class SAC_QSafe:
                 episode_steps += 1
                 episode_failures += int(np.sum(failures))
                 if "forward_velocity" in info:
-                    forward_velocity_sum += float(
+                    forward_velocity = float(
                         np.mean(np.asarray(info["forward_velocity"]))
+                    )
+                    forward_velocity_sum += forward_velocity
+                    forward_velocity_samples.append(forward_velocity)
+                if "estimated_forward_velocity" in info:
+                    estimated_forward_velocity_sum += float(
+                        np.mean(np.asarray(info["estimated_forward_velocity"]))
+                    )
+                if "velocity_estimation_error" in info:
+                    velocity_estimation_error_sum += float(
+                        np.mean(np.asarray(info["velocity_estimation_error"]))
                     )
                 if "target_velocity_error" in info:
                     target_velocity_error_sum += float(
@@ -1422,6 +1435,29 @@ class SAC_QSafe:
                 summary += (
                     f", Mean forward velocity: "
                     f"{forward_velocity_sum / episode_steps:.6f}"
+                )
+                window_size = min(100, len(forward_velocity_samples))
+                window_means = [
+                    float(np.mean(forward_velocity_samples[start:start + window_size]))
+                    for start in range(
+                        0,
+                        len(forward_velocity_samples) - window_size + 1,
+                        window_size,
+                    )
+                ]
+                summary += (
+                    f", Last {window_size}-step velocity: {window_means[-1]:.6f}, "
+                    f"Min {window_size}-step velocity: {min(window_means):.6f}"
+                )
+            if episode_steps and "estimated_forward_velocity" in info:
+                summary += (
+                    f", Mean estimated forward velocity: "
+                    f"{estimated_forward_velocity_sum / episode_steps:.6f}"
+                )
+            if episode_steps and "velocity_estimation_error" in info:
+                summary += (
+                    f", Mean velocity estimation error: "
+                    f"{velocity_estimation_error_sum / episode_steps:.6f}"
                 )
             if episode_steps and "target_velocity_error" in info:
                 summary += (

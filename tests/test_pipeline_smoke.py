@@ -53,11 +53,12 @@ def test_sdk_environment_observation_command_reward_smoke():
     environment = Go2SDKMujocoEnv(config, client=FakeSDKClient())
     observation, _ = environment.reset()
     assert observation.shape == (1, 46)
+    np.testing.assert_allclose(observation[0, 27:30], [0.5, 0.0, 0.0])
     next_observation, reward, terminated, truncated, info = environment.step(
         np.zeros((1, 12), dtype=np.float32)
     )
     assert next_observation.shape == (1, 46)
-    assert reward[0] == 1.0
+    assert reward[0] == pytest.approx(-0.0030842112, abs=1e-7)
     assert not terminated[0]
     assert not truncated[0]
     assert info["applied_action"].shape == (1, 12)

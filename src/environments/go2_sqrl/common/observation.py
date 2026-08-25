@@ -1,4 +1,4 @@
-"""Construction of the exact 46-dimensional policy observation."""
+"""Construction of the 46D command-conditioned policy observation."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def continuous_quaternion_wxyz(
 
 def build_observation(
     state: RobotState,
-    body_velocity: np.ndarray,
+    velocity_command: np.ndarray,
     previous_q_target: np.ndarray,
     previous_quaternion: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -38,8 +38,8 @@ def build_observation(
     observation[OBSERVATION_SPEC.imu_gyro] = np.asarray(
         state.imu_gyro, dtype=np.float32
     )
-    observation[OBSERVATION_SPEC.body_velocity] = np.asarray(
-        body_velocity, dtype=np.float32
+    observation[OBSERVATION_SPEC.velocity_command] = np.asarray(
+        velocity_command, dtype=np.float32
     )
     observation[OBSERVATION_SPEC.imu_quat] = quaternion
     observation[OBSERVATION_SPEC.previous_action_q_target] = np.asarray(
@@ -67,14 +67,15 @@ class ObservationBuilder:
     def set_previous_q_target(self, q_target: np.ndarray) -> None:
         self.previous_q_target = np.asarray(q_target, dtype=np.float32).copy()
 
-    def build(self, state: RobotState) -> tuple[np.ndarray, np.ndarray]:
-        body_velocity = self.velocity_estimator.update(state)
+    def build(
+        self, state: RobotState, velocity_command: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        estimated_body_velocity = self.velocity_estimator.update(state)
         observation, quaternion = build_observation(
             state,
-            body_velocity,
+            velocity_command,
             self.previous_q_target,
             self.previous_quaternion,
         )
         self.previous_quaternion = quaternion
-        return observation, body_velocity
-
+        return observation, estimated_body_velocity

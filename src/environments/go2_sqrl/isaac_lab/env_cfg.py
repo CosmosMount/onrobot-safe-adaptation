@@ -74,7 +74,7 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
         )
         # ManagerBasedRLEnv requires a reward manager, but its output is not
         # part of the Go2 SQRL contract.  The adapter computes the shared
-        # total-track-xy reward itself, so disable every inherited term.
+        # FlashSAC walk-easy reward itself, so disable every inherited term.
         for reward_name in (
             "track_lin_vel_xy_exp",
             "track_ang_vel_z_exp",

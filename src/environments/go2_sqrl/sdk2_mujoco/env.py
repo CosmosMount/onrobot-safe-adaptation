@@ -14,6 +14,7 @@ from ..common.action import ActionMapper, project_actions_from_observation
 from ..common.estimation.velocity import quaternion_rotation_matrix_wxyz
 from ..common.observation import ObservationBuilder
 from ..common.reward import compute_reward
+from ..common.reward import BASE_HEIGHT_TARGET
 from ..common.specs import ACTION_SIZE, DEFAULT_JOINT_POSITION, OBSERVATION_SIZE
 from ..common.termination import EpisodeTracker
 from ..common.manifest import build_manifest, validate_manifest
@@ -75,6 +76,7 @@ class Go2SDKMujocoEnv:
         self._last_observation: np.ndarray | None = None
         self._policy_blend_elapsed = 0.0
         self._initial_simulator_reset_done = False
+        self._previous_reward_action = np.zeros(ACTION_SIZE, dtype=np.float32)
 
     @staticmethod
     def project_actions(states, actions):
@@ -257,6 +259,7 @@ class Go2SDKMujocoEnv:
         self.fall_detector.reset()
         self.episode.reset()
         self._policy_blend_elapsed = 0.0
+        self._previous_reward_action.fill(0.0)
         # Capture the measured reset pose before issuing any command. Stand-up
         # interpolation begins from this feedback, not from an assumed pose.
         state = self.client.state_buffer.latest_state
@@ -266,7 +269,9 @@ class Go2SDKMujocoEnv:
         else:
             self._last_tick = int(state.tick)
         state = self._hold_reset_pose(state)
-        observation, _ = self.observation_builder.build(state)
+        observation, _ = self.observation_builder.build(
+            state, self._velocity_command()
+        )
         self._last_observation = observation
         return observation[None, :], {}
 
@@ -286,8 +291,17 @@ class Go2SDKMujocoEnv:
         self.fall_detector.reset()
         self.episode.reset()
         self._policy_blend_elapsed = 0.0
-        observation, _ = self.observation_builder.build(state)
+        self._previous_reward_action.fill(0.0)
+        observation, _ = self.observation_builder.build(
+            state, self._velocity_command()
+        )
         return observation
+
+    def _velocity_command(self):
+        return np.asarray(
+            [float(self.config.target_velocity_x), 0.0, 0.0],
+            dtype=np.float32,
+        )
 
     def step(self, actions):
         action = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_SIZE)[0]
@@ -309,6 +323,7 @@ class Go2SDKMujocoEnv:
             dtype=np.float32,
         )
         mapped = self.action_mapper.apply(blended_action)
+        reward_action = np.clip(mapped.raw_action, -1.0, 1.0)
         # JAX updates can take longer than one control interval while the C++
         # simulator continues publishing LowState.  Discard that backlog by
         # anchoring the next ten-frame window at the latest pre-command tick.
@@ -328,7 +343,9 @@ class Go2SDKMujocoEnv:
         for frame in frames:
             failure = self.fall_detector.update(frame.imu_quat) or failure
         final_state = frames[-1]
-        observation, estimated_body_velocity = self.observation_builder.build(final_state)
+        observation, estimated_body_velocity = self.observation_builder.build(
+            final_state, self._velocity_command()
+        )
 
         truth = self.client.latest_training_state()
         if truth is None:
@@ -338,28 +355,42 @@ class Go2SDKMujocoEnv:
             world_velocity = np.asarray(truth.world_velocity)
         rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
         truth_body_velocity = rotation.T @ np.asarray(world_velocity)
-        base_height = None
+        base_height = BASE_HEIGHT_TARGET
         if truth is not None and truth.base_position is not None:
             base_height = float(np.asarray(truth.base_position)[2])
             failure = self.fall_detector.update_base_height(base_height) or failure
-        torque = (
-            np.zeros(ACTION_SIZE, dtype=np.float32)
-            if truth is None or truth.actuator_torque is None
-            else np.asarray(truth.actuator_torque)
-        )
         terms = compute_reward(
             world_velocity,
             final_state.imu_quat,
             final_state.imu_gyro,
-            torque,
+            final_state.joint_q,
+            reward_action,
+            self._previous_reward_action,
             float(self.config.target_velocity_x),
+            base_height=base_height,
         )
+        self._previous_reward_action = reward_action.copy()
         terminated, truncated = self.episode.advance(terms.total, failure)
 
         info = {
             "failure": np.asarray([int(failure)], dtype=np.float32),
             "applied_action": mapped.applied_action[None, :],
             "policy_blend_alpha": np.asarray([alpha], dtype=np.float32),
+            "forward_velocity": np.asarray(
+                [truth_body_velocity[0]], dtype=np.float32
+            ),
+            "estimated_forward_velocity": np.asarray(
+                [estimated_body_velocity[0]], dtype=np.float32
+            ),
+            "target_velocity_error": np.asarray(
+                [
+                    abs(
+                        float(self.config.target_velocity_x)
+                        - float(truth_body_velocity[0])
+                    )
+                ],
+                dtype=np.float32,
+            ),
             "velocity_estimation_error": np.asarray(
                 [np.linalg.norm(truth_body_velocity - estimated_body_velocity)],
                 dtype=np.float32,
@@ -423,6 +454,7 @@ class Go2SDKMujocoEnv:
             normalizer,
             fall_angle_threshold=float(self.config.fall_angle_threshold),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
+            target_velocity_x=float(self.config.target_velocity_x),
         )
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):

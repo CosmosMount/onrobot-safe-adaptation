@@ -13,7 +13,10 @@ from src.environments.go2_sqrl.common.manifest import (
     build_manifest,
     validate_manifest,
 )
-from src.environments.go2_sqrl.common.reward import compute_reward, track_x_reward
+from src.environments.go2_sqrl.common.reward import (
+    REWARD_DEFAULT_JOINT_POSITION,
+    compute_reward,
+)
 from src.environments.go2_sqrl.common.specs import (
     ACTION_SPEC,
     DEFAULT_JOINT_POSITION,
@@ -37,6 +40,7 @@ def robot_state(quaternion=(1.0, 0.0, 0.0, 0.0)):
 
 def test_versioned_observation_layout_and_joint_order():
     assert OBSERVATION_SPEC.size == 46
+    assert OBSERVATION_SPEC.velocity_command == slice(27, 30)
     assert ACTION_SPEC.size == 12
     assert OBSERVATION_SPEC.previous_action_q_target == slice(34, 46)
     source = [f"{name}_joint" for name in reversed(OBSERVATION_SPEC.joint_order)]
@@ -68,23 +72,38 @@ def test_action_limit_rate_limit_and_inverse_mapping():
     assert np.all(result.applied_action <= 1.0)
 
 
-@pytest.mark.parametrize(
-    ("velocity", "expected"),
-    [(-0.3, 0.0), (0.3, 1.0), (0.6, 1.0), (1.2, 0.0)],
-)
-def test_track_x_piecewise_boundaries(velocity, expected):
-    assert track_x_reward(velocity, 0.3) == pytest.approx(expected)
-
-
 def test_reward_and_episode_semantics():
     terms = compute_reward(
-        np.asarray([0.3, 0.0, 0.0]),
+        np.asarray([0.5, 0.0, 0.0]),
         np.asarray([1.0, 0.0, 0.0, 0.0]),
         np.zeros(3),
+        REWARD_DEFAULT_JOINT_POSITION,
         np.zeros(12),
-        target_velocity_x=0.3,
+        np.zeros(12),
+        target_velocity_x=0.5,
+        base_height=0.3,
     )
-    assert terms.total == pytest.approx(1.0)
+    assert terms.tracking_lin_vel == pytest.approx(0.02)
+    assert terms.velocity_error == pytest.approx(0.0)
+    assert terms.tracking_ang_vel == pytest.approx(0.004)
+    assert terms.lin_vel_z == pytest.approx(0.0)
+    assert terms.base_height == pytest.approx(0.0)
+    assert terms.action_rate == pytest.approx(0.0)
+    assert terms.similar_to_default == pytest.approx(0.0)
+    assert terms.total == pytest.approx(0.024)
+
+    stationary = compute_reward(
+        np.zeros(3),
+        np.asarray([1.0, 0.0, 0.0, 0.0]),
+        np.zeros(3),
+        REWARD_DEFAULT_JOINT_POSITION,
+        np.zeros(12),
+        np.zeros(12),
+        target_velocity_x=0.5,
+        base_height=0.3,
+    )
+    assert stationary.velocity_error == pytest.approx(-0.015)
+    assert stationary.total < 0.0
     tracker = EpisodeTracker(max_steps=2)
     assert tracker.advance(1.0, failure=False) == (False, False)
     assert tracker.advance(1.0, failure=False) == (False, True)
@@ -99,3 +118,8 @@ def test_checkpoint_manifest_rejects_contract_drift():
     incompatible["observation"]["quaternion_order"] = "XYZW"
     with pytest.raises(ValueError, match="quaternion_order"):
         validate_manifest(incompatible, expected)
+    incompatible_command = build_manifest(
+        {"observation_size": 46}, target_velocity_x=0.3
+    )
+    with pytest.raises(ValueError, match="linear_velocity_x"):
+        validate_manifest(incompatible_command, expected)
