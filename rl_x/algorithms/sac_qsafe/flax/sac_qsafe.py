@@ -139,7 +139,9 @@ class SAC_QSafe:
             self.target_entropy = -np.prod(self.train_env.single_action_space.shape).item()
         else:
             self.target_entropy = float(self.target_entropy)
-        self.entropy_coefficient = EntropyCoefficient(1.0)
+        self.entropy_coefficient = EntropyCoefficient(
+            float(config.algorithm.alpha_init)
+        )
 
         self.policy.apply = jax.jit(self.policy.apply)
         self.critic.apply = jax.jit(self.critic.apply)

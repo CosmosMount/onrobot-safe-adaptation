@@ -33,6 +33,14 @@ class QSafe:
         self.candidate_actions = int(self.config.candidate_actions)
         if self.candidate_actions < 1:
             raise ValueError("algorithm.qsafe.candidate_actions must be at least 1.")
+        self.finetune_selector = str(
+            getattr(self.config, "finetune_selector", "importance")
+        )
+        if self.finetune_selector not in ("importance", "first_safe"):
+            raise ValueError(
+                "algorithm.qsafe.finetune_selector must be 'importance' or "
+                "'first_safe'."
+            )
         self.observation_shape = tuple(env.single_observation_space.shape)
         self.action_shape = tuple(env.single_action_space.shape)
         self.observation_indices = np.asarray(
@@ -172,16 +180,21 @@ class QSafe:
             )
             selected = boundary_scores.argmax(dim=1)
         elif phase == "finetune":
-            # Practical SQRL: mask unsafe samples, then importance-sample the
-            # remaining candidates according to their likelihood under pi.
-            logits = candidate_log_probs.reshape(nr_envs, nr_candidates)
-            masked_logits = torch.where(
-                safe_mask, logits, torch.full_like(logits, -torch.inf)
-            )
-            masked_logits = torch.where(
-                fallback[:, None], torch.zeros_like(masked_logits), masked_logits
-            )
-            selected = torch.distributions.Categorical(logits=masked_logits).sample()
+            if self.finetune_selector == "first_safe":
+                selected = safe_mask.to(torch.int64).argmax(dim=1)
+            else:
+                # Practical SQRL: mask unsafe samples, then importance-sample
+                # remaining candidates according to their likelihood under pi.
+                logits = candidate_log_probs.reshape(nr_envs, nr_candidates)
+                masked_logits = torch.where(
+                    safe_mask, logits, torch.full_like(logits, -torch.inf)
+                )
+                masked_logits = torch.where(
+                    fallback[:, None], torch.zeros_like(masked_logits), masked_logits
+                )
+                selected = torch.distributions.Categorical(
+                    logits=masked_logits
+                ).sample()
         else:
             raise ValueError(f"Unknown SQRL phase: {phase}")
 

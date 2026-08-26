@@ -41,6 +41,14 @@ class QSafe:
         self.candidate_actions = int(self.config.candidate_actions)
         if self.candidate_actions < 1:
             raise ValueError("algorithm.qsafe.candidate_actions must be at least 1.")
+        self.finetune_selector = str(
+            getattr(self.config, "finetune_selector", "importance")
+        )
+        if self.finetune_selector not in ("importance", "first_safe"):
+            raise ValueError(
+                "algorithm.qsafe.finetune_selector must be 'importance' or "
+                "'first_safe'."
+            )
         self.observation_shape = tuple(env.single_observation_space.shape)
         self.action_shape = tuple(env.single_action_space.shape)
         self.observation_indices = np.asarray(
@@ -92,7 +100,13 @@ class QSafe:
         )
         self._select_finetune_jit = jax.jit(
             lambda params, states, actions, log_probs, key: self._select_kernel(
-                params, states, actions, log_probs, key, pretrain=False
+                params,
+                states,
+                actions,
+                log_probs,
+                key,
+                pretrain=False,
+                first_safe=self.finetune_selector == "first_safe",
             )
         )
         self.replay_buffer = SafetyReplayBuffer(
@@ -225,6 +239,7 @@ class QSafe:
         selection_key,
         *,
         pretrain,
+        first_safe=False,
     ):
         nr_envs, nr_candidates = candidate_actions.shape[:2]
         repeated_states = jnp.repeat(states[:, None, :], nr_candidates, axis=1)
@@ -239,6 +254,8 @@ class QSafe:
         if pretrain:
             scores = jnp.where(safe_mask, q_values, -jnp.inf)
             selected = jnp.argmax(scores, axis=1)
+        elif first_safe:
+            selected = jnp.argmax(safe_mask, axis=1)
         else:
             logits = candidate_log_probs.reshape((nr_envs, nr_candidates))
             logits = jnp.where(safe_mask, logits, -jnp.inf)

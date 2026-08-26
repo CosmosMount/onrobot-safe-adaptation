@@ -22,6 +22,10 @@ def get_config(algorithm_name):
     config.tau = 0.005
     config.gamma = 0.99
     config.target_entropy = "auto"
+    # Keep the historical default while allowing reward-scale-matched target
+    # experiments. The Go2 reward is multiplied by control_dt, so resetting a
+    # transferred actor to alpha=1 can overwhelm its task objective.
+    config.alpha_init = 1.0
     config.log_std_min = -20
     config.log_std_max = 2
     config.nr_hidden_units = 256
@@ -64,6 +68,10 @@ def get_config(algorithm_name):
     # The paper does not publish the finite rejection pool size.  The verified
     # Go2 reproduction uses 100 candidates and ten recent complete rollouts.
     config.qsafe.candidate_actions = 100
+    # ``importance`` follows the paper's practical finite-candidate selector.
+    # ``first_safe`` is the neutral rejection-sampling ablation used by the
+    # independent Go2 reproduction.
+    config.qsafe.finetune_selector = "importance"
     config.qsafe.max_trajectories = 10
     config.qsafe.nr_hidden_units = 256
     config.qsafe.updates_per_iteration = 1
