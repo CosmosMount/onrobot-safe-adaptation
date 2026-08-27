@@ -6,8 +6,7 @@ This module is imported only after :class:`isaaclab.app.AppLauncher` starts.
 from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
-from isaaclab.sensors import Imu, ImuCfg
-from isaaclab.sensors.sensor_base import SensorBase
+from isaaclab.sensors import ImuCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
     LocomotionVelocityRoughEnvCfg,
 )
@@ -20,14 +19,6 @@ from .terrain_cfg import configure_terrain, configure_terrain_mode
 
 
 GO2_USD_PATH = PROJECT_ROOT / "assets" / "robots" / "go2" / "usd" / "go2.usd"
-
-
-class PolicyIntervalImu(Imu):
-    """Use the configured capture interval for the IMU velocity derivative."""
-
-    def update(self, dt: float, force_recompute: bool = False):
-        self._dt = self.cfg.update_period or dt
-        SensorBase.update(self, dt, force_recompute)
 
 
 @configclass
@@ -61,9 +52,8 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
         actuator.dynamic_friction = ACTION_SPEC.joint_friction
         actuator.viscous_friction = ACTION_SPEC.joint_damping
         self.scene.imu = ImuCfg(
-            class_type=PolicyIntervalImu,
             prim_path="{ENV_REGEX_NS}/Robot/base",
-            update_period=ACTION_SPEC.control_dt,
+            update_period=0.0,
             history_length=0,
             debug_vis=False,
         )

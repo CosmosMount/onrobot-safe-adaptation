@@ -3,64 +3,20 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-import fcntl
 import importlib
 import os
-import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 from .config import (
     DEFAULT_DDS_DOMAIN_ID,
     DEFAULT_DDS_INTERFACE,
     DEFAULT_MUJOCO_SCENE,
-    PRETRAIN_RUN_NAME,
     PROJECT_ROOT,
     RUN_PRESETS,
     find_unitree_mujoco_root,
 )
-
-
-@contextmanager
-def _runtime_lock(kind: str, domain_id: int, interface: str, directory=None):
-    """Enforce one simulator/policy owner for a DDS endpoint.
-
-    The lock is owned by the process file descriptor, so stale files after a
-    crash are harmless.  Keeping simulator and policy locks separate permits
-    exactly one of each while rejecting the duplicate-publisher situation that
-    interleaves LowState ticks and invalidates control-window measurements.
-    """
-
-    safe_interface = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(interface))
-    lock_directory = Path(directory or tempfile.gettempdir())
-    lock_path = lock_directory / (
-        f"onrobot-safe-adaptation-{kind}-dds{int(domain_id)}-{safe_interface}.lock"
-    )
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            handle.seek(0)
-            owner = handle.read().strip() or "unknown"
-            raise RuntimeError(
-                f"A {kind} process already owns DDS domain {domain_id} on "
-                f"{interface!r} (owner pid {owner}). Stop it before starting "
-                "another experiment."
-            ) from exc
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(os.getpid()))
-        handle.flush()
-        yield lock_path
-    finally:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
 
 
 def _simulator_command(args) -> int:
@@ -96,12 +52,12 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     if checkpoint is None and command in ("zero-shot", "finetune"):
         checkpoint_path = (
             PROJECT_ROOT
-            / f"runs/go2_sqrl/pretrain/{PRETRAIN_RUN_NAME}/models"
+            / "runs/go2_sqrl/pretrain/isaac_flashsac_cmd_reward_v3/models"
         )
     elif checkpoint is None and command == "isaac-eval":
         checkpoint_path = (
             PROJECT_ROOT
-            / f"runs/go2_sqrl/pretrain/{PRETRAIN_RUN_NAME}/models"
+            / "runs/go2_sqrl/pretrain/isaac_flashsac_cmd_reward_v3/models"
         )
     elif checkpoint is None and command == "eval":
         checkpoint_path = PROJECT_ROOT / "runs/go2_sqrl/finetune/mujoco/models"
@@ -130,21 +86,10 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
             "Fine-tune/zero-shot requires policy.model and qsafe.model in "
             f"{directory}. Pass --checkpoint <models-directory>."
         )
-    flags = [
+    return [
         f"--algorithm.pretrained_policy_path={policy}",
         f"--algorithm.qsafe.checkpoint_path={qsafe}",
     ]
-    if command in ("zero-shot", "finetune"):
-        task_checkpoint = directory / "final.model"
-        if not task_checkpoint.exists():
-            raise FileNotFoundError(
-                "Target-task transfer requires final.model so the task critics and entropy "
-                f"coefficient are transferred with the actor: {task_checkpoint}"
-            )
-        flags.append(
-            f"--algorithm.pretrained_task_checkpoint_path={task_checkpoint}"
-        )
-    return flags
 
 
 def _run_rlx(args, remaining: list[str]) -> int:
@@ -211,11 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sim":
         if remaining:
             parser.error(f"unknown simulator arguments: {' '.join(remaining)}")
-        with _runtime_lock("simulator", args.domain_id, args.interface):
-            return _simulator_command(args)
-    if args.command in ("zero-shot", "finetune", "eval"):
-        with _runtime_lock("policy", args.domain_id, args.interface):
-            return _run_rlx(args, remaining)
+        return _simulator_command(args)
     return _run_rlx(args, remaining)
 
 

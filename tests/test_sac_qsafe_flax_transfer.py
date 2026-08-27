@@ -17,16 +17,12 @@ torch = pytest.importorskip("torch")
 import torch.nn.functional as torch_functional
 
 from gymnasium.spaces import Box
-from ml_collections import ConfigDict
 
-from rl_x.algorithms.qsafe.flax import QSafe
 from rl_x.algorithms.qsafe.flax.safety_critic import SafetyQNetwork
 from rl_x.algorithms.sac.flax.policy import get_policy
-from rl_x.algorithms.sac.flax.critic import get_critic
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
     load_torch_qsafe_artifact,
-    load_torch_task_artifact,
 )
 from rl_x.algorithms.sac_qsafe.flax.distributions import (
     squashed_gaussian_log_probability,
@@ -76,60 +72,6 @@ def _policy_and_template():
 
 def _tensor(values):
     return torch.as_tensor(np.asarray(values, dtype=np.float32))
-
-
-def test_sorl_uses_trainable_twin_safety_critics():
-    config = ConfigDict()
-    config.environment = ConfigDict({"nr_envs": 1})
-    config.algorithm = ConfigDict()
-    config.algorithm.phase = "finetune"
-    config.algorithm.safety_objective = "sorl"
-    config.algorithm.sorl = ConfigDict({"unsafe_replay_fraction": 0.5})
-    config.algorithm.qsafe = ConfigDict(
-        {
-            "epsilon": 0.1,
-            "gamma": 0.7,
-            "tau": 0.005,
-            "batch_size": 8,
-            "candidate_actions": 4,
-            "finetune_selector": "importance",
-            "nr_hidden_units": 32,
-            "learning_rate": 3e-4,
-            "buffer_size": 100,
-            "max_trajectories": 10,
-        }
-    )
-    critic = QSafe(
-        config,
-        _Environment(),
-        np.random.default_rng(0),
-        jax.random.PRNGKey(0),
-        defer_checkpoint_load=True,
-    )
-    assert critic.second_state is not None
-    assert not critic.frozen
-
-    states = np.zeros((1, OBSERVATION_SIZE), dtype=np.float32)
-    actions = np.zeros((1, ACTION_SIZE), dtype=np.float32)
-    critic.add_transition(
-        states,
-        actions,
-        states,
-        np.zeros(1, dtype=np.float32),
-        np.zeros(1, dtype=np.float32),
-        np.zeros(1, dtype=np.float32),
-    )
-    metrics = critic.update(
-        lambda next_states, _: jnp.zeros(
-            (next_states.shape[0], ACTION_SIZE), dtype=jnp.float32
-        )
-    )
-    risks = critic.conservative_values(jnp.asarray(states), jnp.asarray(actions))
-
-    assert int(critic.state.step) == 1
-    assert int(critic.second_state.step) == 1
-    assert 0.0 <= float(risks[0, 0]) <= 1.0
-    assert "sorl/safety_disagreement" in metrics
 
 
 def _linear_state(out_features, in_features, offset):
@@ -273,82 +215,6 @@ def _torch_qsafe_state(offset):
         "network.4.weight": output_weight,
         "network.4.bias": output_bias,
     }
-
-
-def _torch_task_critic_state(offset):
-    first_weight, first_bias = _linear_state(
-        HIDDEN_SIZE, OBSERVATION_SIZE + ACTION_SIZE, offset
-    )
-    second_weight, second_bias = _linear_state(
-        HIDDEN_SIZE, HIDDEN_SIZE, offset + 0.01
-    )
-    output_weight, output_bias = _linear_state(1, HIDDEN_SIZE, offset - 0.01)
-    return {
-        "_orig_mod.critic.0.weight": first_weight,
-        "_orig_mod.critic.0.bias": first_bias,
-        "_orig_mod.critic.2.weight": second_weight,
-        "_orig_mod.critic.2.bias": second_bias,
-        "_orig_mod.critic.4.weight": output_weight,
-        "_orig_mod.critic.4.bias": output_bias,
-    }
-
-
-def test_torch_task_critic_transfer_matches_fixed_input(tmp_path):
-    config = SimpleNamespace(
-        algorithm=SimpleNamespace(nr_hidden_units=HIDDEN_SIZE)
-    )
-    critic = get_critic(config, _Environment())
-    observations = np.linspace(
-        -0.75, 0.75, 2 * OBSERVATION_SIZE, dtype=np.float32
-    ).reshape(2, OBSERVATION_SIZE)
-    actions = np.linspace(-0.5, 0.5, 2 * ACTION_SIZE, dtype=np.float32).reshape(
-        2, ACTION_SIZE
-    )
-    template = critic.init(
-        jax.random.PRNGKey(2),
-        jnp.asarray(observations),
-        jnp.asarray(actions),
-    )
-    online_states = [_torch_task_critic_state(0.01), _torch_task_critic_state(-0.02)]
-    target_states = [_torch_task_critic_state(0.03), _torch_task_critic_state(-0.04)]
-    checkpoint_path = tmp_path / "final.model"
-    torch.save(
-        {
-            "q1_state_dict": online_states[0],
-            "q2_state_dict": online_states[1],
-            "q1_target_state_dict": target_states[0],
-            "q2_target_state_dict": target_states[1],
-            "log_alpha": torch.tensor(-4.25),
-        },
-        checkpoint_path,
-    )
-    artifact = load_torch_task_artifact(
-        checkpoint_path, template, template
-    )
-
-    torch_inputs = torch.cat((_tensor(observations), _tensor(actions)), dim=-1)
-    expected = []
-    for state in online_states:
-        value = torch_functional.relu(
-            torch_functional.linear(
-                torch_inputs, state["_orig_mod.critic.0.weight"], state["_orig_mod.critic.0.bias"]
-            )
-        )
-        value = torch_functional.relu(
-            torch_functional.linear(
-                value, state["_orig_mod.critic.2.weight"], state["_orig_mod.critic.2.bias"]
-            )
-        )
-        expected.append(
-            torch_functional.linear(
-                value, state["_orig_mod.critic.4.weight"], state["_orig_mod.critic.4.bias"]
-            ).numpy()
-        )
-    actual = critic.apply(
-        artifact["online_params"], jnp.asarray(observations), jnp.asarray(actions)
-    )
-    np.testing.assert_allclose(np.asarray(actual), np.stack(expected), atol=1e-5)
-    assert artifact["log_alpha"] == pytest.approx(-4.25)
 
 
 def test_torch_qsafe_transfer_matches_fixed_input(tmp_path):

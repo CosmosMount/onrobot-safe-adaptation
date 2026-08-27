@@ -13,7 +13,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DDS_DOMAIN_ID = 1
 DEFAULT_DDS_INTERFACE = "lo"
-PRETRAIN_RUN_NAME = "isaac_sqrl_v05_400env_300k"
 # Keep the default transfer gate on the flat scene.  Terrain evaluation remains
 # available explicitly through ``--scene scene_terrain.xml`` after flat
 # zero-shot locomotion passes.
@@ -61,14 +60,13 @@ RUN_PRESETS = {
     + (
         "--runner.mode=train",
         "--runner.exp_name=pretrain",
-        f"--runner.run_name={PRETRAIN_RUN_NAME}",
+        "--runner.run_name=isaac_flashsac_cmd_reward_v3",
         "--runner.save_model=true",
         "--environment.name=go2_sqrl.isaac_lab",
         # Train the first transfer checkpoint on the same flat-ground task as
         # the canonical MuJoCo scene.  Rough-terrain robustness is a later
         # training/evaluation gate, not part of the simulator parity check.
         "--environment.terrain_mode=flat",
-        "--algorithm.total_timesteps=300000",
         "--algorithm.phase=pretrain",
         "--algorithm.rollout_mode=partitioned",
     ),
@@ -76,7 +74,7 @@ RUN_PRESETS = {
     + (
         "--runner.mode=test",
         "--runner.exp_name=evaluation",
-        f"--runner.run_name={PRETRAIN_RUN_NAME}",
+        "--runner.run_name=isaac_flashsac_cmd_reward_v3",
         "--runner.nr_test_episodes=5",
         "--environment.name=go2_sqrl.isaac_lab",
         "--environment.nr_envs=1",
@@ -105,11 +103,7 @@ RUN_PRESETS = {
         "--runner.run_name=mujoco",
         "--runner.save_model=true",
         "--environment.name=go2_sqrl.sdk2_mujoco",
-        "--algorithm.total_timesteps=300000",
         "--algorithm.phase=finetune",
-        # SORL target adaptation: safety-critic reward shaping without SQRL's
-        # finite-candidate rejection or Lagrangian action constraint.
-        "--algorithm.safety_objective=sorl",
     ),
     "eval": JAX_ONLINE_FLAGS
     + (

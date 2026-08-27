@@ -21,7 +21,6 @@ from rl_x.algorithms.sac.flax.replay_buffer import ReplayBuffer
 from rl_x.algorithms.sac.flax.rl_train_state import RLTrainState
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
-    SorlRewardShaper,
     extract_failure_signal,
     restore_algorithm_config,
     validate_safety_rollout_environment,
@@ -30,7 +29,6 @@ from rl_x.algorithms.qsafe.flax import QSafe
 from rl_x.algorithms.qsafe.flax.projection import resolve_action_projectors
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
-    load_torch_task_artifact,
     make_native_policy_artifact,
     validate_policy_contract,
 )
@@ -86,47 +84,6 @@ class SAC_QSafe:
         self.phase = config.algorithm.phase
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
-        self.safety_objective = str(config.algorithm.safety_objective)
-        if self.safety_objective not in ("sqrl", "sorl"):
-            raise ValueError("algorithm.safety_objective must be 'sqrl' or 'sorl'.")
-        if self.phase == "pretrain" and self.safety_objective != "sqrl":
-            raise ValueError("Isaac pre-training uses the SQRL safety objective.")
-        self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
-        if self.phase == "pretrain" and not self.qsafe_enabled:
-            raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
-        if self.safety_objective == "sorl" and not self.qsafe_enabled:
-            raise ValueError("SORL reward shaping requires a safety critic.")
-        self.transfer_deterministic_steps = int(
-            config.algorithm.transfer_deterministic_steps
-        )
-        self.transfer_exploration_scale = float(
-            config.algorithm.transfer_exploration_scale
-        )
-        self.transfer_actor_learning_starts = int(
-            config.algorithm.transfer_actor_learning_starts
-        )
-        self.transfer_actor_update_interval = int(
-            config.algorithm.transfer_actor_update_interval
-        )
-        self.transfer_actor_anchor_coefficient = float(
-            config.algorithm.transfer_actor_anchor_coefficient
-        )
-        if self.transfer_deterministic_steps < 0:
-            raise ValueError("algorithm.transfer_deterministic_steps must be non-negative")
-        if not 0.0 <= self.transfer_exploration_scale <= 1.0:
-            raise ValueError(
-                "algorithm.transfer_exploration_scale must be in [0, 1]"
-            )
-        if self.transfer_actor_learning_starts < int(self.learning_starts):
-            raise ValueError(
-                "algorithm.transfer_actor_learning_starts must not precede learning_starts"
-            )
-        if self.transfer_actor_update_interval < 1:
-            raise ValueError("algorithm.transfer_actor_update_interval must be positive")
-        if self.transfer_actor_anchor_coefficient < 0.0:
-            raise ValueError(
-                "algorithm.transfer_actor_anchor_coefficient must be non-negative"
-            )
         self.n_off = int(config.algorithm.n_off)
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
@@ -138,15 +95,11 @@ class SAC_QSafe:
         )
         if self.qsafe_updates_per_iteration < 1:
             raise ValueError("algorithm.qsafe.updates_per_iteration must be at least 1.")
-        self.nu = (
-            float(config.algorithm.initial_nu) if self.qsafe_enabled else 0.0
-        )
+        self.nu = float(config.algorithm.initial_nu)
         self.dual_learning_rate = float(config.algorithm.dual_learning_rate)
         self.dual_optimizer = (
             optax.adam(self.dual_learning_rate)
             if self.phase == "finetune"
-            and self.qsafe_enabled
-            and self.safety_objective == "sqrl"
             else optax.set_to_zero()
         )
         self.dual_optimizer_state = self.dual_optimizer.init(
@@ -201,12 +154,7 @@ class SAC_QSafe:
             return self.learning_rate * fraction
         
         self.q_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
-        if self.phase == "finetune":
-            self.policy_learning_rate = float(
-                config.algorithm.transfer_actor_learning_rate
-            )
-        else:
-            self.policy_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
+        self.policy_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
         self.entropy_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
 
         state = jnp.array([self.train_env.single_observation_space.sample()])
@@ -242,39 +190,7 @@ class SAC_QSafe:
         )
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
-            self._load_pretrained_task_state(
-                str(config.algorithm.pretrained_task_checkpoint_path)
-            )
             self.observation_normalizer.freeze()
-        self.reference_policy_params = jax.tree.map(
-            lambda value: value.copy(), self.policy_state.params
-        )
-        self.sorl_reward_shaper = None
-        self.sorl_safety_learning_starts = int(
-            config.algorithm.sorl.safety_learning_starts
-        )
-        self.sorl_safety_updates_per_step = int(
-            config.algorithm.sorl.safety_updates_per_step
-        )
-        if self.sorl_safety_learning_starts < 0:
-            raise ValueError("algorithm.sorl.safety_learning_starts must be non-negative")
-        if self.sorl_safety_updates_per_step < 1:
-            raise ValueError("algorithm.sorl.safety_updates_per_step must be positive")
-        if self.phase == "finetune" and self.safety_objective == "sorl":
-            self.sorl_reward_shaper = SorlRewardShaper(
-                gamma=self.gamma,
-                gamma_safe=float(config.algorithm.qsafe.gamma),
-                horizon=int(config.algorithm.sorl.horizon),
-                significance=float(config.algorithm.sorl.significance),
-                cost_margin=float(config.algorithm.sorl.cost_margin),
-                target_delta=float(config.algorithm.sorl.target_delta),
-                solve_significance=bool(
-                    config.algorithm.sorl.solve_significance
-                ),
-                preserve_negative_task_penalty=bool(
-                    config.algorithm.sorl.preserve_negative_task_penalty
-                ),
-            )
 
         self._build_action_kernels()
         self._warm_up_action_kernels()
@@ -312,38 +228,14 @@ class SAC_QSafe:
         self.observation_normalizer.load_state_dict(
             artifact["normalizer_state"], artifact["normalizer_metadata"]
         )
-        if not hasattr(self.train_env, "validate_transfer_manifest"):
+        if not hasattr(self.train_env, "validate_checkpoint_manifest"):
             raise ValueError(
-                "Fine-tuning environment must validate the policy transfer manifest"
+                "Fine-tuning environment must validate the policy checkpoint manifest"
             )
-        self.train_env.validate_transfer_manifest(
+        self.train_env.validate_checkpoint_manifest(
             artifact["environment_manifest"], self.observation_normalizer.metadata()
         )
         self.observation_normalizer.freeze()
-
-    def _load_pretrained_task_state(self, file_path):
-        if not file_path:
-            raise ValueError(
-                "algorithm.pretrained_task_checkpoint_path is required for finetune."
-            )
-        artifact = load_torch_task_artifact(
-            file_path,
-            self.critic_state.params,
-            self.critic_state.target_params,
-        )
-        self.critic_state = self.critic_state.replace(
-            params=artifact["online_params"],
-            target_params=artifact["target_params"],
-        )
-        entropy_state = serialization.to_state_dict(
-            self.entropy_coefficient_state.params
-        )
-        entropy_state["params"]["log_alpha"] = artifact["log_alpha"]
-        self.entropy_coefficient_state = self.entropy_coefficient_state.replace(
-            params=serialization.from_state_dict(
-                self.entropy_coefficient_state.params, entropy_state
-            )
-        )
 
     @staticmethod
     def _normalize_kernel(states, mean, std, epsilon):
@@ -377,26 +269,6 @@ class SAC_QSafe:
             actions = self._jax_project_actions(raw_states, actions)
             return actions, key
 
-        def transfer(params, raw_states, mean, std, epsilon, key):
-            states = self._normalize_kernel(raw_states, mean, std, epsilon)
-            action_mean, action_logstd = self.policy.apply(params, states)
-            key, action_key = jax.random.split(key)
-            deterministic_actions = jnp.tanh(action_mean)
-            actions = jnp.tanh(
-                action_mean
-                + self.transfer_exploration_scale
-                * jnp.exp(action_logstd)
-                * jax.random.normal(action_key, shape=action_mean.shape)
-            )
-            deterministic_actions = self._jax_project_actions(
-                raw_states, deterministic_actions
-            )
-            actions = self._jax_project_actions(raw_states, actions)
-            exploration_rms = jnp.sqrt(
-                jnp.mean(jnp.square(actions - deterministic_actions))
-            )
-            return actions, key, exploration_rms
-
         def candidates(params, raw_states, mean, std, epsilon, key):
             states = self._normalize_kernel(raw_states, mean, std, epsilon)
             action_mean, action_logstd = self.policy.apply(params, states)
@@ -422,7 +294,6 @@ class SAC_QSafe:
 
         self._deterministic_action_jit = jax.jit(deterministic)
         self._unconstrained_action_jit = jax.jit(unconstrained)
-        self._transfer_action_jit = jax.jit(transfer)
         self._candidate_distribution_jit = jax.jit(candidates)
 
     def _normalizer_parameters(self):
@@ -451,54 +322,29 @@ class SAC_QSafe:
             epsilon,
             self.key,
         )
-        transfer_actions, _, exploration_rms = self._transfer_action_jit(
-            self.policy_state.params,
-            dummy_states,
-            mean,
-            std,
-            epsilon,
-            self.key,
+        states, candidates, log_probs, _, selection_key = (
+            self._candidate_distribution_jit(
+                self.policy_state.params,
+                dummy_states,
+                mean,
+                std,
+                epsilon,
+                self.key,
+            )
         )
-        if self.qsafe_enabled and self.safety_objective == "sqrl":
-            states, candidates, log_probs, _, selection_key = (
-                self._candidate_distribution_jit(
-                    self.policy_state.params,
-                    dummy_states,
-                    mean,
-                    std,
-                    epsilon,
-                    self.key,
-                )
-            )
-            select = (
-                self.qsafe._select_pretrain_jit
-                if self.phase == "pretrain"
-                else self.qsafe._select_finetune_jit
-            )
-            selected, _, _ = select(
-                self.qsafe.state.params,
-                states,
-                candidates,
-                log_probs,
-                selection_key,
-            )
-            jax.block_until_ready(
-                (deterministic_actions, actions, transfer_actions, exploration_rms, selected)
-            )
-        elif self.qsafe_enabled:
-            normalized_states = self._normalize_kernel(
-                dummy_states, mean, std, epsilon
-            )
-            risks = self.qsafe.conservative_values(
-                normalized_states, deterministic_actions
-            )
-            jax.block_until_ready(
-                (deterministic_actions, actions, transfer_actions, exploration_rms, risks)
-            )
-        else:
-            jax.block_until_ready(
-                (deterministic_actions, actions, transfer_actions, exploration_rms)
-            )
+        select = (
+            self.qsafe._select_pretrain_jit
+            if self.phase == "pretrain"
+            else self.qsafe._select_finetune_jit
+        )
+        selected, _, _ = select(
+            self.qsafe.state.params,
+            states,
+            candidates,
+            log_probs,
+            selection_key,
+        )
+        jax.block_until_ready((deterministic_actions, actions, selected))
 
     def _host_project(self, raw_states, actions):
         if self._projector_is_jax or self._host_project_actions is None:
@@ -538,28 +384,6 @@ class SAC_QSafe:
         )
         actions = self._host_project(states, actions)
         return actions, self.get_processed_action(actions)
-
-    def _sample_transfer_action(self, states, update_normalizer=False):
-        if update_normalizer:
-            self.observation_normalizer.update(states)
-        raw_states = jnp.asarray(states, dtype=jnp.float32)
-        mean, std, epsilon = self._normalizer_parameters()
-        actions, self.key, exploration_rms = self._transfer_action_jit(
-            self.policy_state.params,
-            raw_states,
-            mean,
-            std,
-            epsilon,
-            self.key,
-        )
-        actions = self._host_project(states, actions)
-        metrics = {
-            "transfer/exploration_action_rms": float(
-                jax.device_get(exploration_rms)
-            ),
-            "transfer/exploration_scale": self.transfer_exploration_scale,
-        }
-        return actions, self.get_processed_action(actions), metrics
 
     def _sample_policy_candidates(self, states, phase=None):
         raw_states = jnp.asarray(states, dtype=jnp.float32)
@@ -614,8 +438,7 @@ class SAC_QSafe:
                 states: np.ndarray, next_states: np.ndarray, actions: np.ndarray, rewards: np.ndarray, terminations: np.ndarray,
                 normalizer_mean: np.ndarray, normalizer_std: np.ndarray,
                 normalizer_epsilon: float, qsafe_params: flax.core.FrozenDict,
-                reference_policy_params: flax.core.FrozenDict,
-                nu: float, update_actor: bool, key: jax.random.PRNGKey
+                nu: float, key: jax.random.PRNGKey
             ):
             raw_states = jnp.asarray(states, dtype=jnp.float32)
             raw_next_states = jnp.asarray(next_states, dtype=jnp.float32)
@@ -629,7 +452,7 @@ class SAC_QSafe:
                 normalizer_epsilon,
             )
 
-            def loss_fn(policy_params: flax.core.FrozenDict, critic_params: flax.core.FrozenDict, entropy_coefficient_params: flax.core.FrozenDict, reference_params: flax.core.FrozenDict,
+            def loss_fn(policy_params: flax.core.FrozenDict, critic_params: flax.core.FrozenDict, entropy_coefficient_params: flax.core.FrozenDict,
                         state: np.ndarray, next_state: np.ndarray,
                         raw_state: np.ndarray, raw_next_state: np.ndarray,
                         action: np.ndarray, reward: np.ndarray, terminated: np.ndarray,
@@ -680,35 +503,12 @@ class SAC_QSafe:
 
                 policy_loss = alpha * current_log_prob - min_q
                 safety_q = jnp.zeros_like(min_q)
-                if (
-                    self.phase == "finetune"
-                    and self.qsafe_enabled
-                    and self.safety_objective == "sqrl"
-                ):
+                if self.phase == "finetune":
                     safety_q = self.qsafe.network.apply(
                         stop_gradient(qsafe_params), state, current_action
                     ).squeeze()
                     policy_loss = policy_loss + nu * (
                         safety_q - self.qsafe.epsilon
-                    )
-                anchor_loss = jnp.zeros_like(policy_loss)
-                if self.phase == "finetune":
-                    reference_mean, _ = self.policy.apply(
-                        stop_gradient(reference_params), state
-                    )
-                    current_mean_action = self._jax_project_actions(
-                        raw_state[None, :], jnp.tanh(current_action_mean)[None, :]
-                    )[0]
-                    reference_action = self._jax_project_actions(
-                        raw_state[None, :], jnp.tanh(reference_mean)[None, :]
-                    )[0]
-                    anchor_loss = jnp.mean(
-                        jnp.square(
-                            current_mean_action - stop_gradient(reference_action)
-                        )
-                    )
-                    policy_loss = policy_loss + (
-                        self.transfer_actor_anchor_coefficient * anchor_loss
                     )
 
                 # Entropy loss
@@ -722,7 +522,6 @@ class SAC_QSafe:
                     "loss/q_loss": q_loss,
                     "loss/policy_loss": policy_loss,
                     "loss/entropy_loss": entropy_loss,
-                    "loss/transfer_actor_anchor": anchor_loss,
                     "entropy/entropy": entropy,
                     "entropy/alpha": alpha,
                     "q_value/q_value": min_q,
@@ -734,7 +533,7 @@ class SAC_QSafe:
 
             vmap_loss_fn = jax.vmap(
                 loss_fn,
-                in_axes=(None, None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                in_axes=(None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0),
                 out_axes=0,
             )
             safe_mean = lambda x: jnp.mean(x) if x is not None else x
@@ -746,23 +545,12 @@ class SAC_QSafe:
 
             (loss, (metrics)), (policy_gradients, critic_gradients, entropy_gradients) = grad_loss_fn(
                 policy_state.params, critic_state.params, entropy_coefficient_state.params,
-                reference_policy_params,
                 states, next_states, raw_states, raw_next_states, actions, rewards,
                 terminations, keys1, keys2)
 
+            policy_state = policy_state.apply_gradients(grads=policy_gradients)
             critic_state = critic_state.apply_gradients(grads=critic_gradients)
-            policy_state = jax.lax.cond(
-                update_actor,
-                lambda value: value.apply_gradients(grads=policy_gradients),
-                lambda value: value,
-                policy_state,
-            )
-            entropy_coefficient_state = jax.lax.cond(
-                update_actor,
-                lambda value: value.apply_gradients(grads=entropy_gradients),
-                lambda value: value,
-                entropy_coefficient_state,
-            )
+            entropy_coefficient_state = entropy_coefficient_state.apply_gradients(grads=entropy_gradients)
 
             # Update targets
             critic_state = critic_state.replace(target_params=optax.incremental_update(critic_state.params, critic_state.target_params, self.tau))
@@ -771,9 +559,6 @@ class SAC_QSafe:
             metrics["gradients/policy_grad_norm"] = optax.global_norm(policy_gradients)
             metrics["gradients/critic_grad_norm"] = optax.global_norm(critic_gradients)
             metrics["gradients/entropy_grad_norm"] = optax.global_norm(entropy_gradients)
-            metrics["transfer/actor_updated"] = jnp.asarray(
-                update_actor, dtype=jnp.float32
-            )
 
             return policy_state, critic_state, entropy_coefficient_state, metrics, key
         
@@ -802,29 +587,10 @@ class SAC_QSafe:
             std,
             epsilon,
             self.qsafe.state.params,
-            self.reference_policy_params,
             self.nu,
-            True,
             self.key,
         )
         jax.block_until_ready(warm_result[3])
-
-        def sample_safety_action(next_states, action_key):
-            action_mean, action_logstd = self.policy.apply(
-                self.policy_state.params, next_states
-            )
-            return jnp.tanh(
-                action_mean
-                + jnp.exp(action_logstd)
-                * jax.random.normal(action_key, shape=action_mean.shape)
-            )
-
-        self.qsafe.warm_up_sorl_update(
-            sample_safety_action,
-            state_transform=lambda value: self.observation_normalizer.normalize(
-                value, update=False
-            ),
-        )
 
         self.set_train_mode()
 
@@ -852,119 +618,6 @@ class SAC_QSafe:
         steps_metrics = {}
         prev_saving_end_time = None
         logging_time_prev = None
-
-        def run_task_update(batch, update_step, in_policy_window):
-            nonlocal nr_updates
-            learner_start_time = time.perf_counter()
-            mean, std, epsilon = self._normalizer_parameters()
-            update_actor = (
-                self.phase != "finetune"
-                or (
-                    update_step >= self.transfer_actor_learning_starts
-                    and nr_updates % self.transfer_actor_update_interval == 0
-                )
-            )
-            (
-                self.policy_state,
-                self.critic_state,
-                self.entropy_coefficient_state,
-                optimization_metrics,
-                self.key,
-            ) = update(
-                self.policy_state,
-                self.critic_state,
-                self.entropy_coefficient_state,
-                *batch,
-                mean,
-                std,
-                epsilon,
-                self.qsafe.state.params,
-                self.reference_policy_params,
-                self.nu,
-                update_actor,
-                self.key,
-            )
-            jax.block_until_ready(optimization_metrics)
-            if (
-                self.sorl_reward_shaper is not None
-                and update_step >= self.sorl_safety_learning_starts
-                and self.qsafe.ready_to_update()
-            ):
-                sorl_update_metrics = []
-                for _ in range(self.sorl_safety_updates_per_step):
-                    sorl_update_metrics.append(
-                        self.qsafe.update(
-                            sample_safety_action,
-                            state_transform=lambda value: self.observation_normalizer.normalize(
-                                value, update=False
-                            ),
-                        )
-                    )
-                jax.block_until_ready(sorl_update_metrics[-1])
-                for metric_name in sorl_update_metrics[0]:
-                    optimization_metrics[metric_name] = jnp.mean(
-                        jnp.asarray(
-                            [
-                                metrics[metric_name]
-                                for metrics in sorl_update_metrics
-                            ]
-                        )
-                    )
-                optimization_metrics["sorl/replay_transitions"] = float(
-                    self.qsafe.replay_buffer.nr_transitions
-                )
-                optimization_metrics["sorl/unsafe_replay_transitions"] = float(
-                    self.qsafe.replay_buffer.nr_unsafe_transitions
-                )
-            learner_update_time = time.perf_counter() - learner_start_time
-            optimization_metrics["time/learner_update_time"] = learner_update_time
-            optimization_metrics["transfer/update_in_policy_window"] = float(
-                in_policy_window
-            )
-            if self._learner_deadline_seconds is not None:
-                missed_deadline = float(
-                    learner_update_time > self._learner_deadline_seconds
-                )
-                optimization_metrics["time/learner_deadline_miss"] = missed_deadline
-                if missed_deadline:
-                    self._deadline_misses += 1
-                    if self._deadline_misses == 1 or self._deadline_misses % 100 == 0:
-                        rlx_logger.warning(
-                            "Flax learner update %.6fs exceeded control deadline "
-                            "%.6fs (%d misses)",
-                            learner_update_time,
-                            self._learner_deadline_seconds,
-                            self._deadline_misses,
-                        )
-            if (
-                self.phase == "finetune"
-                and self.qsafe_enabled
-                and self.safety_objective == "sqrl"
-                and update_actor
-            ):
-                safety_value = float(optimization_metrics["qsafe/actor_value"])
-                nu_before_update = jnp.asarray(self.nu, dtype=jnp.float32)
-                dual_gradient = jnp.asarray(
-                    self.qsafe.epsilon - safety_value, dtype=jnp.float32
-                )
-                dual_updates, self.dual_optimizer_state = self.dual_optimizer.update(
-                    dual_gradient,
-                    self.dual_optimizer_state,
-                    nu_before_update,
-                )
-                self.nu = max(
-                    0.0,
-                    float(optax.apply_updates(nu_before_update, dual_updates)),
-                )
-                optimization_metrics["qsafe/nu"] = self.nu
-                optimization_metrics["loss/qsafe_dual_loss"] = float(
-                    nu_before_update * dual_gradient
-                )
-            for metric_name, metric_value in optimization_metrics.items():
-                optimization_metrics_collection.setdefault(
-                    metric_name, []
-                ).append(metric_value)
-            nr_updates += 1
         
         while global_step < self.total_timesteps or (
             self.phase == "pretrain" and pretrain_stage == "safe"
@@ -981,76 +634,22 @@ class SAC_QSafe:
             interaction_env = self.eval_env if is_safety_step else self.train_env
             completed_safety_block = False
             dones_this_rollout = 0
-            window_update_scheduled = False
-            deterministic_transfer = (
-                self.phase == "finetune"
-                and global_step < self.transfer_deterministic_steps
-            )
-            if deterministic_transfer:
-                action, processed_action = self._sample_deterministic_action(
-                    acting_state
-                )
-                action_safety_metrics = None
-            elif is_safety_step:
+            if is_safety_step:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="pretrain"
                 )
-            elif (
-                self.phase == "finetune"
-                and self.qsafe_enabled
-                and self.safety_objective == "sqrl"
-            ):
+            elif self.phase == "finetune":
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="finetune"
-                )
-            elif self.phase == "finetune":
-                action, processed_action, action_safety_metrics = (
-                    self._sample_transfer_action(
-                        acting_state, update_normalizer=True
-                    )
                 )
             else:
                 action, processed_action = self._sample_unconstrained_action(
                     acting_state, update_normalizer=True
                 )
                 action_safety_metrics = None
-            sorl_risk = None
-            if self.sorl_reward_shaper is not None:
-                raw_acting_state = jnp.asarray(acting_state, dtype=jnp.float32)
-                normalizer_mean, normalizer_std, normalizer_epsilon = (
-                    self._normalizer_parameters()
-                )
-                normalized_acting_state = self._normalize_kernel(
-                    raw_acting_state,
-                    normalizer_mean,
-                    normalizer_std,
-                    normalizer_epsilon,
-                )
-                sorl_risk = np.asarray(
-                    jax.device_get(
-                        self.qsafe.conservative_values(
-                            normalized_acting_state, action
-                        )
-                    ),
-                    dtype=np.float32,
-                ).reshape(self.nr_envs)
             if action_safety_metrics is not None:
                 for key, value in action_safety_metrics.items():
                     safety_metrics_collection.setdefault(key, []).append(value)
-            if (
-                not is_safety_step
-                and global_step > self.learning_starts
-                and offline_replay_buffer.size > 0
-                and hasattr(interaction_env, "set_policy_window_callback")
-            ):
-                update_batch = offline_replay_buffer.sample(self.batch_size)
-                update_step = global_step
-                interaction_env.set_policy_window_callback(
-                    lambda batch=update_batch, step=update_step: run_task_update(
-                        batch, step, True
-                    )
-                )
-                window_update_scheduled = True
             
             try:
                 next_state, reward, terminated, truncated, info = interaction_env.step(
@@ -1070,27 +669,6 @@ class SAC_QSafe:
                     state = recovered_state
                 continue
             failure = extract_failure_signal(info, terminated, self.nr_envs)
-            if self.sorl_reward_shaper is not None:
-                raw_reward = np.asarray(reward, dtype=np.float32).copy()
-                reward = self.sorl_reward_shaper.shape(
-                    raw_reward, sorl_risk, failure
-                )
-                safety_metrics_collection.setdefault("sorl/risk", []).extend(
-                    sorl_risk.tolist()
-                )
-                safety_metrics_collection.setdefault("sorl/raw_reward", []).extend(
-                    raw_reward.reshape(-1).tolist()
-                )
-                safety_metrics_collection.setdefault(
-                    "sorl/shaped_reward", []
-                ).extend(np.asarray(reward).reshape(-1).tolist())
-                for metric_name, metric_value in (
-                    self.sorl_reward_shaper.metrics().items()
-                ):
-                    if np.isfinite(metric_value):
-                        safety_metrics_collection.setdefault(
-                            metric_name, []
-                        ).append(metric_value)
             host_action = jax.device_get(action)
             applied_action = np.asarray(
                 info.get("applied_action", host_action), dtype=np.float32
@@ -1145,15 +723,6 @@ class SAC_QSafe:
                 else:
                     safety_state = next_state
             else:
-                if self.sorl_reward_shaper is not None:
-                    self.qsafe.add_transition(
-                        state,
-                        applied_action,
-                        actual_next_state,
-                        failure,
-                        terminated,
-                        truncated,
-                    )
                 offline_replay_buffer.add(
                     state, actual_next_state, applied_action, reward, terminated
                 )
@@ -1185,7 +754,7 @@ class SAC_QSafe:
                 and global_step > self.learning_starts
                 and offline_replay_buffer.size > 0
             )
-            should_optimize = should_learning_start and not window_update_scheduled
+            should_optimize = should_learning_start
             should_evaluate = (
                 not is_safety_step
                 and self.evaluation_frequency != -1
@@ -1202,12 +771,73 @@ class SAC_QSafe:
             )
 
 
+            # Optimizing - Prepare batches
             if should_optimize:
-                run_task_update(
-                    offline_replay_buffer.sample(self.batch_size),
-                    global_step,
-                    False,
+                batch_states, batch_next_states, batch_actions, batch_rewards, batch_terminations = offline_replay_buffer.sample(self.batch_size)
+
+
+            # Optimizing - Q-functions, policy and entropy coefficient
+            if should_optimize:
+                learner_start_time = time.perf_counter()
+                mean, std, epsilon = self._normalizer_parameters()
+                self.policy_state, self.critic_state, self.entropy_coefficient_state, optimization_metrics, self.key = update(
+                    self.policy_state,
+                    self.critic_state,
+                    self.entropy_coefficient_state,
+                    batch_states,
+                    batch_next_states,
+                    batch_actions,
+                    batch_rewards,
+                    batch_terminations,
+                    mean,
+                    std,
+                    epsilon,
+                    self.qsafe.state.params,
+                    self.nu,
+                    self.key,
                 )
+                jax.block_until_ready(optimization_metrics)
+                learner_update_time = time.perf_counter() - learner_start_time
+                optimization_metrics["time/learner_update_time"] = learner_update_time
+                if self._learner_deadline_seconds is not None:
+                    missed_deadline = float(
+                        learner_update_time > self._learner_deadline_seconds
+                    )
+                    optimization_metrics["time/learner_deadline_miss"] = missed_deadline
+                    if missed_deadline:
+                        self._deadline_misses += 1
+                        if self._deadline_misses == 1 or self._deadline_misses % 100 == 0:
+                            rlx_logger.warning(
+                                "Flax learner update %.6fs exceeded control deadline "
+                                "%.6fs (%d misses)",
+                                learner_update_time,
+                                self._learner_deadline_seconds,
+                                self._deadline_misses,
+                            )
+                if self.phase == "finetune":
+                    safety_value = float(optimization_metrics["qsafe/actor_value"])
+                    nu_before_update = jnp.asarray(self.nu, dtype=jnp.float32)
+                    dual_gradient = jnp.asarray(
+                        self.qsafe.epsilon - safety_value, dtype=jnp.float32
+                    )
+                    dual_updates, self.dual_optimizer_state = (
+                        self.dual_optimizer.update(
+                            dual_gradient,
+                            self.dual_optimizer_state,
+                            nu_before_update,
+                        )
+                    )
+                    updated_nu = optax.apply_updates(
+                        nu_before_update, dual_updates
+                    )
+                    self.nu = max(0.0, float(updated_nu))
+                    optimization_metrics["qsafe/nu"] = self.nu
+                    optimization_metrics["loss/qsafe_dual_loss"] = float(
+                        nu_before_update * dual_gradient
+                    )
+                for key, value in optimization_metrics.items():
+                    optimization_metrics_collection.setdefault(key, []).append(value)
+                nr_updates += 1
 
             if completed_safety_block and self.qsafe.ready_to_update():
                 def sample_unconstrained_action(next_states, action_key):
@@ -1241,14 +871,7 @@ class SAC_QSafe:
                 eval_state, _ = self.eval_env.reset()
                 eval_nr_episodes = 0
                 while True:
-                    if self.safety_objective == "sorl":
-                        _, eval_processed_action = self._sample_deterministic_action(
-                            eval_state
-                        )
-                    else:
-                        _, eval_processed_action, _ = self._sample_policy_candidates(
-                            eval_state
-                        )
+                    _, eval_processed_action, _ = self._sample_policy_candidates(eval_state)
                     try:
                         eval_state, eval_reward, eval_terminated, eval_truncated, eval_info = self.eval_env.step(
                             jax.device_get(eval_processed_action)
@@ -1393,15 +1016,12 @@ class SAC_QSafe:
         )
         checkpoint = {
             "policy": self.policy_state,
-            "reference_policy_params": self.reference_policy_params,
             "critic": self.critic_state,
             "entropy_coefficient": self.entropy_coefficient_state,
             "qsafe": self.qsafe.state,
             "nu": jnp.asarray(self.nu, dtype=jnp.float32),
             "dual_optimizer_state": self.dual_optimizer_state,
         }
-        if self.qsafe.second_state is not None:
-            checkpoint["qsafe_second"] = self.qsafe.second_state
         payload = {
             "config_algorithm": self.config.algorithm.to_dict(),
             "checkpoint": serialization.to_state_dict(checkpoint),
@@ -1429,9 +1049,7 @@ class SAC_QSafe:
             critic_file.write(serialization.to_bytes(self.critic_state))
         self.qsafe.save(
             f"{self.save_path}/qsafe.msgpack",
-            include_optimizer=(
-                self.phase == "pretrain" or self.safety_objective == "sorl"
-            ),
+            include_optimizer=self.phase == "pretrain",
         )
 
         if self.track_wandb:
@@ -1494,30 +1112,14 @@ class SAC_QSafe:
             "nu": jnp.asarray(model.nu, dtype=jnp.float32),
             "dual_optimizer_state": model.dual_optimizer_state,
         }
-        if "reference_policy_params" in payload["checkpoint"]:
-            target["reference_policy_params"] = model.reference_policy_params
-        if "qsafe_second" in payload["checkpoint"]:
-            if model.qsafe.second_state is None:
-                raise ValueError(
-                    "SORL checkpoint contains a second safety critic but the "
-                    "loaded algorithm is not configured for SORL"
-                )
-            target["qsafe_second"] = model.qsafe.second_state
         checkpoint = serialization.from_state_dict(target, payload["checkpoint"])
 
         model.policy_state = checkpoint["policy"]
         model.critic_state = checkpoint["critic"]
         model.entropy_coefficient_state = checkpoint["entropy_coefficient"]
         model.qsafe.state = checkpoint["qsafe"]
-        if "qsafe_second" in checkpoint:
-            model.qsafe.second_state = checkpoint["qsafe_second"]
-        model.reference_policy_params = checkpoint.get(
-            "reference_policy_params",
-            jax.tree.map(lambda value: value.copy(), model.policy_state.params),
-        )
         if model.phase == "finetune":
-            if model.safety_objective == "sqrl":
-                model.qsafe.freeze()
+            model.qsafe.freeze()
             model.observation_normalizer.freeze()
         model.nu = float(checkpoint["nu"])
         model.dual_optimizer_state = checkpoint["dual_optimizer_state"]
@@ -1530,8 +1132,6 @@ class SAC_QSafe:
         eval_policy = str(self.config.algorithm.eval_policy)
         if eval_policy not in ("task", "safe"):
             raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
-        if eval_policy == "safe" and not self.qsafe_enabled:
-            raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
         for i in range(episodes):
             done = False
             episode_return = 0
@@ -1544,7 +1144,7 @@ class SAC_QSafe:
             target_velocity_error_sum = 0.0
             state, _ = self.eval_env.reset()
             while not done:
-                if eval_policy == "task" or self.safety_objective == "sorl":
+                if eval_policy == "task":
                     _, processed_action = self._sample_deterministic_action(state)
                 else:
                     _, processed_action, _ = self._sample_policy_candidates(state)

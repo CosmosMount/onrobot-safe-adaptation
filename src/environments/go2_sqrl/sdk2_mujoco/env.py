@@ -11,28 +11,13 @@ from gymnasium.spaces import Box
 from rl_x.environments.safety_rollout import InvalidTransitionError
 
 from ..common.action import ActionMapper, project_actions_from_observation
-from ..common.estimation.velocity import (
-    VelocityEstimator,
-    quaternion_rotation_matrix_wxyz,
-    velocity_estimator_config_from,
-)
+from ..common.estimation.velocity import quaternion_rotation_matrix_wxyz
 from ..common.observation import ObservationBuilder
 from ..common.reward import compute_reward
 from ..common.reward import BASE_HEIGHT_TARGET
-from ..common.specs import (
-    ACTION_SIZE,
-    CONTROL_DT,
-    DEFAULT_JOINT_POSITION,
-    OBSERVATION_SIZE,
-    PHYSICS_DT,
-    PHYSICS_STEPS_PER_ACTION,
-)
+from ..common.specs import ACTION_SIZE, DEFAULT_JOINT_POSITION, OBSERVATION_SIZE
 from ..common.termination import EpisodeTracker
-from ..common.manifest import (
-    build_manifest,
-    validate_manifest,
-    validate_transfer_manifest as validate_transfer_manifest_contract,
-)
+from ..common.manifest import build_manifest, validate_manifest
 from .fall_detector import FallDetector
 from .general_properties import GeneralProperties
 from .reset_controller import MujocoResetController
@@ -57,19 +42,6 @@ class Go2SDKMujocoEnv:
         reset_controller: MujocoResetController | None = None,
     ):
         environment = config.environment
-        if int(environment.policy_frames) != PHYSICS_STEPS_PER_ACTION:
-            raise ValueError(
-                "MuJoCo control windows must contain exactly "
-                f"{PHYSICS_STEPS_PER_ACTION} LowState frames"
-            )
-        if not np.isclose(
-            float(environment.policy_period_seconds), CONTROL_DT,
-            rtol=0.0,
-            atol=1e-12,
-        ):
-            raise ValueError(
-                f"MuJoCo policy_period_seconds must remain {CONTROL_DT}s"
-            )
         self.config = environment
         self.role = role
         runner = getattr(config, "runner", None)
@@ -92,12 +64,7 @@ class Go2SDKMujocoEnv:
             )
         self.reset_controller = reset_controller
         self.action_mapper = ActionMapper()
-        self.observation_builder = ObservationBuilder(
-            VelocityEstimator(
-                dt=PHYSICS_DT,
-                config=velocity_estimator_config_from(environment),
-            )
-        )
+        self.observation_builder = ObservationBuilder()
         self.fall_detector = FallDetector(
             environment.fall_angle_threshold,
             environment.fall_consecutive_frames,
@@ -110,7 +77,6 @@ class Go2SDKMujocoEnv:
         self._policy_blend_elapsed = 0.0
         self._initial_simulator_reset_done = False
         self._previous_reward_action = np.zeros(ACTION_SIZE, dtype=np.float32)
-        self._policy_window_callback = None
 
     @staticmethod
     def project_actions(states, actions):
@@ -123,15 +89,6 @@ class Go2SDKMujocoEnv:
         """
 
         return project_actions_from_observation(states, actions)
-
-    def set_policy_window_callback(self, callback):
-        """Run one learner update while the external simulator executes an action."""
-
-        if callback is not None and not callable(callback):
-            raise TypeError("policy window callback must be callable")
-        if self._policy_window_callback is not None:
-            raise RuntimeError("a policy window callback is already pending")
-        self._policy_window_callback = callback
 
     def _wait_window(self, count: int | None = None):
         count = int(count or self.config.policy_frames)
@@ -185,51 +142,17 @@ class Go2SDKMujocoEnv:
         return max(0, int(np.ceil(float(seconds) / period)))
 
     def _publish_and_wait(self, target: np.ndarray):
+        self._last_tick = self.client.state_buffer.last_tick
         target = np.asarray(target, dtype=np.float32)
-        # DDS may briefly deliver queued pre-reset ticks after the first new
-        # low tick. StateBuffer correctly records another generation change,
-        # but reset interpolation should resynchronize rather than treating it
-        # as a policy transition. Runtime ``step`` remains strict.
-        # CycloneDDS can interleave several queued pre-reset samples with the
-        # new epoch.  A fixed retry count is therefore racy: every old/new
-        # boundary legitimately advances StateBuffer's generation.  Bound the
-        # recovery by wall time instead and require one complete policy window
-        # from a stable generation before continuing the stand-up sequence.
-        deadline = time.monotonic() + max(
-            float(self.config.state_timeout),
-            10.0 * float(self.config.policy_period_seconds),
-        )
-        resynchronizations = 0
-        while True:
-            generation = self.client.state_buffer.generation
-            self._generation = generation
-            self._last_tick = self.client.state_buffer.last_tick
-            if isinstance(self.client, SDKClient):
-                self.client.publish_joint_target(
-                    target,
-                    kp=float(self.config.reset_kp),
-                    kd=float(self.config.reset_kd),
-                )
-            else:
-                self.client.publish_joint_target(target)
-            try:
-                return self._wait_window()[-1]
-            except InvalidTransitionError:
-                current_generation = self.client.state_buffer.generation
-                if (
-                    current_generation == generation
-                    or time.monotonic() >= deadline
-                ):
-                    raise
-                resynchronizations += 1
-                if resynchronizations == 1:
-                    logger.info(
-                        "MuJoCo tick generation advanced during reset pose; "
-                        "draining queued pre-reset LowState samples."
-                    )
-                self.client.state_buffer.clear_error()
-                self._last_tick = None
-                self.fall_detector.reset()
+        if isinstance(self.client, SDKClient):
+            self.client.publish_joint_target(
+                target,
+                kp=float(self.config.reset_kp),
+                kd=float(self.config.reset_kd),
+            )
+        else:
+            self.client.publish_joint_target(target)
+        return self._wait_window()[-1]
 
     def _wait_for_simulator_restart(self, reason: str) -> None:
         logger.warning("%s Press Backspace in the unitree_mujoco window to reset.", reason)
@@ -238,11 +161,6 @@ class Go2SDKMujocoEnv:
         self._generation = self.client.state_buffer.wait_for_restart(
             self._generation, timeout=timeout
         )
-        settle_seconds = float(self.config.reset_post_restart_settle_seconds)
-        if settle_seconds > 0.0:
-            time.sleep(settle_seconds)
-        self._generation = self.client.state_buffer.generation
-        self.client.state_buffer.clear_error()
         self._last_tick = None
         self.fall_detector.reset()
 
@@ -270,11 +188,6 @@ class Go2SDKMujocoEnv:
                 "MuJoCo received the automatic reset key, but no simulator "
                 "tick restart was observed."
             ) from exc
-        settle_seconds = float(self.config.reset_post_restart_settle_seconds)
-        if settle_seconds > 0.0:
-            time.sleep(settle_seconds)
-        self._generation = self.client.state_buffer.generation
-        self.client.state_buffer.clear_error()
         self._last_tick = None
         self.fall_detector.reset()
 
@@ -356,7 +269,9 @@ class Go2SDKMujocoEnv:
         else:
             self._last_tick = int(state.tick)
         state = self._hold_reset_pose(state)
-        observation, _ = self.observation_builder.build(state)
+        observation, _ = self.observation_builder.build(
+            state, self._velocity_command()
+        )
         self._last_observation = observation
         return observation[None, :], {}
 
@@ -370,28 +285,23 @@ class Go2SDKMujocoEnv:
             self._wait_for_simulator_restart("Go2 fall detected.")
         return self.reset()[0][0]
 
-    def _logical_reset(self, observation):
-        """Start a new accounting episode without breaking physical continuity.
-
-        A time limit does not reset the external simulator.  Controller memory,
-        the KF, quaternion continuity, the previous target/action, and the fall
-        debounce state must therefore remain continuous as well.  Rebuilding
-        the observation here would also integrate the final LowState twice.
-        """
-
+    def _logical_reset(self, state):
+        self.action_mapper.reset()
+        self.observation_builder.reset()
+        self.fall_detector.reset()
         self.episode.reset()
-        return np.asarray(observation, dtype=np.float32).copy()
+        self._policy_blend_elapsed = 0.0
+        self._previous_reward_action.fill(0.0)
+        observation, _ = self.observation_builder.build(
+            state, self._velocity_command()
+        )
+        return observation
 
-    def _time_limit_reset(self, observation):
-        """Return the first observation of an independent physical rollout."""
-
-        if bool(self.config.auto_reset_on_time_limit) and self.reset_controller is not None:
-            self._auto_reset_simulator("Go2 episode time limit reached.")
-            return self.reset()[0][0]
-        # Dependency-injected unit tests and headless SDK deployments without a
-        # reset controller retain a physically continuous fallback.  Crucially,
-        # it also retains all controller/estimator memory.
-        return self._logical_reset(observation)
+    def _velocity_command(self):
+        return np.asarray(
+            [float(self.config.target_velocity_x), 0.0, 0.0],
+            dtype=np.float32,
+        )
 
     def step(self, actions):
         action = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_SIZE)[0]
@@ -427,18 +337,14 @@ class Go2SDKMujocoEnv:
         else:
             self.client.publish_joint_target(mapped.q_target)
         self.observation_builder.set_previous_q_target(mapped.q_target)
-        callback = self._policy_window_callback
-        self._policy_window_callback = None
-        if callback is not None:
-            callback()
         frames = self._wait_window()
 
         failure = False
         for frame in frames:
             failure = self.fall_detector.update(frame.imu_quat) or failure
         final_state = frames[-1]
-        observation, estimated_body_velocity = self.observation_builder.build_many(
-            frames
+        observation, estimated_body_velocity = self.observation_builder.build(
+            final_state, self._velocity_command()
         )
 
         truth = self.client.latest_training_state()
@@ -465,10 +371,6 @@ class Go2SDKMujocoEnv:
         )
         self._previous_reward_action = reward_action.copy()
         terminated, truncated = self.episode.advance(terms.total, failure)
-        estimator = self.observation_builder.velocity_estimator
-        innovation_squared = getattr(estimator, "last_innovation_squared", None)
-        support_confidence = getattr(estimator, "last_support_confidence", None)
-        covariance = getattr(estimator, "covariance", None)
 
         info = {
             "failure": np.asarray([int(failure)], dtype=np.float32),
@@ -493,26 +395,6 @@ class Go2SDKMujocoEnv:
                 [np.linalg.norm(truth_body_velocity - estimated_body_velocity)],
                 dtype=np.float32,
             ),
-            "velocity_estimator/measurement_accepted": np.asarray(
-                [float(getattr(estimator, "last_measurement_accepted", False))],
-                dtype=np.float32,
-            ),
-            "velocity_estimator/innovation_nis": np.asarray(
-                [np.nan if innovation_squared is None else innovation_squared],
-                dtype=np.float32,
-            ),
-            "velocity_estimator/support_confidence_sum": np.asarray(
-                [
-                    np.nan
-                    if support_confidence is None
-                    else np.sum(support_confidence)
-                ],
-                dtype=np.float32,
-            ),
-            "velocity_estimator/covariance_trace": np.asarray(
-                [np.nan if covariance is None else np.trace(covariance)],
-                dtype=np.float32,
-            ),
             **{key: np.asarray([value], dtype=np.float32) for key, value in terms.as_dict().items()},
         }
 
@@ -528,7 +410,7 @@ class Go2SDKMujocoEnv:
             if terminated:
                 observation = self._manual_failure_reset()
             else:
-                observation = self._time_limit_reset(observation)
+                observation = self._logical_reset(final_state)
             info["episode_return"] = np.asarray(
                 [terminal_info["episode_return"]], dtype=np.float32
             )
@@ -577,8 +459,3 @@ class Go2SDKMujocoEnv:
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
         validate_manifest(manifest, self.checkpoint_manifest(normalizer))
-
-    def validate_transfer_manifest(self, manifest, normalizer=None):
-        validate_transfer_manifest_contract(
-            manifest, self.checkpoint_manifest(normalizer)
-        )

@@ -17,11 +17,7 @@ from ..common.specs import (
     OBSERVATION_SIZE,
     PHYSICS_STEPS_PER_ACTION,
 )
-from ..common.manifest import (
-    build_manifest,
-    validate_manifest,
-    validate_transfer_manifest as validate_transfer_manifest_contract,
-)
+from ..common.manifest import build_manifest, validate_manifest
 from ..common.reward import (
     BASE_HEIGHT_TARGET,
     REWARD_DT,
@@ -29,10 +25,7 @@ from ..common.reward import (
     REWARD_SCALES,
     TRACKING_SIGMA,
 )
-from ..common.estimation import (
-    TorchVelocityEstimator,
-    velocity_estimator_config_from,
-)
+from ..common.estimation import TorchVelocityEstimator
 from .general_properties import GeneralProperties
 from .mdp import (
     build_observation_tensor,
@@ -170,10 +163,7 @@ class Go2IsaacEnv:
         )
         self._previous_quaternion = None
         self._velocity_estimator = TorchVelocityEstimator(
-            self.nr_envs,
-            robot.device,
-            dt=ACTION_SPEC.control_dt,
-            config=velocity_estimator_config_from(self.config),
+            self.nr_envs, robot.device
         )
         self._fall_detector = TorchFallDetector(
             self.nr_envs,
@@ -226,11 +216,15 @@ class Go2IsaacEnv:
             imu.data.quat_w,
             imu.data.lin_acc_b,
         )
+        velocity_command = torch.zeros(
+            (self.nr_envs, 3), dtype=joint_q.dtype, device=joint_q.device
+        )
+        velocity_command[:, 0] = float(self.config.target_velocity_x)
         observation, quaternion = build_observation_tensor(
             joint_q,
             joint_dq,
             imu.data.ang_vel_b,
-            self._latest_estimated_body_velocity,
+            velocity_command,
             imu.data.quat_w,
             self._previous_target,
             self._previous_quaternion,
@@ -473,8 +467,3 @@ class Go2IsaacEnv:
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
         validate_manifest(manifest, self.checkpoint_manifest(normalizer))
-
-    def validate_transfer_manifest(self, manifest, normalizer=None):
-        validate_transfer_manifest_contract(
-            manifest, self.checkpoint_manifest(normalizer)
-        )

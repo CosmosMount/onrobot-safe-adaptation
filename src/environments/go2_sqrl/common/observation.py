@@ -1,8 +1,6 @@
-"""Construction of the 46D Walk-in-the-Park-style policy observation."""
+"""Construction of the 46D command-conditioned policy observation."""
 
 from __future__ import annotations
-
-from typing import Protocol, Sequence
 
 import numpy as np
 
@@ -29,7 +27,7 @@ def continuous_quaternion_wxyz(
 
 def build_observation(
     state: RobotState,
-    estimated_body_velocity: np.ndarray,
+    velocity_command: np.ndarray,
     previous_q_target: np.ndarray,
     previous_quaternion: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -40,8 +38,8 @@ def build_observation(
     observation[OBSERVATION_SPEC.imu_gyro] = np.asarray(
         state.imu_gyro, dtype=np.float32
     )
-    observation[OBSERVATION_SPEC.body_velocity] = np.asarray(
-        estimated_body_velocity, dtype=np.float32
+    observation[OBSERVATION_SPEC.velocity_command] = np.asarray(
+        velocity_command, dtype=np.float32
     )
     observation[OBSERVATION_SPEC.imu_quat] = quaternion
     observation[OBSERVATION_SPEC.previous_action_q_target] = np.asarray(
@@ -52,16 +50,8 @@ def build_observation(
     return observation, quaternion
 
 
-class BodyVelocityEstimator(Protocol):
-    def reset(self) -> None: ...
-
-    def update(self, state: RobotState) -> np.ndarray: ...
-
-
 class ObservationBuilder:
-    def __init__(
-        self, velocity_estimator: BodyVelocityEstimator | None = None
-    ):
+    def __init__(self, velocity_estimator: VelocityEstimator | None = None):
         self.velocity_estimator = velocity_estimator or VelocityEstimator()
         self.previous_quaternion: np.ndarray | None = None
         self.previous_q_target = DEFAULT_JOINT_POSITION.copy()
@@ -77,30 +67,15 @@ class ObservationBuilder:
     def set_previous_q_target(self, q_target: np.ndarray) -> None:
         self.previous_q_target = np.asarray(q_target, dtype=np.float32).copy()
 
-    def _build_with_velocity(
-        self, state: RobotState, estimated_body_velocity: np.ndarray
+    def build(
+        self, state: RobotState, velocity_command: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
+        estimated_body_velocity = self.velocity_estimator.update(state)
         observation, quaternion = build_observation(
             state,
-            estimated_body_velocity,
+            velocity_command,
             self.previous_q_target,
             self.previous_quaternion,
         )
         self.previous_quaternion = quaternion
         return observation, estimated_body_velocity
-
-    def build(self, state: RobotState) -> tuple[np.ndarray, np.ndarray]:
-        estimated_body_velocity = self.velocity_estimator.update(state)
-        return self._build_with_velocity(state, estimated_body_velocity)
-
-    def build_many(
-        self, states: Sequence[RobotState]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Advance every physics frame and build one observation from the last."""
-
-        if len(states) == 0:
-            raise ValueError("states must contain at least one physics frame")
-        estimated_body_velocity = None
-        for state in states:
-            estimated_body_velocity = self.velocity_estimator.update(state)
-        return self._build_with_velocity(states[-1], estimated_body_velocity)
