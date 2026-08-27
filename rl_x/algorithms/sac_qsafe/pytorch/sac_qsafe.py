@@ -78,6 +78,9 @@ class SAC_QSafe:
         self.phase = config.algorithm.phase
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
+        self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
+        if self.phase == "pretrain" and not self.qsafe_enabled:
+            raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
         self.n_off = int(config.algorithm.n_off)
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
@@ -145,13 +148,13 @@ class SAC_QSafe:
         self.q_optimizer = optim.Adam(list(self.critic.q1.parameters()) + list(self.critic.q2.parameters()), lr=self.learning_rate, fused=fused)
         self.entropy_optimizer = optim.Adam([self.entropy_coefficient.log_alpha], lr=self.learning_rate, fused=fused)
         self.nu = torch.tensor(
-            float(config.algorithm.initial_nu),
+            float(config.algorithm.initial_nu) if self.qsafe_enabled else 0.0,
             dtype=torch.float32,
             device=self.device,
-            requires_grad=self.phase == "finetune",
+            requires_grad=self.phase == "finetune" and self.qsafe_enabled,
         )
         self.dual_optimizer = None
-        if self.phase == "finetune":
+        if self.phase == "finetune" and self.qsafe_enabled:
             self.dual_optimizer = optim.Adam(
                 [self.nu], lr=float(config.algorithm.dual_learning_rate), fused=fused
             )
@@ -218,10 +221,10 @@ class SAC_QSafe:
             self.observation_normalizer.validate_metadata(metadata)
         self.observation_normalizer.load_state_dict(normalizer_state)
         environment_manifest = checkpoint.get("environment_manifest")
-        if hasattr(self.train_env, "validate_checkpoint_manifest"):
+        if hasattr(self.train_env, "validate_transfer_manifest"):
             if environment_manifest is None:
                 raise ValueError("Pretrained policy is missing environment manifest.")
-            self.train_env.validate_checkpoint_manifest(
+            self.train_env.validate_transfer_manifest(
                 environment_manifest, self.observation_normalizer.metadata()
             )
 
@@ -330,7 +333,7 @@ class SAC_QSafe:
                 alpha_detach = alpha.detach()
                 policy_loss = (alpha_detach * current_log_probs - min_q).mean()
                 safety_q = torch.zeros_like(min_q)
-                if self.phase == "finetune":
+                if self.phase == "finetune" and self.qsafe_enabled:
                     # QSafe parameters are frozen, but this forward pass intentionally
                     # remains differentiable with respect to the sampled action.
                     safety_q = self.qsafe.values(batch_states, current_actions)
@@ -361,7 +364,7 @@ class SAC_QSafe:
             self.entropy_optimizer.step()
 
             dual_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-            if self.phase == "finetune":
+            if self.phase == "finetune" and self.qsafe_enabled:
                 dual_loss = self.nu * (self.qsafe.epsilon - safety_q.detach()).mean()
                 self.dual_optimizer.zero_grad()
                 dual_loss.backward()
@@ -471,7 +474,7 @@ class SAC_QSafe:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                         acting_state, phase="pretrain"
                     )
-                elif self.phase == "finetune":
+                elif self.phase == "finetune" and self.qsafe_enabled:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                         acting_state, phase="finetune"
                     )
@@ -1373,6 +1376,8 @@ class SAC_QSafe:
         eval_policy = str(self.config.algorithm.eval_policy)
         if eval_policy not in ("task", "safe"):
             raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
+        if eval_policy == "safe" and not self.qsafe_enabled:
+            raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
         for i in range(episodes):
             done = False
             episode_return = 0

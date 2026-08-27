@@ -6,12 +6,14 @@ from src.environments.go2_sqrl.common.action import (
     normalized_action_from_target,
 )
 from src.environments.go2_sqrl.common.observation import (
+    ObservationBuilder,
     build_observation,
     continuous_quaternion_wxyz,
 )
 from src.environments.go2_sqrl.common.manifest import (
     build_manifest,
     validate_manifest,
+    validate_transfer_manifest,
 )
 from src.environments.go2_sqrl.common.reward import (
     REWARD_DEFAULT_JOINT_POSITION,
@@ -40,7 +42,7 @@ def robot_state(quaternion=(1.0, 0.0, 0.0, 0.0)):
 
 def test_versioned_observation_layout_and_joint_order():
     assert OBSERVATION_SPEC.size == 46
-    assert OBSERVATION_SPEC.velocity_command == slice(27, 30)
+    assert OBSERVATION_SPEC.body_velocity == slice(27, 30)
     assert ACTION_SPEC.size == 12
     assert OBSERVATION_SPEC.previous_action_q_target == slice(34, 46)
     source = [f"{name}_joint" for name in reversed(OBSERVATION_SPEC.joint_order)]
@@ -52,12 +54,30 @@ def test_quaternion_continuity_and_observation_layout():
     second = continuous_quaternion_wxyz(np.asarray([-1.0, 0, 0, 0]), first)
     np.testing.assert_array_equal(first, np.asarray([1.0, 0, 0, 0]))
     np.testing.assert_array_equal(second, first)
+    body_velocity = np.asarray([0.1, 0.2, 0.3])
     observation, quaternion = build_observation(
-        robot_state(), np.asarray([0.1, 0.2, 0.3]), DEFAULT_JOINT_POSITION
+        robot_state(), body_velocity, DEFAULT_JOINT_POSITION
     )
     assert observation.shape == (46,)
     np.testing.assert_allclose(observation[27:30], [0.1, 0.2, 0.3])
     np.testing.assert_allclose(observation[30:34], quaternion)
+
+
+def test_observation_builder_exposes_estimated_body_velocity_not_task_target():
+    class FixedVelocityEstimator:
+        def reset(self):
+            pass
+
+        def update(self, state):
+            del state
+            return np.asarray([0.37, -0.08, 0.02], dtype=np.float32)
+
+    observation, _ = ObservationBuilder(FixedVelocityEstimator()).build(
+        robot_state()
+    )
+    np.testing.assert_allclose(
+        observation[OBSERVATION_SPEC.body_velocity], [0.37, -0.08, 0.02]
+    )
 
 
 def test_action_limit_rate_limit_and_inverse_mapping():
@@ -121,5 +141,29 @@ def test_checkpoint_manifest_rejects_contract_drift():
     incompatible_command = build_manifest(
         {"observation_size": 46}, target_velocity_x=0.3
     )
+    assert incompatible_command["observation"] == expected["observation"]
     with pytest.raises(ValueError, match="linear_velocity_x"):
         validate_manifest(incompatible_command, expected)
+    validate_transfer_manifest(incompatible_command, expected)
+
+    incompatible_failure = build_manifest(
+        {"observation_size": 46}, fall_angle_threshold=0.7
+    )
+    with pytest.raises(ValueError, match="angle_threshold"):
+        validate_transfer_manifest(incompatible_failure, expected)
+
+
+def test_legacy_command_observation_manifest_is_rejected():
+    expected = build_manifest({"observation_size": 46})
+    legacy = build_manifest({"observation_size": 46})
+    legacy["manifest_version"] = 7
+    legacy["observation"]["version"] = "go2-observation-v2-command"
+    legacy["observation"]["velocity_command"] = {
+        "indices": [27, 30],
+        "linear_velocity_x": 0.5,
+        "linear_velocity_y": 0.0,
+        "angular_velocity_z": 0.0,
+    }
+    del legacy["observation"]["body_velocity"]
+    with pytest.raises(ValueError, match="manifest_version"):
+        validate_manifest(legacy, expected)

@@ -3,14 +3,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.config import DEFAULT_MUJOCO_SCENE, RUN_PRESETS
+from src.config import DEFAULT_MUJOCO_SCENE, PRETRAIN_RUN_NAME, RUN_PRESETS
 from src.environments.go2_sqrl.common.specs import (
     ACTION_SPEC,
     DEFAULT_BASE_HEIGHT,
     JOINT_NAMES,
     PHYSICS_DT,
 )
-from src.run import _artifact_flags
+from src.run import _artifact_flags, _runtime_lock
 
 
 def test_framework_is_selected_by_training_backend():
@@ -30,10 +30,13 @@ def test_zero_shot_is_a_flat_deterministic_task_policy_gate():
 
 def test_pretrain_parity_checkpoint_uses_flat_ground():
     assert "--environment.terrain_mode=flat" in RUN_PRESETS["pretrain"]
-    assert (
-        "--runner.run_name=isaac_flashsac_cmd_reward_v3"
-        in RUN_PRESETS["pretrain"]
-    )
+    assert "--algorithm.total_timesteps=300000" in RUN_PRESETS["pretrain"]
+    assert f"--runner.run_name={PRETRAIN_RUN_NAME}" in RUN_PRESETS["pretrain"]
+
+
+def test_finetune_uses_matched_300k_budget():
+    assert "--algorithm.total_timesteps=300000" in RUN_PRESETS["finetune"]
+    assert "--algorithm.safety_objective=sorl" in RUN_PRESETS["finetune"]
 
 
 def test_isaac_eval_is_single_environment_deterministic_task_policy():
@@ -101,13 +104,28 @@ def test_canonical_mujoco_asset_matches_sdk_bridge_contract():
 def test_transfer_commands_use_torch_pretrain_sidecars(tmp_path: Path):
     (tmp_path / "policy.model").touch()
     (tmp_path / "qsafe.model").touch()
+    (tmp_path / "final.model").touch()
     flags = _artifact_flags("finetune", str(tmp_path))
     assert flags == [
         f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}",
         f"--algorithm.qsafe.checkpoint_path={tmp_path / 'qsafe.model'}",
+        f"--algorithm.pretrained_task_checkpoint_path={tmp_path / 'final.model'}",
     ]
+
+    zero_shot_flags = _artifact_flags("zero-shot", str(tmp_path))
+    assert zero_shot_flags == flags
 
 
 def test_eval_rejects_a_missing_flax_checkpoint(tmp_path: Path):
     with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
         _artifact_flags("eval", str(tmp_path))
+
+
+def test_runtime_lock_rejects_duplicate_dds_owner(tmp_path: Path):
+    with _runtime_lock("simulator", 1, "lo", directory=tmp_path):
+        with pytest.raises(RuntimeError, match="already owns DDS domain 1"):
+            with _runtime_lock("simulator", 1, "lo", directory=tmp_path):
+                pass
+        # A single policy process is allowed alongside the single simulator.
+        with _runtime_lock("policy", 1, "lo", directory=tmp_path):
+            pass

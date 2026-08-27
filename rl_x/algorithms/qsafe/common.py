@@ -1,6 +1,174 @@
 import numpy as np
 
 
+class SorlRewardShaper:
+    """Stateful implementation of SORL equations (10) and (11).
+
+    The empirical reward range updates the terminal cost and, when requested,
+    the safety significance ``lambda``.  Equation (19) is the lower envelope
+    of ``H*`` affine functions of lambda when the unsafe-trajectory length is
+    evaluated at the integer horizons 1..H*.  Solving those line intersections
+    is deterministic and avoids a SciPy dependency while implementing the
+    paper's local solution around the previous lambda.
+    """
+
+    def __init__(
+        self,
+        gamma,
+        gamma_safe,
+        horizon,
+        significance,
+        cost_margin,
+        target_delta=0.0,
+        solve_significance=False,
+        preserve_negative_task_penalty=False,
+    ):
+        self.gamma = float(gamma)
+        self.gamma_safe = float(gamma_safe)
+        self.horizon = int(horizon)
+        self.significance = float(significance)
+        self.cost_margin = float(cost_margin)
+        self.target_delta = float(target_delta)
+        self.solve_significance = bool(solve_significance)
+        self.preserve_negative_task_penalty = bool(
+            preserve_negative_task_penalty
+        )
+        if not 0.0 < self.gamma < 1.0:
+            raise ValueError("SORL gamma must be in (0, 1)")
+        if not 0.0 < self.gamma_safe < 1.0:
+            raise ValueError("SORL gamma_safe must be in (0, 1)")
+        if self.horizon < 1:
+            raise ValueError("SORL horizon must be at least one")
+        if self.significance < 0.0:
+            raise ValueError("SORL significance must be non-negative")
+        if self.cost_margin <= 0.0:
+            raise ValueError("SORL cost_margin must be positive")
+        if not np.isfinite(self.target_delta):
+            raise ValueError("SORL target_delta must be finite")
+        self.reward_min = np.inf
+        self.reward_max = -np.inf
+        self.failure_cost = self.cost_margin
+        self.achieved_delta = np.nan
+        self.negative_penalty_floor_fraction = 0.0
+
+
+    def _delta_lines(self):
+        """Return Eq. (19) as ``min_x(intercept_x + slope_x*lambda)``."""
+        horizons = np.arange(1, self.horizon + 1, dtype=np.float64)
+        ratio = self.gamma / self.gamma_safe
+        unsafe_scale = (
+            self.gamma_safe**self.horizon
+            * self.reward_max
+            / (1.0 - ratio)
+        )
+        unsafe_intercepts = (
+            self.reward_max / (1.0 - self.gamma)
+            - (self.reward_max + self.failure_cost)
+            / (1.0 - self.gamma)
+            * self.gamma**horizons
+        )
+        unsafe_slopes = unsafe_scale * (ratio**horizons - 1.0)
+        safe_slope = (
+            self.gamma_safe * self.reward_min / (1.0 - self.gamma)
+        )
+        return -unsafe_intercepts, safe_slope - unsafe_slopes
+
+
+    def _delta(self, significance):
+        intercepts, slopes = self._delta_lines()
+        return float(np.min(intercepts + slopes * float(significance)))
+
+
+    def _solve_significance(self):
+        # The theorem assumes r_min < 0 < r_max.  Before the online samples
+        # establish that range, retaining the configured initial lambda is the
+        # only well-defined behavior.
+        if not self.reward_min < 0.0 < self.reward_max:
+            self.achieved_delta = np.nan
+            return
+        intercepts, slopes = self._delta_lines()
+        candidates = [max(self.significance, np.finfo(np.float64).tiny)]
+        for intercept, slope in zip(intercepts, slopes):
+            if abs(slope) <= np.finfo(np.float64).eps:
+                continue
+            candidate = (self.target_delta - intercept) / slope
+            if np.isfinite(candidate) and candidate > 0.0:
+                candidates.append(float(candidate))
+
+        previous = max(self.significance, np.finfo(np.float64).tiny)
+        scored = []
+        for candidate in candidates:
+            achieved = self._delta(candidate)
+            error = abs(achieved - self.target_delta)
+            locality = abs(np.log(candidate / previous))
+            scored.append((error, locality, candidate, achieved))
+        _, _, self.significance, self.achieved_delta = min(scored)
+
+
+    def shape(self, rewards, risks, failures):
+        rewards = np.asarray(rewards, dtype=np.float32)
+        risks = np.asarray(risks, dtype=np.float32).reshape(rewards.shape)
+        failures = np.asarray(failures, dtype=np.float32).reshape(rewards.shape)
+        if not np.all(np.isfinite(rewards)) or not np.all(np.isfinite(risks)):
+            raise ValueError("SORL rewards and risks must be finite")
+        if not np.all((failures == 0.0) | (failures == 1.0)):
+            raise ValueError("SORL failures must be binary")
+
+        self.reward_min = min(self.reward_min, float(np.min(rewards)))
+        self.reward_max = max(self.reward_max, float(np.max(rewards)))
+        reward_range = max(self.reward_max - self.reward_min, 0.0)
+        theoretical_cost = (
+            reward_range / (self.gamma**self.horizon) - self.reward_max
+        )
+        self.failure_cost = max(
+            self.cost_margin, theoretical_cost + self.cost_margin
+        )
+        if self.solve_significance:
+            self._solve_significance()
+        elif self.reward_min < 0.0 < self.reward_max:
+            self.achieved_delta = self._delta(self.significance)
+
+        risks = np.clip(risks, 0.0, 1.0)
+        positive = (1.0 - self.significance * risks) * rewards
+        negative = self.significance * risks * rewards
+        shaped = np.where(rewards >= 0.0, positive, negative)
+        if self.preserve_negative_task_penalty:
+            # Eq. (10) assumes that suppressing a negative reward in states
+            # judged safe is desirable.  For command tracking this reverses
+            # the task ordering: a slow but safe gait can turn a negative
+            # speed reward into a larger value than walking at the command.
+            # Retain the paper value whenever it is more conservative, but
+            # never allow safety shaping to erase a negative task signal.
+            floor_applied = (
+                (failures == 0.0)
+                & (rewards < 0.0)
+                & (shaped > rewards)
+            )
+            self.negative_penalty_floor_fraction = float(
+                np.mean(floor_applied)
+            )
+            shaped = np.where(rewards < 0.0, np.minimum(shaped, rewards), shaped)
+        else:
+            self.negative_penalty_floor_fraction = 0.0
+        return np.where(failures > 0.0, -self.failure_cost, shaped).astype(
+            np.float32
+        )
+
+
+    def metrics(self):
+        return {
+            "sorl/reward_min": self.reward_min,
+            "sorl/reward_max": self.reward_max,
+            "sorl/failure_cost": self.failure_cost,
+            "sorl/significance": self.significance,
+            "sorl/target_delta": self.target_delta,
+            "sorl/achieved_delta": self.achieved_delta,
+            "sorl/negative_penalty_floor_fraction": (
+                self.negative_penalty_floor_fraction
+            ),
+        }
+
+
 class VectorTrajectoryAccumulator:
     """Stage vector-env transitions and emit complete per-env trajectories."""
 

@@ -10,7 +10,10 @@ from src.environments.go2_sqrl.common.action import (
     ActionMapper,
     project_actions_from_observation,
 )
-from src.environments.go2_sqrl.common.estimation.velocity import VelocityEstimator
+from src.environments.go2_sqrl.common.estimation.velocity import (
+    DEFAULT_VELOCITY_ESTIMATOR_CONFIG,
+    VelocityEstimator,
+)
 from src.environments.go2_sqrl.common.manifest import (
     ACTION_PIPELINE_VERSION,
     FAILURE_CONTRACT_VERSION,
@@ -18,11 +21,18 @@ from src.environments.go2_sqrl.common.manifest import (
     VELOCITY_ESTIMATOR_VERSION,
     build_manifest,
     validate_manifest,
+    validate_transfer_manifest,
 )
 from src.environments.go2_sqrl.common.specs import (
+    ACTION_SPEC,
+    CONTROL_DT,
     DEFAULT_JOINT_POSITION,
+    EPISODE_STEPS,
     JOINT_NAMES,
     OBSERVATION_SPEC,
+    PHYSICS_STEPS_PER_ACTION,
+    FINETUNE_TARGET_VELOCITY_X,
+    PRETRAIN_TARGET_VELOCITY_X,
 )
 from src.environments.go2_sqrl.common.types import RobotState, TrainingState
 from src.environments.go2_sqrl.sdk2_mujoco.env import Go2SDKMujocoEnv
@@ -73,20 +83,70 @@ def test_mujoco_reset_pd_defaults_settle_before_policy_takeover():
     assert config.reset_max_joint_velocity == 0.5
 
 
+def test_mujoco_robust_velocity_estimator_defaults_are_explicit():
+    config = get_config("go2_sqrl.sdk2_mujoco")
+    for field in fields(DEFAULT_VELOCITY_ESTIMATOR_CONFIG):
+        assert config[f"velocity_estimator_{field.name}"] == pytest.approx(
+            getattr(DEFAULT_VELOCITY_ESTIMATOR_CONFIG, field.name)
+        )
+
+
+def test_isaac_robust_velocity_estimator_defaults_match_mujoco():
+    from src.environments.go2_sqrl.isaac_lab.default_config import (
+        get_config as get_isaac_config,
+    )
+
+    mujoco = get_config("go2_sqrl.sdk2_mujoco")
+    isaac = get_isaac_config("go2_sqrl.isaac_lab")
+    for field in fields(DEFAULT_VELOCITY_ESTIMATOR_CONFIG):
+        name = f"velocity_estimator_{field.name}"
+        assert isaac[name] == pytest.approx(mujoco[name])
+
+
+def test_backend_defaults_share_common_control_contract():
+    from src.environments.go2_sqrl.isaac_lab.default_config import (
+        get_config as get_isaac_config,
+    )
+
+    mujoco = get_config("go2_sqrl.sdk2_mujoco")
+    isaac = get_isaac_config("go2_sqrl.isaac_lab")
+    assert mujoco.policy_frames == PHYSICS_STEPS_PER_ACTION
+    assert mujoco.policy_period_seconds == pytest.approx(CONTROL_DT)
+    assert mujoco.policy_kp == pytest.approx(ACTION_SPEC.kp)
+    assert mujoco.policy_kd == pytest.approx(ACTION_SPEC.kd)
+    for config in (mujoco, isaac):
+        assert config.episode_steps == EPISODE_STEPS
+    assert isaac.target_velocity_x == pytest.approx(PRETRAIN_TARGET_VELOCITY_X)
+    assert mujoco.target_velocity_x == pytest.approx(FINETUNE_TARGET_VELOCITY_X)
+
+
+def test_sqrl_transfer_changes_only_forward_velocity_objective():
+    pretrain = build_manifest(target_velocity_x=PRETRAIN_TARGET_VELOCITY_X)
+    finetune = build_manifest(target_velocity_x=FINETUNE_TARGET_VELOCITY_X)
+    validate_transfer_manifest(pretrain, finetune)
+    with pytest.raises(ValueError, match="linear_velocity_x"):
+        validate_manifest(pretrain, finetune)
+
+
 def test_manifest_versions_sensor_free_estimator_and_imu_failure():
     manifest = build_manifest({"observation_size": 46})
-    assert manifest["manifest_version"] == MANIFEST_VERSION == 7
+    assert manifest["manifest_version"] == MANIFEST_VERSION == 8
     assert manifest["reward_version"] == "flashsac-go2-walk-easy-command-v3"
-    assert manifest["reward_contract"]["command"]["linear_velocity_x"] == 0.5
+    assert manifest["reward_contract"]["command"]["linear_velocity_x"] == (
+        PRETRAIN_TARGET_VELOCITY_X
+    )
     np.testing.assert_allclose(
         manifest["reward_contract"]["similar_to_default_joint_position"],
         [0.0, 0.8, -1.5] * 2 + [0.0, 1.0, -1.5] * 2,
     )
     estimator = manifest["observation"]["velocity_estimator"]
     assert estimator["version"] == VELOCITY_ESTIMATOR_VERSION
-    assert estimator["policy_visible"] is False
+    assert estimator["policy_visible"] is True
     assert estimator["external_contact_sensor"] is False
-    assert manifest["observation"]["velocity_command"]["indices"] == [27, 30]
+    body_velocity = manifest["observation"]["body_velocity"]
+    assert body_velocity["indices"] == [27, 30]
+    assert body_velocity["frame"] == "body"
+    assert body_velocity["source"] == "proprioceptive_velocity_estimator"
     assert manifest["failure"]["version"] == FAILURE_CONTRACT_VERSION
     assert manifest["failure"]["external_contact_sensor"] is False
     assert manifest["failure"]["frame_unit"] == "physics_frames"
@@ -378,7 +438,11 @@ def test_finetune_auto_resets_on_start_and_one_second_after_fall(monkeypatch):
     client._push(count=1)
     environment._manual_failure_reset()
     assert controller.count == 2
-    assert sleeps == [pytest.approx(1.0)]
+    assert sleeps == [
+        pytest.approx(0.25),
+        pytest.approx(1.0),
+        pytest.approx(0.25),
+    ]
 
 
 def test_sdk_reset_pose_requires_upright_home_configuration():
@@ -442,7 +506,7 @@ def test_sdk_reset_pose_rejects_low_base_even_when_level():
     assert not environment._reset_pose_ready(level_home)
 
 
-def test_torch_and_numpy_estimators_and_action_projection_match():
+def test_torch_and_numpy_robust_estimators_and_action_projection_match():
     torch = pytest.importorskip("torch")
     from src.environments.go2_sqrl.common.estimation.velocity_torch import (
         TorchVelocityEstimator,
@@ -455,7 +519,7 @@ def test_torch_and_numpy_estimators_and_action_projection_match():
     quat = np.asarray([0.99875027, 0.0, 0.0, 0.04997917], dtype=np.float32)
     accel = np.asarray([0.1, -0.05, 9.81], dtype=np.float32)
     state = RobotState(q, dq, gyro, quat, accel)
-    numpy_estimator = VelocityEstimator()
+    numpy_estimator = VelocityEstimator(dt=0.02)
     torch_estimator = TorchVelocityEstimator(1, "cpu")
     for _ in range(3):
         numpy_velocity = numpy_estimator.update(state)

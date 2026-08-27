@@ -1,20 +1,31 @@
 from ml_collections import config_dict
 
+from ..common.estimation.velocity import configure_velocity_estimator
+from ..common.specs import EPISODE_STEPS, PRETRAIN_TARGET_VELOCITY_X
+
 
 def get_config(environment_name):
     config = config_dict.ConfigDict()
     config.name = environment_name
     config.seed = 0
-    config.nr_envs = 320
-    config.nr_task_envs = 256
-    config.nr_safety_envs = 64
+    # A 300k budget needs at least two 500-step safety horizons so QSafe can be
+    # updated before training ends. This raises total parallelism above the old
+    # 320-env setup without collapsing the run to a single safety-trajectory
+    # batch as a 512-task-env pool would.
+    config.nr_envs = 400
+    config.nr_task_envs = 300
+    config.nr_safety_envs = 100
     config.rollout_mode = "partitioned"
     config.device = "gpu"
-    config.target_velocity_x = 0.5
+    config.target_velocity_x = PRETRAIN_TARGET_VELOCITY_X
+    # Robust batched velocity Kalman filter. Isaac exposes one sensor snapshot
+    # per 20 ms decimated policy step, while SDK2/MuJoCo consumes all ten 2 ms
+    # LowState frames with the same estimator model.
+    configure_velocity_estimator(config)
     config.terrain_mode = "rough"
     config.domain_randomization = False
     config.friction = 0.4
-    config.episode_steps = 500
+    config.episode_steps = EPISODE_STEPS
     config.fall_angle_threshold = 0.8
     config.fall_consecutive_frames = 5
     config.render = False

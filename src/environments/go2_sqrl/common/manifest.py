@@ -17,10 +17,11 @@ from .specs import (
     DEFAULT_BASE_HEIGHT,
     OBSERVATION_SPEC,
     PHYSICS_DT,
+    PRETRAIN_TARGET_VELOCITY_X,
 )
 
 
-MANIFEST_VERSION = 7
+MANIFEST_VERSION = 8
 VELOCITY_ESTIMATOR_VERSION = "proprioceptive-support-v2"
 FAILURE_CONTRACT_VERSION = "imu-roll-pitch-sustained-v1"
 ACTION_PIPELINE_VERSION = "sdk-absolute-position-v2"
@@ -31,7 +32,7 @@ def build_manifest(
     *,
     fall_angle_threshold: float = 0.8,
     fall_consecutive_frames: int = 5,
-    target_velocity_x: float = 0.5,
+    target_velocity_x: float = PRETRAIN_TARGET_VELOCITY_X,
 ) -> dict[str, Any]:
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -40,18 +41,17 @@ def build_manifest(
             "size": OBSERVATION_SPEC.size,
             "joint_order": list(OBSERVATION_SPEC.joint_order),
             "quaternion_order": OBSERVATION_SPEC.quaternion_order,
-            "velocity_command": {
+            "body_velocity": {
                 "indices": [
-                    OBSERVATION_SPEC.velocity_command.start,
-                    OBSERVATION_SPEC.velocity_command.stop,
+                    OBSERVATION_SPEC.body_velocity.start,
+                    OBSERVATION_SPEC.body_velocity.stop,
                 ],
-                "linear_velocity_x": float(target_velocity_x),
-                "linear_velocity_y": 0.0,
-                "angular_velocity_z": 0.0,
+                "frame": "body",
+                "source": "proprioceptive_velocity_estimator",
             },
             "velocity_estimator": {
                 "version": VELOCITY_ESTIMATOR_VERSION,
-                "policy_visible": False,
+                "policy_visible": True,
                 "inputs": [
                     "joint_q",
                     "joint_dq",
@@ -123,18 +123,52 @@ def build_manifest(
     }
 
 
-def validate_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> None:
+def _validate_manifest(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    ignored_paths: frozenset[str] = frozenset(),
+) -> None:
     def compare(path: str, lhs: Any, rhs: Any) -> None:
         if isinstance(rhs, dict):
             if not isinstance(lhs, dict):
                 raise ValueError(f"Checkpoint contract mismatch at {path}")
             for key, value in rhs.items():
+                child_path = f"{path}{key}"
+                if child_path in ignored_paths:
+                    continue
                 if key not in lhs:
                     raise ValueError(f"Checkpoint contract missing {path}{key}")
-                compare(f"{path}{key}.", lhs[key], value)
+                compare(f"{child_path}.", lhs[key], value)
         elif lhs != rhs:
             raise ValueError(
                 f"Checkpoint contract mismatch at {path[:-1]}: expected {rhs}, got {lhs}"
             )
 
     compare("", actual, expected)
+
+
+def validate_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> None:
+    """Validate an exact resume/evaluation checkpoint contract."""
+
+    _validate_manifest(actual, expected)
+
+
+def validate_transfer_manifest(
+    actual: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    """Validate a cross-task SQRL transfer contract.
+
+    SQRL deliberately changes the target-task reward while reusing the policy
+    and task-independent safety critic. Only the forward-velocity command may
+    differ; observation, action, dynamics, failure, and reward-shape contracts
+    remain strict.
+    """
+
+    _validate_manifest(
+        actual,
+        expected,
+        ignored_paths=frozenset(
+            {"reward_contract.command.linear_velocity_x"}
+        ),
+    )

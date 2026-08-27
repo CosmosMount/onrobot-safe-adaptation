@@ -77,4 +77,3 @@ def test_publish_joint_target_populates_pd_and_crc_without_sdk_runtime():
     assert client._command.crc == 1234
     assert client._publisher.written is client._command
     assert all(motor.kp == 25.0 and motor.kd == 0.5 for motor in client._command.motor_cmd[:12])
-

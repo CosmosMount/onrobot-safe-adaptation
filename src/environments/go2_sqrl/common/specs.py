@@ -20,6 +20,11 @@ PHYSICS_DT: Final = 0.002
 PHYSICS_STEPS_PER_ACTION: Final = 10
 EPISODE_STEPS: Final = 500
 DEFAULT_BASE_HEIGHT: Final = 0.27
+# SQRL transfers from a safer/slower locomotion task to a faster target task.
+# Keep both stage objectives in the shared contract so Isaac and MuJoCo do not
+# acquire independent magic numbers.
+PRETRAIN_TARGET_VELOCITY_X: Final = 0.5
+FINETUNE_TARGET_VELOCITY_X: Final = 0.6
 
 DEFAULT_JOINT_POSITION = np.tile(
     np.asarray([0.0, 0.9, -1.8], dtype=np.float32), 4
@@ -45,13 +50,15 @@ JOINT_UPPER_LIMIT = np.asarray(
 
 
 @dataclass(frozen=True)
-class ObservationSpecV2:
-    version: str = "go2-observation-v2-command"
+class ObservationSpecV3:
+    # Contact-free Walk in the Park variant: the fixed task target belongs to
+    # the reward, while the policy observes onboard-estimated body velocity.
+    version: str = "go2-observation-v3-body-velocity"
     size: int = OBSERVATION_SIZE
     joint_q: slice = field(default_factory=lambda: slice(0, 12))
     joint_dq: slice = field(default_factory=lambda: slice(12, 24))
     imu_gyro: slice = field(default_factory=lambda: slice(24, 27))
-    velocity_command: slice = field(default_factory=lambda: slice(27, 30))
+    body_velocity: slice = field(default_factory=lambda: slice(27, 30))
     imu_quat: slice = field(default_factory=lambda: slice(30, 34))
     previous_action_q_target: slice = field(default_factory=lambda: slice(34, 46))
     quaternion_order: str = "WXYZ"
@@ -78,7 +85,7 @@ class ActionSpecV1:
     joint_order: tuple[str, ...] = JOINT_NAMES
 
 
-OBSERVATION_SPEC = ObservationSpecV2()
+OBSERVATION_SPEC = ObservationSpecV3()
 ACTION_SPEC = ActionSpecV1()
 
 

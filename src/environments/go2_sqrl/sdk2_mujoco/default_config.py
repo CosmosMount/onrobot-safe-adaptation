@@ -1,5 +1,14 @@
 from ml_collections import config_dict
 
+from ..common.estimation.velocity import configure_velocity_estimator
+from ..common.specs import (
+    ACTION_SPEC,
+    CONTROL_DT,
+    EPISODE_STEPS,
+    PHYSICS_STEPS_PER_ACTION,
+    FINETUNE_TARGET_VELOCITY_X,
+)
+
 
 def get_config(environment_name):
     config = config_dict.ConfigDict()
@@ -8,21 +17,30 @@ def get_config(environment_name):
     config.nr_envs = 1
     config.domain_id = 1
     config.interface = "lo"
-    config.policy_frames = 10
+    config.policy_frames = PHYSICS_STEPS_PER_ACTION
     # LowState is published at 500 Hz; one policy/learner iteration consumes
     # ten fresh physical ticks. The Flax learner reports deadline misses while
     # DDS transport itself remains on the host.
-    config.policy_period_seconds = 0.02
+    config.policy_period_seconds = CONTROL_DT
+    # Robust velocity Kalman filter. These defaults start from the empirical A1
+    # variances and the existing contact-free Go2 support scales.
+    configure_velocity_estimator(config)
     # Runtime policy PD. Defaults reproduce the Isaac/checkpoint contract;
     # command-line overrides are MuJoCo-only sensitivity experiments.
-    config.policy_kp = 25.0
-    config.policy_kd = 0.5
+    config.policy_kp = ACTION_SPEC.kp
+    config.policy_kd = ACTION_SPEC.kd
     config.state_timeout = 1.0
     config.manual_reset_timeout = -1.0
     config.auto_reset_on_start = True
     config.auto_reset_after_fall = True
+    # Gym time limits delimit independent physical rollouts. Continuing the
+    # same MuJoCo trajectory while clearing controller state corrupts both the
+    # estimator and fall statistics; production SDK runs reset and stand up.
+    config.auto_reset_on_time_limit = True
     config.fall_auto_reset_delay_seconds = 1.0
     config.auto_reset_timeout_seconds = 5.0
+    # Let queued pre-reset DDS ticks drain before reset-pose interpolation.
+    config.reset_post_restart_settle_seconds = 0.25
     config.mujoco_window_title = "MuJoCo"
     # Two-stage linear stand-up copied from the proven Go2 controller in the
     # reference repository: current pose -> folded/crouched keyframe -> home.
@@ -48,14 +66,12 @@ def get_config(environment_name):
     # Position alone can look ready while the legs are still oscillating.
     config.reset_max_joint_velocity = 0.5
     config.reset_min_base_height = 0.20
-    config.episode_steps = 500
-    # The policy has no command input, so evaluation must use the fixed velocity
-    # objective on which it was pre-trained.
-    config.target_velocity_x = 0.5
+    config.episode_steps = EPISODE_STEPS
+    # SQRL target-task shift: adapt the 0.5 m/s pre-trained policy to 0.6 m/s.
+    # The command remains reward-only and does not enter the deployable 46D
+    # observation.
+    config.target_velocity_x = FINETUNE_TARGET_VELOCITY_X
     config.fall_angle_threshold = 0.8
     config.fall_consecutive_frames = 5
-
-    config.kp = 25.0
-    config.kd = 0.5
 
     return config
