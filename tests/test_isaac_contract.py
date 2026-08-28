@@ -90,8 +90,11 @@ def test_domain_randomization_report_shows_effective_ranges():
     assert "uniform [0.34, 0.46]" in enabled
     assert "base mass delta (kg)" in enabled
     assert "uniform [-0.5, 0.5]" in enabled
-    assert "46D policy observation corruption" in enabled
-    assert "disabled (common adapter output)" in enabled
+    assert "joint position noise (rad)" in enabled
+    assert "uniform [-0.005, 0.005]" in enabled
+    assert "IMU acceleration noise (m/s^2)" in enabled
+    assert "leg mass scale" in enabled
+    assert "uniform [0.9, 1.1]" in enabled
 
     disabled = format_domain_randomization_report(enabled=False, friction=0.4)
     assert "Domain Randomization: disabled" in disabled
@@ -164,11 +167,14 @@ def test_domain_randomization_can_be_enabled_after_fixed_baseline(monkeypatch):
     configure_existing_events(events, enabled=False, friction=0.4)
     assert events.add_base_mass is None
     assert events.base_com is None
+    assert events.leg_mass is None
 
     configure_existing_events(events, enabled=True, friction=0.4)
     assert events.add_base_mass.params["mass_distribution_params"] == (-0.5, 0.5)
     assert events.add_base_mass.params["asset_cfg"].body_names == "base"
     assert events.base_com.params["asset_cfg"].body_names == "base"
+    assert events.leg_mass.params["mass_distribution_params"] == (0.9, 1.1)
+    assert events.leg_mass.params["asset_cfg"].body_names == ".*_(hip|thigh|calf)"
     assert events.actuator_gains.mode == "reset"
 
 

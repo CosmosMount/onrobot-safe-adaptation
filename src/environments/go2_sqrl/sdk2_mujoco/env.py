@@ -103,7 +103,7 @@ class Go2SDKMujocoEnv:
         self.fall_detector = FallDetector(
             environment.fall_angle_threshold,
             environment.fall_consecutive_frames,
-            environment.reset_min_base_height,
+            environment.fall_min_base_height,
         )
         self.episode = EpisodeTracker(environment.episode_steps)
         self._last_tick: int | None = None
@@ -407,8 +407,11 @@ class Go2SDKMujocoEnv:
         frames = self._wait_window()
 
         failure = False
+        tilt_failure = False
         for frame in frames:
-            failure = self.fall_detector.update(frame.imu_quat) or failure
+            frame_tilt_failure = self.fall_detector.update(frame.imu_quat)
+            tilt_failure = frame_tilt_failure or tilt_failure
+            failure = frame_tilt_failure or failure
         final_state = frames[-1]
         observation, estimated_body_velocity = self.observation_builder.build_many(
             frames
@@ -425,7 +428,10 @@ class Go2SDKMujocoEnv:
         base_height = BASE_HEIGHT_TARGET
         if truth is not None and truth.base_position is not None:
             base_height = float(np.asarray(truth.base_position)[2])
-            failure = self.fall_detector.update_base_height(base_height) or failure
+            height_failure = self.fall_detector.update_base_height(base_height)
+            failure = height_failure or failure
+        else:
+            height_failure = False
         terms = compute_reward(
             world_velocity,
             final_state.imu_quat,
@@ -445,6 +451,8 @@ class Go2SDKMujocoEnv:
 
         info = {
             "failure": np.asarray([int(failure)], dtype=np.float32),
+            "failure/tilt": np.asarray([int(tilt_failure)], dtype=np.float32),
+            "failure/height": np.asarray([int(height_failure)], dtype=np.float32),
             "applied_action": mapped.applied_action[None, :],
             "policy_blend_alpha": np.asarray([alpha], dtype=np.float32),
             "estimated_forward_velocity": np.asarray(
@@ -557,6 +565,7 @@ class Go2SDKMujocoEnv:
         return build_manifest(
             normalizer,
             fall_angle_threshold=float(self.config.fall_angle_threshold),
+            fall_min_base_height=float(self.config.fall_min_base_height),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
         )

@@ -4,12 +4,19 @@
 TRANSFER_RANDOMIZATION = {
     "friction_scale": (0.85, 1.15),
     "base_mass_delta": (-0.5, 0.5),
+    "leg_mass_scale": (0.9, 1.1),
     "com_offset": (-0.01, 0.01),
     "kp_scale": (0.95, 1.05),
     "kd_scale": (0.95, 1.05),
     "joint_position_scale": (0.98, 1.02),
     "initial_tilt_rad": (-0.035, 0.035),
     "initial_velocity": (-0.05, 0.05),
+    # Modest sensor errors cover the residual Isaac/MuJoCo estimator gap while
+    # preserving the shared 46D tensor meaning.
+    "joint_position_noise": (-0.005, 0.005),
+    "joint_velocity_noise": (-0.05, 0.05),
+    "gyro_noise": (-0.01, 0.01),
+    "accelerometer_noise": (-0.05, 0.05),
 }
 
 
@@ -33,9 +40,12 @@ def domain_randomization_rows(*, enabled: bool, friction: float):
     return (
         (
             "policy",
-            "46D policy observation corruption",
-            "disabled (common adapter output)",
+            "joint position noise (rad)",
+            uniform("joint_position_noise"),
         ),
+        ("policy", "joint velocity noise (rad/s)", uniform("joint_velocity_noise")),
+        ("policy", "IMU gyro noise (rad/s)", uniform("gyro_noise")),
+        ("policy", "IMU acceleration noise (m/s^2)", uniform("accelerometer_noise")),
         (
             "startup",
             "static/dynamic friction coefficient",
@@ -46,6 +56,7 @@ def domain_randomization_rows(*, enabled: bool, friction: float):
             ),
         ),
         ("startup", "base mass delta (kg)", uniform("base_mass_delta")),
+        ("startup", "leg mass scale", uniform("leg_mass_scale")),
         ("startup", "base COM offset xyz (m)", uniform("com_offset")),
         ("reset", "actuator stiffness scale", uniform("kp_scale")),
         ("reset", "actuator damping scale", uniform("kd_scale")),
@@ -133,6 +144,20 @@ def configure_existing_events(events, *, enabled: bool, friction: float):
                 },
             },
         )
+        events.leg_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=".*_(hip|thigh|calf)"
+                ),
+                "mass_distribution_params": TRANSFER_RANDOMIZATION[
+                    "leg_mass_scale"
+                ],
+                "operation": "scale",
+                "distribution": "uniform",
+            },
+        )
         events.actuator_gains = EventTerm(
             func=mdp.randomize_actuator_gains,
             mode="reset",
@@ -151,6 +176,7 @@ def configure_existing_events(events, *, enabled: bool, friction: float):
     else:
         events.add_base_mass = None
         events.base_com = None
+        events.leg_mass = None
         events.actuator_gains = None
     events.reset_robot_joints.params["position_range"] = (
         TRANSFER_RANDOMIZATION["joint_position_scale"]

@@ -146,65 +146,6 @@ def convert_torch_qsafe_params(
     return serialization.from_state_dict(template_params, state)
 
 
-def convert_torch_critic_params(
-    template_params,
-    q1_state: Mapping[str, Any],
-    q2_state: Mapping[str, Any],
-):
-    """Convert two PyTorch SAC Q networks into one vmapped Flax critic."""
-
-    critics = [
-        _normalized_state_dict(q1_state),
-        _normalized_state_dict(q2_state),
-    ]
-    expected = {
-        "critic.0.weight",
-        "critic.0.bias",
-        "critic.2.weight",
-        "critic.2.bias",
-        "critic.4.weight",
-        "critic.4.bias",
-    }
-    for index, critic in enumerate(critics, start=1):
-        _require_exact_keys(critic, expected, f"PyTorch task critic Q{index}")
-
-    state = serialization.to_state_dict(template_params)
-    try:
-        vmapped = state["params"]["VmapCritic_0"]
-    except KeyError as exc:
-        raise ValueError("Unexpected Flax vmapped critic parameter structure") from exc
-    for dense_name, torch_layer in (
-        ("Dense_0", "critic.0"),
-        ("Dense_1", "critic.2"),
-        ("Dense_2", "critic.4"),
-    ):
-        kernels = np.stack(
-            [
-                _as_numpy(critic[f"{torch_layer}.weight"], dtype=np.float32).T
-                for critic in critics
-            ],
-            axis=0,
-        )
-        biases = np.stack(
-            [
-                _as_numpy(critic[f"{torch_layer}.bias"], dtype=np.float32)
-                for critic in critics
-            ],
-            axis=0,
-        )
-        expected_kernel = np.asarray(vmapped[dense_name]["kernel"]).shape
-        expected_bias = np.asarray(vmapped[dense_name]["bias"]).shape
-        if kernels.shape != expected_kernel or biases.shape != expected_bias:
-            raise ValueError(
-                f"{torch_layer} shape mismatch: expected kernel={expected_kernel}, "
-                f"bias={expected_bias}; got kernel={kernels.shape}, "
-                f"bias={biases.shape}"
-            )
-        vmapped[dense_name]["kernel"] = kernels
-        vmapped[dense_name]["bias"] = biases
-    return serialization.from_state_dict(template_params, state)
-
-
 def _normalizer_state_from_torch(state: Mapping[str, Any]) -> dict[str, Any]:
     required = {"running_mean", "running_var", "count"}
     _require_exact_keys(state, required, "PyTorch observation normalizer")
@@ -319,15 +260,17 @@ def make_native_policy_artifact(
     normalizer_metadata: Mapping[str, Any],
     environment_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "format": POLICY_ARTIFACT_FORMAT,
         "version": POLICY_ARTIFACT_VERSION,
         "policy_params": serialization.to_state_dict(policy_params),
-        "log_alpha": np.asarray(log_alpha, dtype=np.float32),
         "normalizer_state": dict(normalizer_state),
         "normalizer_metadata": dict(normalizer_metadata),
         "environment_manifest": dict(environment_manifest),
     }
+    if log_alpha is not None:
+        payload["log_alpha"] = np.asarray(log_alpha, dtype=np.float32)
+    return payload
 
 
 def load_torch_qsafe_artifact(
@@ -352,36 +295,5 @@ def load_torch_qsafe_artifact(
             target_template,
             checkpoint["target_state_dict"],
             expected_observation_indices,
-        ),
-    }
-
-
-def load_torch_task_critic_artifact(
-    file_path: str | Path,
-    online_template,
-    target_template,
-) -> dict[str, Any]:
-    checkpoint = _load_torch(file_path)
-    required = {
-        "q1_state_dict",
-        "q2_state_dict",
-        "q1_target_state_dict",
-        "q2_target_state_dict",
-    }
-    missing = required.difference(checkpoint)
-    if missing:
-        raise ValueError(
-            f"PyTorch task critic checkpoint is missing {sorted(missing)}"
-        )
-    return {
-        "online_params": convert_torch_critic_params(
-            online_template,
-            checkpoint["q1_state_dict"],
-            checkpoint["q2_state_dict"],
-        ),
-        "target_params": convert_torch_critic_params(
-            target_template,
-            checkpoint["q1_target_state_dict"],
-            checkpoint["q2_target_state_dict"],
         ),
     }

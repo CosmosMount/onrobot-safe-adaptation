@@ -189,10 +189,15 @@ class QSafe:
         selected = torch.where(fallback, lowest_risk, selected)
         batch_indices = torch.arange(nr_envs, device=candidate_actions.device)
         log_probs = candidate_log_probs.reshape(nr_envs, nr_candidates)
+        flat_q = q_values.reshape(-1)
         return candidate_actions[batch_indices, selected], selected, {
             "qsafe/rejected_fraction": (~safe_mask).float().mean().item(),
             "qsafe/fallback_fraction": fallback.float().mean().item(),
             "qsafe/selected_value": q_values[batch_indices, selected].mean().item(),
+            "qsafe/candidate_value_p50": torch.quantile(flat_q, 0.50).item(),
+            "qsafe/candidate_value_p90": torch.quantile(flat_q, 0.90).item(),
+            "qsafe/candidate_value_p99": torch.quantile(flat_q, 0.99).item(),
+            "qsafe/candidate_value_min": flat_q.min().item(),
             "qsafe/selected_log_probability": log_probs[
                 batch_indices, selected
             ].mean().item(),

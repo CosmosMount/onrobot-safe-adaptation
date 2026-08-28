@@ -82,11 +82,12 @@ one update per newly collected transition; changing the number of parallel
 environments therefore no longer silently changes the optimization budget.
 QSafe updates are credited only when complete safety trajectories are committed.
 
-The Go2 transfer manifest is deliberately strict. Manifest v5 records the SDK
-joint order, shared reset pose, absolute joint-target semantics, PD gains and
-torque limits. Older checkpoints are rejected because their Isaac action term
-used a different joint ordering and articulation-default offset; run
-`python -m src.run pretrain` again instead of reusing those policy and safety
-critic weights. The parity checkpoint and default MuJoCo transfer gate both use
-flat ground. Rough terrain and domain randomization should be enabled only
-after that deterministic task-policy gate passes.
+The Go2 transfer manifest is deliberately strict. Manifest v9 records the SDK
+joint order, shared reset pose, absolute joint-target semantics, PD gains,
+torque limits, and the common tilt-or-low-base failure label. Older checkpoints
+are rejected; run `python -m src.run pretrain` again instead of reusing policy
+and safety-critic weights trained with different tensor or incident semantics.
+The source and target tasks both use flat ground. Source pre-training enables
+bounded transfer randomization for friction, base/leg mass, COM, actuator
+gains, reset state, and proprioceptive sensor noise. Rough terrain remains a
+later robustness gate.

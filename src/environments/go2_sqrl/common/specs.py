@@ -78,8 +78,27 @@ class ActionSpecV1:
     joint_order: tuple[str, ...] = JOINT_NAMES
 
 
+@dataclass(frozen=True)
+class FailureSpecV2:
+    """Sparse SQRL incident label shared by source and target backends."""
+
+    version: str = "tilt-or-low-base-sustained-v2"
+    angle_threshold: float = 0.8
+    min_base_height: float = 0.18
+    consecutive_frames: int = 5
+
+
 OBSERVATION_SPEC = ObservationSpecV3()
 ACTION_SPEC = ActionSpecV1()
+FAILURE_SPEC = FailureSpecV2()
+
+
+def configure_failure_detection(config) -> None:
+    """Expose the exact common SQRL failure label on an environment config."""
+
+    config.fall_angle_threshold = FAILURE_SPEC.angle_threshold
+    config.fall_min_base_height = FAILURE_SPEC.min_base_height
+    config.fall_consecutive_frames = FAILURE_SPEC.consecutive_frames
 
 
 def policy_observation_rows() -> tuple[tuple[str, slice, str], ...]:

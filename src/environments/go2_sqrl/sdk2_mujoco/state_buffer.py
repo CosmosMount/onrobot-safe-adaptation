@@ -31,14 +31,16 @@ class StateBuffer:
         capacity: int = 4096,
         restart_threshold_ticks: int = 100,
         restart_settle_seconds: float = 5.0,
-        restart_max_forward_jump: int = 5,
+        restart_stable_frames: int = 3,
     ):
         self._frames: deque[RobotState] = deque(maxlen=int(capacity))
         self._condition = threading.Condition()
         self._last_tick: int | None = None
         self._restart_threshold = int(restart_threshold_ticks)
         self._restart_settle_seconds = float(restart_settle_seconds)
-        self._restart_max_forward_jump = int(restart_max_forward_jump)
+        self._restart_stable_frames_required = max(1, int(restart_stable_frames))
+        self._restart_stable_frames = 0
+        self._restart_stale_tick_floor: int | None = None
         self._restart_armed = False
         self._restart_settle_deadline = 0.0
         self._generation = 0
@@ -65,15 +67,20 @@ class StateBuffer:
         tick = int(state.tick)
         with self._condition:
             now = time.monotonic()
+            if now >= self._restart_settle_deadline:
+                self._restart_stale_tick_floor = None
             if self._last_tick is not None:
                 if tick == self._last_tick:
                     return False
                 if tick < self._last_tick:
                     difference = self._last_tick - tick
                     if self._restart_armed:
+                        previous_tick = self._last_tick
                         self._frames.clear()
                         self._generation += 1
                         self._restart_armed = False
+                        self._restart_stable_frames = 0
+                        self._restart_stale_tick_floor = previous_tick
                         self._restart_settle_deadline = (
                             now + self._restart_settle_seconds
                         )
@@ -82,8 +89,11 @@ class StateBuffer:
                         # any late lower tick belongs to the drained DDS epoch.
                         return False
                     elif difference >= self._restart_threshold:
+                        previous_tick = self._last_tick
                         self._frames.clear()
                         self._generation += 1
+                        self._restart_stable_frames = 0
+                        self._restart_stale_tick_floor = previous_tick
                         self._restart_settle_deadline = (
                             now + self._restart_settle_seconds
                         )
@@ -95,14 +105,21 @@ class StateBuffer:
                         return False
                 elif (
                     now < self._restart_settle_deadline
-                    and tick - self._last_tick > self._restart_max_forward_jump
+                    and self._restart_stale_tick_floor is not None
+                    and tick >= self._restart_stale_tick_floor
                 ):
                     # A reliable DDS reader may finish delivering queued frames
-                    # from the previous simulator epoch after reset.  Ignore a
-                    # stale forward jump while the new low-tick epoch settles.
+                    # from the previous simulator epoch after reset.  Compare
+                    # against the previous epoch watermark instead of imposing
+                    # a small maximum jump: the 500 Hz reader may legitimately
+                    # skip more than five ticks while Python handles reset.
                     return False
             self._last_tick = tick
             self._frames.append(state)
+            if self._restart_stale_tick_floor is not None:
+                self._restart_stable_frames += 1
+                if self._restart_stable_frames >= self._restart_stable_frames_required:
+                    self._restart_stale_tick_floor = None
             self._condition.notify_all()
             return True
 

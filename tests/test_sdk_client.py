@@ -70,6 +70,22 @@ def test_buffer_accepts_armed_small_reset_and_ignores_stale_high_tick():
     assert [frame.tick for frame in frames] == [28, 29]
 
 
+def test_buffer_accepts_skipped_ticks_while_new_reset_epoch_settles():
+    buffer = StateBuffer(restart_threshold_ticks=100)
+    buffer.push(state(2000))
+    buffer.arm_restart()
+    assert buffer.push(state(0))
+
+    # A queued sample from the previous epoch is rejected, but a scheduling
+    # gap in the new 500 Hz stream must not permanently starve the reader.
+    assert not buffer.push(state(2002))
+    assert buffer.push(state(20))
+    assert buffer.push(state(22))
+    assert buffer.push(state(24))
+    frames = buffer.wait_for_frames(4, after_tick=None, timeout=0.01)
+    assert [frame.tick for frame in frames] == [0, 20, 22, 24]
+
+
 def test_publish_joint_target_populates_pd_and_crc_without_sdk_runtime():
     class CRC:
         def Crc(self, command):

@@ -26,6 +26,7 @@ from rl_x.algorithms.sac.pytorch.replay_buffer import ReplayBuffer
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
     extract_failure_signal,
+    finetune_constraints_enabled,
     restore_algorithm_config,
     validate_safety_rollout_environment,
 )
@@ -81,6 +82,9 @@ class SAC_QSafe:
         self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
         if self.phase == "pretrain" and not self.qsafe_enabled:
             raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
+        self.finetune_constraints_enabled = finetune_constraints_enabled(
+            self.phase, self.qsafe_enabled
+        )
         self.n_off = int(config.algorithm.n_off)
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
@@ -141,9 +145,6 @@ class SAC_QSafe:
 
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
-            self._load_pretrained_task_critic(
-                str(config.algorithm.pretrained_task_critic_path)
-            )
             self.observation_normalizer.freeze()
         
         fused = self.device.type == "cuda"
@@ -154,10 +155,10 @@ class SAC_QSafe:
             float(config.algorithm.initial_nu) if self.qsafe_enabled else 0.0,
             dtype=torch.float32,
             device=self.device,
-            requires_grad=self.phase == "finetune" and self.qsafe_enabled,
+            requires_grad=self.finetune_constraints_enabled,
         )
         self.dual_optimizer = None
-        if self.phase == "finetune" and self.qsafe_enabled:
+        if self.finetune_constraints_enabled:
             self.dual_optimizer = optim.Adam(
                 [self.nu], lr=float(config.algorithm.dual_learning_rate), fused=fused
             )
@@ -169,6 +170,11 @@ class SAC_QSafe:
                     if self.qsafe_enabled
                     else "disabled (SAC ablation)"
                 )
+            )
+            rlx_logger.info(
+                "SQRL transfer loaded actor, observation normalizer, and frozen "
+                "QSafe only; task critics, targets, entropy temperature, replay, "
+                "optimizers, and nu start fresh"
             )
 
         if self.anneal_learning_rate:
@@ -222,15 +228,6 @@ class SAC_QSafe:
         else:
             policy_state_dict = checkpoint
         self.policy.load_state_dict(policy_state_dict)
-        if "log_alpha" in checkpoint:
-            restore_parameter_(
-                self.entropy_coefficient.log_alpha, checkpoint["log_alpha"]
-            )
-        else:
-            rlx_logger.warning(
-                "Pretrained policy artifact has no SAC entropy temperature; "
-                f"using algorithm.alpha_init={float(self.config.algorithm.alpha_init):g}"
-            )
 
         normalizer_state = checkpoint.get("observation_normalizer_state_dict")
         if normalizer_state is None:
@@ -252,31 +249,6 @@ class SAC_QSafe:
             raise ValueError(
                 "Fine-tuning environment must validate the policy transfer manifest"
             )
-
-    def _load_pretrained_task_critic(self, file_path):
-        if not file_path:
-            raise ValueError(
-                "algorithm.pretrained_task_critic_path is required for finetune."
-            )
-        checkpoint = torch.load(
-            file_path, map_location=self.device, weights_only=False
-        )
-        required = {
-            "q1_state_dict",
-            "q2_state_dict",
-            "q1_target_state_dict",
-            "q2_target_state_dict",
-        }
-        missing = required.difference(checkpoint)
-        if missing:
-            raise ValueError(
-                f"Pretrained task critic checkpoint is missing {sorted(missing)}"
-            )
-        self.critic.q1.load_state_dict(checkpoint["q1_state_dict"])
-        self.critic.q2.load_state_dict(checkpoint["q2_state_dict"])
-        self.critic.q1_target.load_state_dict(checkpoint["q1_target_state_dict"])
-        self.critic.q2_target.load_state_dict(checkpoint["q2_target_state_dict"])
-        rlx_logger.info("Transferred pretrained SAC task critics and targets")
 
     def _normalize_states(self, states, update=False):
         states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
@@ -355,6 +327,13 @@ class SAC_QSafe:
         selected_actions, selected_indices, metrics = self.qsafe.select_safe_action(
             states, candidate_actions, candidate_log_probs, phase or self.phase
         )
+        absolute_z = states.abs()
+        metrics["qsafe/observation_abs_z_p95"] = torch.quantile(
+            absolute_z.reshape(-1), 0.95
+        ).item()
+        metrics["qsafe/observation_ood_fraction"] = (
+            absolute_z > 5.0
+        ).float().mean().item()
         batch_indices = torch.arange(nr_envs, device=self.device)
         selected_processed_actions = candidate_processed_actions[
             batch_indices, selected_indices
@@ -383,7 +362,7 @@ class SAC_QSafe:
                 alpha_detach = alpha.detach()
                 policy_loss = (alpha_detach * current_log_probs - min_q).mean()
                 safety_q = torch.zeros_like(min_q)
-                if self.phase == "finetune" and self.qsafe_enabled:
+                if self.finetune_constraints_enabled:
                     # QSafe parameters are frozen, but this forward pass intentionally
                     # remains differentiable with respect to the sampled action.
                     safety_q = self.qsafe.values(batch_states, current_actions)
@@ -414,7 +393,7 @@ class SAC_QSafe:
             self.entropy_optimizer.step()
 
             dual_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-            if self.phase == "finetune" and self.qsafe_enabled:
+            if self.finetune_constraints_enabled:
                 dual_loss = self.nu * (self.qsafe.epsilon - safety_q.detach()).mean()
                 self.dual_optimizer.zero_grad()
                 dual_loss.backward()
@@ -524,7 +503,7 @@ class SAC_QSafe:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                         acting_state, phase="pretrain"
                     )
-                elif self.phase == "finetune" and self.qsafe_enabled:
+                elif self.finetune_constraints_enabled:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                         acting_state, phase="finetune"
                     )
@@ -1360,22 +1339,11 @@ class SAC_QSafe:
         torch.save(
             {
                 "policy_state_dict": self.policy.state_dict(),
-                "log_alpha": self.entropy_coefficient.log_alpha.detach().cpu(),
                 "observation_normalizer_state_dict": self.observation_normalizer.state_dict(),
                 "observation_normalizer_metadata": self.observation_normalizer.metadata(),
                 "environment_manifest": environment_manifest,
             },
             self.save_path + "/policy.model",
-        )
-        torch.save(
-            {
-                "q1_state_dict": self.critic.q1.state_dict(),
-                "q2_state_dict": self.critic.q2.state_dict(),
-                "q1_target_state_dict": self.critic.q1_target.state_dict(),
-                "q2_target_state_dict": self.critic.q2_target.state_dict(),
-                "q_optimizer_state_dict": self.q_optimizer.state_dict(),
-            },
-            self.save_path + "/task_critic.model",
         )
         self.qsafe.save(
             self.save_path + "/qsafe.model",

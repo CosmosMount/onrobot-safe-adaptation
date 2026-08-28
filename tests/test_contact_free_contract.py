@@ -73,9 +73,9 @@ def test_mujoco_reset_pd_defaults_settle_before_policy_takeover():
     assert config.reset_max_joint_velocity == 0.5
 
 
-def test_manifest_versions_sensor_free_estimator_and_imu_failure():
+def test_manifest_versions_sensor_free_estimator_and_shared_failure():
     manifest = build_manifest({"observation_size": 46})
-    assert manifest["manifest_version"] == MANIFEST_VERSION == 8
+    assert manifest["manifest_version"] == MANIFEST_VERSION == 9
     assert manifest["reward_version"] == "flashsac-go2-walk-easy-command-v3"
     assert manifest["reward_contract"]["command"]["linear_velocity_x"] == 0.5
     np.testing.assert_allclose(
@@ -89,6 +89,11 @@ def test_manifest_versions_sensor_free_estimator_and_imu_failure():
     assert manifest["observation"]["body_velocity"]["indices"] == [27, 30]
     assert manifest["observation"]["body_velocity"]["frame"] == "body"
     assert manifest["failure"]["version"] == FAILURE_CONTRACT_VERSION
+    assert manifest["failure"]["signal"] == [
+        "imu_quaternion_roll_pitch",
+        "base_height",
+    ]
+    assert manifest["failure"]["min_base_height"] == pytest.approx(0.18)
     assert manifest["failure"]["external_contact_sensor"] is False
     assert manifest["failure"]["frame_unit"] == "physics_frames"
     assert manifest["failure"]["frame_dt"] == pytest.approx(0.002)
@@ -572,6 +577,24 @@ def test_isaac_fall_detector_requires_consecutive_imu_frames_and_resets():
 
     torch.testing.assert_close(
         detector.update(quaternions), torch.tensor([False, False])
+    )
+
+    low_detector = TorchFallDetector(
+        nr_envs=1,
+        device="cpu",
+        min_base_height=0.18,
+        consecutive_frames=2,
+    )
+    torch.testing.assert_close(
+        low_detector.update(upright[None], torch.tensor([0.17])),
+        torch.tensor([False]),
+    )
+    torch.testing.assert_close(
+        low_detector.update(upright[None], torch.tensor([0.17])),
+        torch.tensor([True]),
+    )
+    torch.testing.assert_close(
+        low_detector.last_height_failure, torch.tensor([True])
     )
 
     decimated = TorchFallDetector(

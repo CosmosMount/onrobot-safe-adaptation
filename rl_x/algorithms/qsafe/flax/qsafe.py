@@ -254,10 +254,15 @@ class QSafe:
         selected = jnp.where(fallback, lowest_risk, selected)
         batch_indices = jnp.arange(nr_envs)
         log_probs = candidate_log_probs.reshape((nr_envs, nr_candidates))
+        flat_q = q_values.reshape((-1,))
         return candidate_actions[batch_indices, selected], selected, {
             "qsafe/rejected_fraction": jnp.mean(~safe_mask),
             "qsafe/fallback_fraction": jnp.mean(fallback),
             "qsafe/selected_value": jnp.mean(q_values[batch_indices, selected]),
+            "qsafe/candidate_value_p50": jnp.quantile(flat_q, 0.50),
+            "qsafe/candidate_value_p90": jnp.quantile(flat_q, 0.90),
+            "qsafe/candidate_value_p99": jnp.quantile(flat_q, 0.99),
+            "qsafe/candidate_value_min": jnp.min(flat_q),
             "qsafe/selected_log_probability": jnp.mean(
                 log_probs[batch_indices, selected]
             ),

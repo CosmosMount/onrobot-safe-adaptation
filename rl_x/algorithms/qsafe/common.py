@@ -1,6 +1,12 @@
 import numpy as np
 
 
+def finetune_constraints_enabled(phase, qsafe_enabled):
+    """Use one gate for both target-task action masking and Eq. 4."""
+
+    return str(phase) == "finetune" and bool(qsafe_enabled)
+
+
 class VectorTrajectoryAccumulator:
     """Stage vector-env transitions and emit complete per-env trajectories."""
 

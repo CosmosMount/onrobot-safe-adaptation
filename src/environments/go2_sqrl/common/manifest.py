@@ -15,22 +15,24 @@ from .reward import (
 from .specs import (
     ACTION_SPEC,
     DEFAULT_BASE_HEIGHT,
+    FAILURE_SPEC,
     OBSERVATION_SPEC,
     PHYSICS_DT,
 )
 
 
-MANIFEST_VERSION = 8
+MANIFEST_VERSION = 9
 VELOCITY_ESTIMATOR_VERSION = "contact-free-robust-kf-v1"
-FAILURE_CONTRACT_VERSION = "imu-roll-pitch-sustained-v1"
+FAILURE_CONTRACT_VERSION = FAILURE_SPEC.version
 ACTION_PIPELINE_VERSION = "sdk-absolute-position-v2"
 
 
 def build_manifest(
     normalizer: dict[str, Any] | None = None,
     *,
-    fall_angle_threshold: float = 0.8,
-    fall_consecutive_frames: int = 5,
+    fall_angle_threshold: float = FAILURE_SPEC.angle_threshold,
+    fall_min_base_height: float = FAILURE_SPEC.min_base_height,
+    fall_consecutive_frames: int = FAILURE_SPEC.consecutive_frames,
     target_velocity_x: float = 0.5,
 ) -> dict[str, Any]:
     return {
@@ -110,8 +112,10 @@ def build_manifest(
         },
         "failure": {
             "version": FAILURE_CONTRACT_VERSION,
-            "signal": "imu_quaternion_roll_pitch",
+            "signal": ["imu_quaternion_roll_pitch", "base_height"],
+            "aggregation": "tilt_or_low_base",
             "angle_threshold": float(fall_angle_threshold),
+            "min_base_height": float(fall_min_base_height),
             "consecutive_frames": int(fall_consecutive_frames),
             "frame_unit": "physics_frames",
             "frame_dt": PHYSICS_DT,

@@ -1,6 +1,7 @@
 from ml_collections import config_dict
 
 from ..common.estimation.velocity import configure_velocity_estimator
+from ..common.specs import configure_failure_detection
 
 
 def get_config(environment_name):
@@ -14,12 +15,11 @@ def get_config(environment_name):
     config.device = "gpu"
     config.target_velocity_x = 0.5
     configure_velocity_estimator(config)
+    configure_failure_detection(config)
     config.terrain_mode = "rough"
     config.domain_randomization = False
     config.friction = 0.4
     config.episode_steps = 500
-    config.fall_angle_threshold = 0.8
-    config.fall_consecutive_frames = 5
     config.render = False
 
     # AppLauncher-compatible defaults consumed by RL-X before environment creation.

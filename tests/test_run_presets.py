@@ -11,6 +11,7 @@ from src.environments.go2_sqrl.common.specs import (
     PHYSICS_DT,
 )
 from src.run import _artifact_flags
+from rl_x.algorithms.qsafe.common import finetune_constraints_enabled
 from rl_x.algorithms.sac_qsafe.pytorch.default_config import get_config
 
 
@@ -41,8 +42,9 @@ def test_zero_shot_uses_the_sqrl_projected_policy_on_flat_ground():
 
 def test_pretrain_parity_checkpoint_uses_flat_ground():
     assert "--environment.terrain_mode=flat" in RUN_PRESETS["pretrain"]
+    assert "--environment.domain_randomization=true" in RUN_PRESETS["pretrain"]
     assert (
-        "--runner.run_name=isaac_flashsac_cmd_reward_v3"
+        "--runner.run_name=isaac_sqrl_height_dr_v1"
         in RUN_PRESETS["pretrain"]
     )
 
@@ -124,14 +126,18 @@ def test_canonical_mujoco_asset_matches_sdk_bridge_contract():
 
 def test_transfer_commands_use_torch_pretrain_sidecars(tmp_path: Path):
     (tmp_path / "policy.model").touch()
-    (tmp_path / "task_critic.model").touch()
     (tmp_path / "qsafe.model").touch()
     flags = _artifact_flags("finetune", str(tmp_path))
     assert flags == [
         f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}",
-        f"--algorithm.pretrained_task_critic_path={tmp_path / 'task_critic.model'}",
         f"--algorithm.qsafe.checkpoint_path={tmp_path / 'qsafe.model'}",
     ]
+
+
+def test_qsafe_ablation_uses_one_gate_for_action_masking_and_eq4():
+    assert finetune_constraints_enabled("finetune", True) is True
+    assert finetune_constraints_enabled("finetune", False) is False
+    assert finetune_constraints_enabled("pretrain", True) is False
 
 
 def test_eval_rejects_a_missing_flax_checkpoint(tmp_path: Path):

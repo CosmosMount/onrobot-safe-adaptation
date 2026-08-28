@@ -52,12 +52,12 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     if checkpoint is None and command in ("zero-shot", "finetune"):
         checkpoint_path = (
             PROJECT_ROOT
-            / "runs/go2_sqrl/pretrain/isaac_flashsac_cmd_reward_v3/models"
+            / "runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models"
         )
     elif checkpoint is None and command == "isaac-eval":
         checkpoint_path = (
             PROJECT_ROOT
-            / "runs/go2_sqrl/pretrain/isaac_flashsac_cmd_reward_v3/models"
+            / "runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models"
         )
     elif checkpoint is None and command == "eval":
         checkpoint_path = PROJECT_ROOT / "runs/go2_sqrl/finetune/mujoco/models"
@@ -86,17 +86,14 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
         )
     directory = checkpoint_path
     policy = directory / "policy.model"
-    task_critic = directory / "task_critic.model"
     qsafe = directory / "qsafe.model"
-    if not policy.exists() or not task_critic.exists() or not qsafe.exists():
+    if not policy.exists() or not qsafe.exists():
         raise FileNotFoundError(
-            "Fine-tune/zero-shot requires policy.model, task_critic.model, "
-            "and qsafe.model in "
+            "Fine-tune/zero-shot requires policy.model and qsafe.model in "
             f"{directory}. Pass --checkpoint <models-directory>."
         )
     return [
         f"--algorithm.pretrained_policy_path={policy}",
-        f"--algorithm.pretrained_task_critic_path={task_critic}",
         f"--algorithm.qsafe.checkpoint_path={qsafe}",
     ]
 

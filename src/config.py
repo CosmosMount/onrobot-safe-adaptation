@@ -60,13 +60,14 @@ RUN_PRESETS = {
     + (
         "--runner.mode=train",
         "--runner.exp_name=pretrain",
-        "--runner.run_name=isaac_flashsac_cmd_reward_v3",
+        "--runner.run_name=isaac_sqrl_height_dr_v1",
         "--runner.save_model=true",
         "--environment.name=go2_sqrl.isaac_lab",
         # Train the first transfer checkpoint on the same flat-ground task as
         # the canonical MuJoCo scene.  Rough-terrain robustness is a later
         # training/evaluation gate, not part of the simulator parity check.
         "--environment.terrain_mode=flat",
+        "--environment.domain_randomization=true",
         "--algorithm.phase=pretrain",
         "--algorithm.rollout_mode=partitioned",
     ),
@@ -74,7 +75,7 @@ RUN_PRESETS = {
     + (
         "--runner.mode=test",
         "--runner.exp_name=evaluation",
-        "--runner.run_name=isaac_flashsac_cmd_reward_v3",
+        "--runner.run_name=isaac_sqrl_height_dr_v1",
         "--runner.nr_test_episodes=5",
         "--environment.name=go2_sqrl.isaac_lab",
         "--environment.nr_envs=1",

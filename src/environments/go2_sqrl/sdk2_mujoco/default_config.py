@@ -1,6 +1,7 @@
 from ml_collections import config_dict
 
 from ..common.estimation.velocity import configure_velocity_estimator
+from ..common.specs import configure_failure_detection
 
 
 def get_config(environment_name):
@@ -16,6 +17,7 @@ def get_config(environment_name):
     # DDS transport itself remains on the host.
     config.policy_period_seconds = 0.02
     configure_velocity_estimator(config)
+    configure_failure_detection(config)
     # Runtime policy PD. Defaults reproduce the Isaac/checkpoint contract;
     # command-line overrides are MuJoCo-only sensitivity experiments.
     config.policy_kp = 25.0
@@ -55,8 +57,6 @@ def get_config(environment_name):
     # The policy has no command input, so evaluation must use the fixed velocity
     # objective on which it was pre-trained.
     config.target_velocity_x = 0.5
-    config.fall_angle_threshold = 0.8
-    config.fall_consecutive_frames = 5
 
     config.kp = 25.0
     config.kd = 0.5

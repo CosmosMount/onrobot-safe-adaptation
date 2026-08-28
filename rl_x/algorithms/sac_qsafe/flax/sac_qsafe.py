@@ -22,6 +22,7 @@ from rl_x.algorithms.sac.flax.rl_train_state import RLTrainState
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
     extract_failure_signal,
+    finetune_constraints_enabled,
     restore_algorithm_config,
     validate_safety_rollout_environment,
 )
@@ -29,7 +30,6 @@ from rl_x.algorithms.qsafe.flax import QSafe
 from rl_x.algorithms.qsafe.flax.projection import resolve_action_projectors
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
-    load_torch_task_critic_artifact,
     make_native_policy_artifact,
     validate_policy_contract,
 )
@@ -88,6 +88,9 @@ class SAC_QSafe:
         self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
         if self.phase == "pretrain" and not self.qsafe_enabled:
             raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
+        self.finetune_constraints_enabled = finetune_constraints_enabled(
+            self.phase, self.qsafe_enabled
+        )
         self.n_off = int(config.algorithm.n_off)
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
@@ -105,7 +108,7 @@ class SAC_QSafe:
         self.dual_learning_rate = float(config.algorithm.dual_learning_rate)
         self.dual_optimizer = (
             optax.adam(self.dual_learning_rate)
-            if self.phase == "finetune" and self.qsafe_enabled
+            if self.finetune_constraints_enabled
             else optax.set_to_zero()
         )
         self.dual_optimizer_state = self.dual_optimizer.init(
@@ -205,10 +208,12 @@ class SAC_QSafe:
         )
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
-            self._load_pretrained_task_critic(
-                str(config.algorithm.pretrained_task_critic_path)
-            )
             self.observation_normalizer.freeze()
+            rlx_logger.info(
+                "SQRL transfer loaded actor, observation normalizer, and frozen "
+                "QSafe only; task critics, targets, entropy temperature, replay, "
+                "optimizers, and nu start fresh"
+            )
 
         self._build_action_kernels()
         self._warm_up_action_kernels()
@@ -243,27 +248,6 @@ class SAC_QSafe:
         self.policy_state = self.policy_state.replace(
             params=artifact["policy_params"]
         )
-        if artifact["log_alpha"] is None:
-            rlx_logger.warning(
-                "Pretrained policy artifact has no SAC entropy temperature; "
-                f"using algorithm.alpha_init={float(self.config.algorithm.alpha_init):g}"
-            )
-        else:
-            entropy_params = serialization.to_state_dict(
-                self.entropy_coefficient_state.params
-            )
-            entropy_params["params"]["log_alpha"] = np.asarray(
-                artifact["log_alpha"], dtype=np.float32
-            )
-            self.entropy_coefficient_state = self.entropy_coefficient_state.replace(
-                params=serialization.from_state_dict(
-                    self.entropy_coefficient_state.params, entropy_params
-                )
-            )
-            rlx_logger.info(
-                "Transferred SAC entropy coefficient alpha: "
-                f"{float(np.exp(artifact['log_alpha'])):.9g}"
-            )
         self.observation_normalizer.load_state_dict(
             artifact["normalizer_state"], artifact["normalizer_metadata"]
         )
@@ -275,24 +259,6 @@ class SAC_QSafe:
             artifact["environment_manifest"], self.observation_normalizer.metadata()
         )
         self.observation_normalizer.freeze()
-
-    def _load_pretrained_task_critic(self, file_path):
-        if not file_path:
-            raise ValueError(
-                "algorithm.pretrained_task_critic_path is required for finetune."
-            )
-        artifact = load_torch_task_critic_artifact(
-            file_path,
-            self.critic_state.params,
-            self.critic_state.target_params,
-        )
-        # Algorithm 2 clears D_offline but does not reinitialize the SAC
-        # critics.  Optimizer moments are intentionally fresh across backends.
-        self.critic_state = self.critic_state.replace(
-            params=artifact["online_params"],
-            target_params=artifact["target_params"],
-        )
-        rlx_logger.info("Transferred pretrained SAC task critics and targets")
 
     @staticmethod
     def _normalize_kernel(states, mean, std, epsilon):
@@ -488,6 +454,14 @@ class SAC_QSafe:
             log_probs,
             selection_key,
         )
+        absolute_z = jnp.abs(normalized_states)
+        metrics = {
+            **metrics,
+            "qsafe/observation_abs_z_p95": jnp.quantile(
+                absolute_z.reshape((-1,)), 0.95
+            ),
+            "qsafe/observation_ood_fraction": jnp.mean(absolute_z > 5.0),
+        }
         return selected_actions, self.get_processed_action(selected_actions), metrics
         
     
@@ -563,7 +537,7 @@ class SAC_QSafe:
 
                 policy_loss = alpha * current_log_prob - min_q
                 safety_q = jnp.zeros_like(min_q)
-                if self.phase == "finetune" and self.qsafe_enabled:
+                if self.finetune_constraints_enabled:
                     safety_q = self.qsafe.network.apply(
                         stop_gradient(qsafe_params), state, current_action
                     ).squeeze()
@@ -698,7 +672,7 @@ class SAC_QSafe:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="pretrain"
                 )
-            elif self.phase == "finetune" and self.qsafe_enabled:
+            elif self.finetune_constraints_enabled:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="finetune"
                 )
@@ -874,7 +848,7 @@ class SAC_QSafe:
                                 self._learner_deadline_seconds,
                                 self._deadline_misses,
                             )
-                if self.phase == "finetune" and self.qsafe_enabled:
+                if self.finetune_constraints_enabled:
                     safety_value = float(optimization_metrics["qsafe/actor_value"])
                     nu_before_update = jnp.asarray(self.nu, dtype=jnp.float32)
                     dual_gradient = jnp.asarray(
@@ -1106,15 +1080,13 @@ class SAC_QSafe:
                 serialization.msgpack_serialize(
                     make_native_policy_artifact(
                         self.policy_state.params,
-                        self.entropy_coefficient_state.params["params"]["log_alpha"],
+                        None,
                         normalizer_state,
                         normalizer_metadata,
                         environment_manifest,
                     )
                 )
             )
-        with open(f"{self.save_path}/task_critic.msgpack", "wb") as critic_file:
-            critic_file.write(serialization.to_bytes(self.critic_state))
         self.qsafe.save(
             f"{self.save_path}/qsafe.msgpack",
             include_optimizer=self.phase == "pretrain",

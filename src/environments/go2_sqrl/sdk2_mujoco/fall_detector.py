@@ -19,26 +19,35 @@ class FallDetector:
         self.min_base_height = float(min_base_height)
         self._count = 0
         self._low_height_count = 0
+        self.last_tilt_failure = False
+        self.last_height_failure = False
 
     def reset(self) -> None:
         self._count = 0
         self._low_height_count = 0
+        self.last_tilt_failure = False
+        self.last_height_failure = False
 
     def update(self, quaternion) -> bool:
         roll, pitch, _ = quaternion_to_rpy_wxyz(quaternion)
         fallen = abs(roll) > self.angle_threshold or abs(pitch) > self.angle_threshold
         self._count = self._count + 1 if fallen else 0
-        return self._count >= self.consecutive_frames
+        self.last_tilt_failure = self._count >= self.consecutive_frames
+        return self.last_tilt_failure
 
     def update_base_height(self, height: float | None) -> bool:
         if height is None or not np.isfinite(height):
             self._low_height_count = 0
+            self.last_height_failure = False
             return False
         if float(height) < self.min_base_height:
             self._low_height_count += 1
         else:
             self._low_height_count = 0
-        return self._low_height_count >= self.consecutive_frames
+        self.last_height_failure = (
+            self._low_height_count >= self.consecutive_frames
+        )
+        return self.last_height_failure
 
     def is_stable(self, quaternion) -> bool:
         roll, pitch, _ = quaternion_to_rpy_wxyz(quaternion)

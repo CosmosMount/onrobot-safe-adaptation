@@ -44,6 +44,7 @@ from .mdp import (
     sdk_joint_indices,
     validate_action_term_contract,
 )
+from .randomization_cfg import TRANSFER_RANDOMIZATION
 
 
 def relabel_isaac_backend_manager_output(output: str) -> str:
@@ -109,13 +110,14 @@ def project_action_targets_tensor(previous_q_target, actions):
 
 
 class TorchFallDetector:
-    """Vectorized sustained IMU roll/pitch detector for Isaac environments."""
+    """Vectorized common tilt-or-low-base SQRL incident detector."""
 
     def __init__(
         self,
         nr_envs: int,
         device,
         angle_threshold: float = 0.8,
+        min_base_height: float = 0.18,
         consecutive_frames: int = 5,
         samples_per_update: int = 1,
     ):
@@ -124,18 +126,32 @@ class TorchFallDetector:
         if samples_per_update < 1:
             raise ValueError("samples_per_update must be at least 1")
         self.angle_threshold = float(angle_threshold)
+        self.min_base_height = float(min_base_height)
         self.consecutive_frames = int(consecutive_frames)
         self.samples_per_update = int(samples_per_update)
-        self.count = torch.zeros(nr_envs, dtype=torch.long, device=device)
+        self.tilt_count = torch.zeros(nr_envs, dtype=torch.long, device=device)
+        self.height_count = torch.zeros(nr_envs, dtype=torch.long, device=device)
+        self.last_tilt_failure = torch.zeros(
+            nr_envs, dtype=torch.bool, device=device
+        )
+        self.last_height_failure = torch.zeros(
+            nr_envs, dtype=torch.bool, device=device
+        )
 
     def reset(self, env_ids=None):
         if env_ids is None:
-            self.count.zero_()
+            self.tilt_count.zero_()
+            self.height_count.zero_()
+            self.last_tilt_failure.zero_()
+            self.last_height_failure.zero_()
         else:
-            self.count[env_ids] = 0
+            self.tilt_count[env_ids] = 0
+            self.height_count[env_ids] = 0
+            self.last_tilt_failure[env_ids] = False
+            self.last_height_failure[env_ids] = False
 
     @torch.no_grad()
-    def update(self, quaternion):
+    def update(self, quaternion, base_height=None):
         quaternion = quaternion / torch.linalg.vector_norm(
             quaternion, dim=-1, keepdim=True
         ).clamp_min(1e-8)
@@ -147,12 +163,27 @@ class TorchFallDetector:
         tilted = (roll.abs() > self.angle_threshold) | (
             pitch.abs() > self.angle_threshold
         )
-        self.count = torch.where(
+        self.tilt_count = torch.where(
             tilted,
-            self.count + self.samples_per_update,
-            torch.zeros_like(self.count),
+            self.tilt_count + self.samples_per_update,
+            torch.zeros_like(self.tilt_count),
         )
-        return self.count >= self.consecutive_frames
+        if base_height is None:
+            low = torch.zeros_like(tilted)
+        else:
+            low = torch.as_tensor(
+                base_height,
+                dtype=quaternion.dtype,
+                device=quaternion.device,
+            ).reshape(tilted.shape) < self.min_base_height
+        self.height_count = torch.where(
+            low,
+            self.height_count + self.samples_per_update,
+            torch.zeros_like(self.height_count),
+        )
+        self.last_tilt_failure = self.tilt_count >= self.consecutive_frames
+        self.last_height_failure = self.height_count >= self.consecutive_frames
+        return self.last_tilt_failure | self.last_height_failure
 
 
 class Go2IsaacEnv:
@@ -191,6 +222,7 @@ class Go2IsaacEnv:
             )
         self.backend = backend
         self.config = config.environment
+        self._domain_randomization = bool(self.config.domain_randomization)
         self.nr_envs = int(self.config.nr_envs)
         self.num_envs = self.nr_envs
         self.nr_task_envs = int(self.config.nr_task_envs)
@@ -228,6 +260,7 @@ class Go2IsaacEnv:
             self.nr_envs,
             robot.device,
             angle_threshold=float(self.config.fall_angle_threshold),
+            min_base_height=float(self.config.fall_min_base_height),
             consecutive_frames=int(self.config.fall_consecutive_frames),
             # The adapter observes orientation once after each decimated policy
             # step.  Treating that sample as the latest 10 physics frames is a
@@ -267,22 +300,37 @@ class Go2IsaacEnv:
     def _robot(self):
         return self.backend.scene["robot"]
 
+    def _sensor_value(self, value, noise_name):
+        value = value.clone()
+        if not self._domain_randomization:
+            return value
+        low, high = TRANSFER_RANDOMIZATION[noise_name]
+        return value + torch.empty_like(value).uniform_(float(low), float(high))
+
     def _observation(self):
         robot = self._robot
         imu = self.backend.scene["imu"]
-        joint_q = robot.data.joint_pos[:, self._joint_indices]
-        joint_dq = robot.data.joint_vel[:, self._joint_indices]
+        joint_q = self._sensor_value(
+            robot.data.joint_pos[:, self._joint_indices], "joint_position_noise"
+        )
+        joint_dq = self._sensor_value(
+            robot.data.joint_vel[:, self._joint_indices], "joint_velocity_noise"
+        )
+        imu_gyro = self._sensor_value(imu.data.ang_vel_b, "gyro_noise")
+        imu_acceleration = self._sensor_value(
+            imu.data.lin_acc_b, "accelerometer_noise"
+        )
         self._latest_estimated_body_velocity = self._velocity_estimator.update(
             joint_q,
             joint_dq,
-            imu.data.ang_vel_b,
+            imu_gyro,
             imu.data.quat_w,
-            imu.data.lin_acc_b,
+            imu_acceleration,
         )
         observation, quaternion = build_observation_tensor(
             joint_q,
             joint_dq,
-            imu.data.ang_vel_b,
+            imu_gyro,
             self._latest_estimated_body_velocity,
             imu.data.quat_w,
             self._previous_target,
@@ -413,9 +461,12 @@ class Go2IsaacEnv:
         reward = torch.stack(tuple(reward_terms.values()), dim=0).sum(dim=0)
         self._previous_reward_action.copy_(reward_action)
         failure = self._fall_detector.update(
-            self.backend.scene["imu"].data.quat_w
+            self.backend.scene["imu"].data.quat_w,
+            base_height,
         )
         failure = failure.clone()
+        tilt_failure = self._fall_detector.last_tilt_failure.clone()
+        height_failure = self._fall_detector.last_height_failure.clone()
         terminated = backend_terminated | failure
         already_reset = backend_terminated | truncated
         self._reset_failed_backend_envs(failure, already_reset)
@@ -428,6 +479,8 @@ class Go2IsaacEnv:
         self._episode_length += 1
         info = {
             "failure": failure.float().cpu().numpy(),
+            "failure/tilt": tilt_failure.float().cpu().numpy(),
+            "failure/height": height_failure.float().cpu().numpy(),
             "applied_action": applied_action.detach().cpu().numpy(),
             "forward_velocity": body_velocity[:, 0].detach().cpu().numpy(),
             "estimated_forward_velocity": estimated_body_velocity[
@@ -509,7 +562,9 @@ class Go2IsaacEnv:
 
     def get_logging_info_dict(self, info):
         return {
-            "velocity_estimation_error": info["velocity_estimation_error"].tolist()
+            "velocity_estimation_error": info["velocity_estimation_error"].tolist(),
+            "failure/tilt": info["failure/tilt"].tolist(),
+            "failure/height": info["failure/height"].tolist(),
         }
 
     def close(self):
@@ -520,6 +575,7 @@ class Go2IsaacEnv:
         return build_manifest(
             normalizer,
             fall_angle_threshold=float(self.config.fall_angle_threshold),
+            fall_min_base_height=float(self.config.fall_min_base_height),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
         )

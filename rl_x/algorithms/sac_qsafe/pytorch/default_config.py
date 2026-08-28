@@ -22,9 +22,8 @@ def get_config(algorithm_name):
     config.tau = 0.005
     config.gamma = 0.99
     config.target_entropy = "auto"
-    # Keep the historical default while allowing reward-scale-matched target
-    # experiments. The Go2 reward is multiplied by control_dt, so resetting a
-    # transferred actor to alpha=1 can overwhelm its task objective.
+    # Fine-tuning initializes the target-task entropy temperature from this
+    # value; alpha is deliberately not part of the SQRL transfer bundle.
     config.alpha_init = 1.0
     config.log_std_min = -20
     config.log_std_max = 2
@@ -41,7 +40,6 @@ def get_config(algorithm_name):
 
     config.phase = "pretrain"  # pretrain, finetune
     config.pretrained_policy_path = ""
-    config.pretrained_task_critic_path = ""
     config.dual_learning_rate = 3e-4
     config.initial_nu = 0.0
     # Algorithm 1: n_off unconstrained task-policy vector steps followed by
