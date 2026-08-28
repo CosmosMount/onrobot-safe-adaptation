@@ -78,6 +78,9 @@ class SAC_QSafe:
         self.phase = config.algorithm.phase
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
+        self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
+        if self.phase == "pretrain" and not self.qsafe_enabled:
+            raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
         self.n_off = int(config.algorithm.n_off)
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
@@ -138,6 +141,9 @@ class SAC_QSafe:
 
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
+            self._load_pretrained_task_critic(
+                str(config.algorithm.pretrained_task_critic_path)
+            )
             self.observation_normalizer.freeze()
         
         fused = self.device.type == "cuda"
@@ -145,15 +151,24 @@ class SAC_QSafe:
         self.q_optimizer = optim.Adam(list(self.critic.q1.parameters()) + list(self.critic.q2.parameters()), lr=self.learning_rate, fused=fused)
         self.entropy_optimizer = optim.Adam([self.entropy_coefficient.log_alpha], lr=self.learning_rate, fused=fused)
         self.nu = torch.tensor(
-            float(config.algorithm.initial_nu),
+            float(config.algorithm.initial_nu) if self.qsafe_enabled else 0.0,
             dtype=torch.float32,
             device=self.device,
-            requires_grad=self.phase == "finetune",
+            requires_grad=self.phase == "finetune" and self.qsafe_enabled,
         )
         self.dual_optimizer = None
-        if self.phase == "finetune":
+        if self.phase == "finetune" and self.qsafe_enabled:
             self.dual_optimizer = optim.Adam(
                 [self.nu], lr=float(config.algorithm.dual_learning_rate), fused=fused
+            )
+        if self.phase == "finetune":
+            rlx_logger.info(
+                "QSafe fine-tuning constraints: "
+                + (
+                    "enabled"
+                    if self.qsafe_enabled
+                    else "disabled (SAC ablation)"
+                )
             )
 
         if self.anneal_learning_rate:
@@ -207,6 +222,15 @@ class SAC_QSafe:
         else:
             policy_state_dict = checkpoint
         self.policy.load_state_dict(policy_state_dict)
+        if "log_alpha" in checkpoint:
+            restore_parameter_(
+                self.entropy_coefficient.log_alpha, checkpoint["log_alpha"]
+            )
+        else:
+            rlx_logger.warning(
+                "Pretrained policy artifact has no SAC entropy temperature; "
+                f"using algorithm.alpha_init={float(self.config.algorithm.alpha_init):g}"
+            )
 
         normalizer_state = checkpoint.get("observation_normalizer_state_dict")
         if normalizer_state is None:
@@ -218,12 +242,41 @@ class SAC_QSafe:
             self.observation_normalizer.validate_metadata(metadata)
         self.observation_normalizer.load_state_dict(normalizer_state)
         environment_manifest = checkpoint.get("environment_manifest")
-        if hasattr(self.train_env, "validate_checkpoint_manifest"):
+        if hasattr(self.train_env, "validate_transfer_checkpoint_manifest"):
             if environment_manifest is None:
                 raise ValueError("Pretrained policy is missing environment manifest.")
-            self.train_env.validate_checkpoint_manifest(
+            self.train_env.validate_transfer_checkpoint_manifest(
                 environment_manifest, self.observation_normalizer.metadata()
             )
+        else:
+            raise ValueError(
+                "Fine-tuning environment must validate the policy transfer manifest"
+            )
+
+    def _load_pretrained_task_critic(self, file_path):
+        if not file_path:
+            raise ValueError(
+                "algorithm.pretrained_task_critic_path is required for finetune."
+            )
+        checkpoint = torch.load(
+            file_path, map_location=self.device, weights_only=False
+        )
+        required = {
+            "q1_state_dict",
+            "q2_state_dict",
+            "q1_target_state_dict",
+            "q2_target_state_dict",
+        }
+        missing = required.difference(checkpoint)
+        if missing:
+            raise ValueError(
+                f"Pretrained task critic checkpoint is missing {sorted(missing)}"
+            )
+        self.critic.q1.load_state_dict(checkpoint["q1_state_dict"])
+        self.critic.q2.load_state_dict(checkpoint["q2_state_dict"])
+        self.critic.q1_target.load_state_dict(checkpoint["q1_target_state_dict"])
+        self.critic.q2_target.load_state_dict(checkpoint["q2_target_state_dict"])
+        rlx_logger.info("Transferred pretrained SAC task critics and targets")
 
     def _normalize_states(self, states, update=False):
         states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
@@ -330,7 +383,7 @@ class SAC_QSafe:
                 alpha_detach = alpha.detach()
                 policy_loss = (alpha_detach * current_log_probs - min_q).mean()
                 safety_q = torch.zeros_like(min_q)
-                if self.phase == "finetune":
+                if self.phase == "finetune" and self.qsafe_enabled:
                     # QSafe parameters are frozen, but this forward pass intentionally
                     # remains differentiable with respect to the sampled action.
                     safety_q = self.qsafe.values(batch_states, current_actions)
@@ -361,7 +414,7 @@ class SAC_QSafe:
             self.entropy_optimizer.step()
 
             dual_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-            if self.phase == "finetune":
+            if self.phase == "finetune" and self.qsafe_enabled:
                 dual_loss = self.nu * (self.qsafe.epsilon - safety_q.detach()).mean()
                 self.dual_optimizer.zero_grad()
                 dual_loss.backward()
@@ -471,7 +524,7 @@ class SAC_QSafe:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                         acting_state, phase="pretrain"
                     )
-                elif self.phase == "finetune":
+                elif self.phase == "finetune" and self.qsafe_enabled:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                         acting_state, phase="finetune"
                     )
@@ -711,7 +764,26 @@ class SAC_QSafe:
                 while True:
                     torch.compiler.cudagraph_mark_step_begin()
                     with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
-                        _, eval_processed_action, _ = self._sample_policy_candidates(eval_state)
+                        if self.qsafe_enabled:
+                            _, eval_processed_action, _ = self._sample_policy_candidates(
+                                eval_state
+                            )
+                        else:
+                            raw_eval_state = torch.as_tensor(
+                                eval_state, dtype=torch.float32, device=self.device
+                            )
+                            normalized_eval_state = self._normalize_states(
+                                raw_eval_state, update=False
+                            )
+                            eval_action = self.policy.get_deterministic_action(
+                                normalized_eval_state
+                            )
+                            eval_action = self._project_actions(
+                                raw_eval_state, eval_action
+                            )
+                            eval_processed_action = self._process_normalized_actions(
+                                eval_action
+                            )
                     eval_state, eval_reward, eval_terminated, eval_truncated, eval_info = self.eval_env.step(eval_processed_action.cpu().numpy())
                     eval_failure = extract_failure_signal(
                         eval_info, eval_terminated, self.nr_envs
@@ -1288,6 +1360,7 @@ class SAC_QSafe:
         torch.save(
             {
                 "policy_state_dict": self.policy.state_dict(),
+                "log_alpha": self.entropy_coefficient.log_alpha.detach().cpu(),
                 "observation_normalizer_state_dict": self.observation_normalizer.state_dict(),
                 "observation_normalizer_metadata": self.observation_normalizer.metadata(),
                 "environment_manifest": environment_manifest,
@@ -1373,6 +1446,8 @@ class SAC_QSafe:
         eval_policy = str(self.config.algorithm.eval_policy)
         if eval_policy not in ("task", "safe"):
             raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
+        if eval_policy == "safe" and not self.qsafe_enabled:
+            raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
         for i in range(episodes):
             done = False
             episode_return = 0
@@ -1433,7 +1508,7 @@ class SAC_QSafe:
             )
             if episode_steps and "forward_velocity" in info:
                 summary += (
-                    f", Mean forward velocity: "
+                    f", Mean simulator forward velocity: "
                     f"{forward_velocity_sum / episode_steps:.6f}"
                 )
                 window_size = min(100, len(forward_velocity_samples))
@@ -1446,8 +1521,10 @@ class SAC_QSafe:
                     )
                 ]
                 summary += (
-                    f", Last {window_size}-step velocity: {window_means[-1]:.6f}, "
-                    f"Min {window_size}-step velocity: {min(window_means):.6f}"
+                    f", Last {window_size}-step simulator velocity: "
+                    f"{window_means[-1]:.6f}, "
+                    f"Min {window_size}-step simulator velocity: "
+                    f"{min(window_means):.6f}"
                 )
             if episode_steps and "estimated_forward_velocity" in info:
                 summary += (
@@ -1456,12 +1533,12 @@ class SAC_QSafe:
                 )
             if episode_steps and "velocity_estimation_error" in info:
                 summary += (
-                    f", Mean velocity estimation error: "
+                    f", Mean 3D velocity estimation error: "
                     f"{velocity_estimation_error_sum / episode_steps:.6f}"
                 )
             if episode_steps and "target_velocity_error" in info:
                 summary += (
-                    f", Mean target error: "
+                    f", Mean absolute forward target error: "
                     f"{target_velocity_error_sum / episode_steps:.6f}"
                 )
             rlx_logger.info(summary)

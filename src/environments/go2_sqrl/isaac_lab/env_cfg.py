@@ -133,7 +133,10 @@ def make_env_cfg(config, num_envs=None):
         config.environment.terrain_mode,
     )
     randomization = bool(config.environment.domain_randomization)
-    cfg.observations.policy.enable_corruption = randomization
+    # The manager observation is an internal Isaac tensor discarded by the
+    # Go2 adapter.  Corrupting it wastes work and does not perturb the actual
+    # common 46D policy observation.
+    cfg.observations.policy.enable_corruption = False
     configure_existing_events(
         cfg.events,
         enabled=randomization,

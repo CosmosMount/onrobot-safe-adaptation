@@ -77,6 +77,7 @@ def test_sdk_environment_velocity_observation_reward_smoke():
     assert not terminated[0]
     assert not truncated[0]
     assert info["applied_action"].shape == (1, 12)
+    assert info["reward_uses_simulator_truth"][0] == 1.0
 
 
 @pytest.mark.live_sdk

@@ -90,12 +90,30 @@ def test_domain_randomization_report_shows_effective_ranges():
     assert "uniform [0.34, 0.46]" in enabled
     assert "base mass delta (kg)" in enabled
     assert "uniform [-0.5, 0.5]" in enabled
-    assert "observation corruption" in enabled
+    assert "46D policy observation corruption" in enabled
+    assert "disabled (common adapter output)" in enabled
 
     disabled = format_domain_randomization_report(enabled=False, friction=0.4)
     assert "Domain Randomization: disabled" in disabled
     assert "fixed 0.4" in disabled
     assert "uniform" not in disabled
+
+
+def test_isaac_manager_output_labels_internal_discarded_values():
+    from src.environments.go2_sqrl.isaac_lab.env import (
+        relabel_isaac_backend_manager_output,
+    )
+
+    raw = """[INFO] Command Manager: commands
+[INFO] Observation Manager: observations
+Active Observation Terms in Group: 'policy' (shape: (48,))
+[INFO] Reward Manager: rewards
+"""
+    reported = relabel_isaac_backend_manager_output(raw)
+    assert "internal; not the Go2 reward target" in reported
+    assert "internal tensor discarded by the Go2 RL-X adapter" in reported
+    assert "not model input" in reported
+    assert "disabled; Go2 adapter computes the effective reward" in reported
 
 
 def test_domain_randomization_can_be_enabled_after_fixed_baseline(monkeypatch):

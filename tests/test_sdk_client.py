@@ -54,6 +54,22 @@ def test_buffer_reports_reordering_timeout_and_restart():
         buffer.wait_for_frames(2, after_tick=0, timeout=0.001)
 
 
+def test_buffer_accepts_armed_small_reset_and_ignores_stale_high_tick():
+    buffer = StateBuffer(restart_threshold_ticks=100)
+    buffer.push(state(50))
+    generation = buffer.generation
+    buffer.arm_restart()
+    assert buffer.push(state(28))
+    assert buffer.generation == generation + 1
+    assert not buffer.push(state(50))
+    assert buffer.push(state(29))
+    assert not buffer.push(state(10))
+    frames = buffer.wait_for_frames(
+        2, after_tick=None, timeout=0.01, generation=buffer.generation
+    )
+    assert [frame.tick for frame in frames] == [28, 29]
+
+
 def test_publish_joint_target_populates_pd_and_crc_without_sdk_runtime():
     class CRC:
         def Crc(self, command):
@@ -77,4 +93,3 @@ def test_publish_joint_target_populates_pd_and_crc_without_sdk_runtime():
     assert client._command.crc == 1234
     assert client._publisher.written is client._command
     assert all(motor.kp == 25.0 and motor.kd == 0.5 for motor in client._command.motor_cmd[:12])
-

@@ -12,6 +12,7 @@ from src.environments.go2_sqrl.common.observation import (
 from src.environments.go2_sqrl.common.manifest import (
     build_manifest,
     validate_manifest,
+    validate_transfer_manifest,
 )
 from src.environments.go2_sqrl.common.reward import (
     REWARD_DEFAULT_JOINT_POSITION,
@@ -21,7 +22,9 @@ from src.environments.go2_sqrl.common.specs import (
     ACTION_SPEC,
     DEFAULT_JOINT_POSITION,
     OBSERVATION_SPEC,
+    format_policy_io_contract,
     joint_order_indices,
+    policy_observation_rows,
 )
 from src.environments.go2_sqrl.common.termination import EpisodeTracker
 from src.environments.go2_sqrl.common.types import RobotState
@@ -45,6 +48,30 @@ def test_versioned_observation_layout_and_joint_order():
     assert OBSERVATION_SPEC.previous_action_q_target == slice(34, 46)
     source = [f"{name}_joint" for name in reversed(OBSERVATION_SPEC.joint_order)]
     np.testing.assert_array_equal(joint_order_indices(source), np.arange(11, -1, -1))
+
+
+def test_policy_io_report_is_derived_from_the_actual_46d_contract():
+    rows = policy_observation_rows()
+    assert [(row[1].start, row[1].stop) for row in rows] == [
+        (0, 12),
+        (12, 24),
+        (24, 27),
+        (27, 30),
+        (30, 34),
+        (34, 46),
+    ]
+    report = format_policy_io_contract(0.6)
+    assert "Policy observation: shape (46,)" in report
+    assert "[27:30] body_velocity" in report
+    assert "robust IMU + leg-odometry estimate" in report
+    assert "velocity_commands: not observed by the policy" in report
+    assert (
+        "simulator base_lin_vel: reward and diagnostics only when available"
+        in report
+    )
+    assert "reward velocity fallback: robust body_velocity estimate" in report
+    assert "reward target_velocity_x: 0.6 m/s" in report
+    assert "Policy action: shape (12,)" in report
 
 
 def test_quaternion_continuity_and_observation_layout():
@@ -123,3 +150,8 @@ def test_checkpoint_manifest_rejects_contract_drift():
     )
     with pytest.raises(ValueError, match="linear_velocity_x"):
         validate_manifest(incompatible_command, expected)
+    validate_transfer_manifest(incompatible_command, expected)
+    incompatible_observation = build_manifest({"observation_size": 46})
+    incompatible_observation["observation"]["size"] = 48
+    with pytest.raises(ValueError, match="observation.size"):
+        validate_transfer_manifest(incompatible_observation, expected)

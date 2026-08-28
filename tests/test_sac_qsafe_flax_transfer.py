@@ -19,10 +19,12 @@ import torch.nn.functional as torch_functional
 from gymnasium.spaces import Box
 
 from rl_x.algorithms.qsafe.flax.safety_critic import SafetyQNetwork
+from rl_x.algorithms.sac.flax.critic import get_critic
 from rl_x.algorithms.sac.flax.policy import get_policy
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
     load_torch_qsafe_artifact,
+    load_torch_task_critic_artifact,
 )
 from rl_x.algorithms.sac_qsafe.flax.distributions import (
     squashed_gaussian_log_probability,
@@ -68,6 +70,19 @@ def _policy_and_template():
         jax.random.PRNGKey(0), jnp.zeros((1, OBSERVATION_SIZE), dtype=jnp.float32)
     )
     return policy, params
+
+
+def _critic_and_template():
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(nr_hidden_units=HIDDEN_SIZE)
+    )
+    critic = get_critic(config, _Environment())
+    params = critic.init(
+        jax.random.PRNGKey(3),
+        jnp.zeros((1, OBSERVATION_SIZE), dtype=jnp.float32),
+        jnp.zeros((1, ACTION_SIZE), dtype=jnp.float32),
+    )
+    return critic, params
 
 
 def _tensor(values):
@@ -135,6 +150,7 @@ def test_torch_policy_transfer_matches_fixed_input_and_freezes_normalizer(tmp_pa
     torch.save(
         {
             "policy_state_dict": torch_state,
+            "log_alpha": torch.tensor(-8.0),
             "observation_normalizer_state_dict": {
                 "running_mean": _tensor(running_mean),
                 "running_var": _tensor(running_var),
@@ -149,6 +165,7 @@ def test_torch_policy_transfer_matches_fixed_input_and_freezes_normalizer(tmp_pa
     artifact = load_policy_artifact(
         checkpoint_path, template, OBSERVATION_SIZE, ACTION_SIZE
     )
+    assert artifact["log_alpha"] == pytest.approx(-8.0)
     inputs = np.linspace(
         -1.0, 1.0, 3 * OBSERVATION_SIZE, dtype=np.float32
     ).reshape(3, OBSERVATION_SIZE)
@@ -215,6 +232,86 @@ def _torch_qsafe_state(offset):
         "network.4.weight": output_weight,
         "network.4.bias": output_bias,
     }
+
+
+def _torch_task_critic_state(offset):
+    first_weight, first_bias = _linear_state(
+        HIDDEN_SIZE, OBSERVATION_SIZE + ACTION_SIZE, offset
+    )
+    second_weight, second_bias = _linear_state(
+        HIDDEN_SIZE, HIDDEN_SIZE, offset + 0.01
+    )
+    output_weight, output_bias = _linear_state(
+        1, HIDDEN_SIZE, offset - 0.01
+    )
+    return {
+        "_orig_mod.critic.0.weight": first_weight,
+        "_orig_mod.critic.0.bias": first_bias,
+        "_orig_mod.critic.2.weight": second_weight,
+        "_orig_mod.critic.2.bias": second_bias,
+        "_orig_mod.critic.4.weight": output_weight,
+        "_orig_mod.critic.4.bias": output_bias,
+    }
+
+
+def _apply_torch_task_critic(state, observations, actions):
+    values = torch.cat((_tensor(observations), _tensor(actions)), dim=-1)
+    values = torch_functional.relu(
+        torch_functional.linear(
+            values, state["_orig_mod.critic.0.weight"], state["_orig_mod.critic.0.bias"]
+        )
+    )
+    values = torch_functional.relu(
+        torch_functional.linear(
+            values, state["_orig_mod.critic.2.weight"], state["_orig_mod.critic.2.bias"]
+        )
+    )
+    return torch_functional.linear(
+        values, state["_orig_mod.critic.4.weight"], state["_orig_mod.critic.4.bias"]
+    ).numpy()
+
+
+def test_torch_task_critic_transfer_matches_online_and_target_values(tmp_path):
+    critic, template = _critic_and_template()
+    states = {
+        "q1_state_dict": _torch_task_critic_state(0.001),
+        "q2_state_dict": _torch_task_critic_state(-0.002),
+        "q1_target_state_dict": _torch_task_critic_state(0.003),
+        "q2_target_state_dict": _torch_task_critic_state(-0.004),
+    }
+    checkpoint_path = tmp_path / "task_critic.model"
+    torch.save(states, checkpoint_path)
+    artifact = load_torch_task_critic_artifact(
+        checkpoint_path, template, template
+    )
+    observations = np.linspace(
+        -0.5, 0.5, 2 * OBSERVATION_SIZE, dtype=np.float32
+    ).reshape(2, OBSERVATION_SIZE)
+    actions = np.linspace(
+        -0.25, 0.25, 2 * ACTION_SIZE, dtype=np.float32
+    ).reshape(2, ACTION_SIZE)
+    for parameter_name, q_names in (
+        ("online_params", ("q1_state_dict", "q2_state_dict")),
+        (
+            "target_params",
+            ("q1_target_state_dict", "q2_target_state_dict"),
+        ),
+    ):
+        expected = np.stack(
+            [
+                _apply_torch_task_critic(states[name], observations, actions)
+                for name in q_names
+            ],
+            axis=0,
+        )
+        actual = np.asarray(
+            critic.apply(
+                artifact[parameter_name],
+                jnp.asarray(observations),
+                jnp.asarray(actions),
+            )
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-4)
 
 
 def test_torch_qsafe_transfer_matches_fixed_input(tmp_path):

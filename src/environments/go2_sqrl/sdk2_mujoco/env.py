@@ -26,9 +26,14 @@ from ..common.specs import (
     OBSERVATION_SIZE,
     PHYSICS_DT,
     PHYSICS_STEPS_PER_ACTION,
+    format_policy_io_contract,
 )
 from ..common.termination import EpisodeTracker
-from ..common.manifest import build_manifest, validate_manifest
+from ..common.manifest import (
+    build_manifest,
+    validate_manifest,
+    validate_transfer_manifest,
+)
 from .fall_detector import FallDetector
 from .general_properties import GeneralProperties
 from .reset_controller import MujocoResetController
@@ -107,6 +112,9 @@ class Go2SDKMujocoEnv:
         self._policy_blend_elapsed = 0.0
         self._initial_simulator_reset_done = False
         self._previous_reward_action = np.zeros(ACTION_SIZE, dtype=np.float32)
+        logger.info(
+            "\n" + format_policy_io_contract(environment.target_velocity_x)
+        )
 
     @staticmethod
     def project_actions(states, actions):
@@ -185,12 +193,19 @@ class Go2SDKMujocoEnv:
         return self._wait_window()[-1]
 
     def _wait_for_simulator_restart(self, reason: str) -> None:
-        logger.warning("%s Press Backspace in the unitree_mujoco window to reset.", reason)
+        logger.warning(
+            f"{reason} Press Backspace in the unitree_mujoco window to reset."
+        )
         timeout = float(self.config.manual_reset_timeout)
         timeout = None if timeout < 0 else timeout
-        self._generation = self.client.state_buffer.wait_for_restart(
-            self._generation, timeout=timeout
-        )
+        self.client.state_buffer.arm_restart()
+        try:
+            self._generation = self.client.state_buffer.wait_for_restart(
+                self._generation, timeout=timeout
+            )
+        except Exception:
+            self.client.state_buffer.cancel_restart()
+            raise
         self._last_tick = None
         self.fall_detector.reset()
 
@@ -219,6 +234,7 @@ class Go2SDKMujocoEnv:
             self.client.publish_joint_target(DEFAULT_JOINT_POSITION)
 
         generation = self.client.state_buffer.generation
+        self.client.state_buffer.arm_restart()
         self.reset_controller.reset()
         try:
             self._generation = self.client.state_buffer.wait_for_restart(
@@ -226,6 +242,7 @@ class Go2SDKMujocoEnv:
                 timeout=float(self.config.auto_reset_timeout_seconds),
             )
         except StateTimeout as exc:
+            self.client.state_buffer.cancel_restart()
             raise RuntimeError(
                 "MuJoCo received the automatic reset key, but no simulator "
                 "tick restart was observed."
@@ -404,7 +421,7 @@ class Go2SDKMujocoEnv:
         else:
             world_velocity = np.asarray(truth.world_velocity)
         rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
-        truth_body_velocity = rotation.T @ np.asarray(world_velocity)
+        reward_body_velocity = rotation.T @ np.asarray(world_velocity)
         base_height = BASE_HEIGHT_TARGET
         if truth is not None and truth.base_position is not None:
             base_height = float(np.asarray(truth.base_position)[2])
@@ -430,23 +447,11 @@ class Go2SDKMujocoEnv:
             "failure": np.asarray([int(failure)], dtype=np.float32),
             "applied_action": mapped.applied_action[None, :],
             "policy_blend_alpha": np.asarray([alpha], dtype=np.float32),
-            "forward_velocity": np.asarray(
-                [truth_body_velocity[0]], dtype=np.float32
-            ),
             "estimated_forward_velocity": np.asarray(
                 [estimated_body_velocity[0]], dtype=np.float32
             ),
-            "target_velocity_error": np.asarray(
-                [
-                    abs(
-                        float(self.config.target_velocity_x)
-                        - float(truth_body_velocity[0])
-                    )
-                ],
-                dtype=np.float32,
-            ),
-            "velocity_estimation_error": np.asarray(
-                [np.linalg.norm(truth_body_velocity - estimated_body_velocity)],
+            "reward_uses_simulator_truth": np.asarray(
+                [float(truth is not None)],
                 dtype=np.float32,
             ),
             "velocity_estimator/measurement_accepted": np.asarray(
@@ -471,6 +476,31 @@ class Go2SDKMujocoEnv:
             ),
             **{key: np.asarray([value], dtype=np.float32) for key, value in terms.as_dict().items()},
         }
+        if truth is not None:
+            info.update(
+                {
+                    "forward_velocity": np.asarray(
+                        [reward_body_velocity[0]], dtype=np.float32
+                    ),
+                    "target_velocity_error": np.asarray(
+                        [
+                            abs(
+                                float(self.config.target_velocity_x)
+                                - float(reward_body_velocity[0])
+                            )
+                        ],
+                        dtype=np.float32,
+                    ),
+                    "velocity_estimation_error": np.asarray(
+                        [
+                            np.linalg.norm(
+                                reward_body_velocity - estimated_body_velocity
+                            )
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+            )
 
         terminal_info = None
         final_observation = None
@@ -533,3 +563,6 @@ class Go2SDKMujocoEnv:
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
         validate_manifest(manifest, self.checkpoint_manifest(normalizer))
+
+    def validate_transfer_checkpoint_manifest(self, manifest, normalizer=None):
+        validate_transfer_manifest(manifest, self.checkpoint_manifest(normalizer))

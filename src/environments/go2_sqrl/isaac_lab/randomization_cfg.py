@@ -33,8 +33,8 @@ def domain_randomization_rows(*, enabled: bool, friction: float):
     return (
         (
             "policy",
-            "observation corruption",
-            "enabled" if enabled else "disabled",
+            "46D policy observation corruption",
+            "disabled (common adapter output)",
         ),
         (
             "startup",

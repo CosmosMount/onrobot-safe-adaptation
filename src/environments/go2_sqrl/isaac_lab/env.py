@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
+
 import numpy as np
 import torch
 from gymnasium.spaces import Box
@@ -16,8 +19,13 @@ from ..common.specs import (
     OBSERVATION_SPEC,
     OBSERVATION_SIZE,
     PHYSICS_STEPS_PER_ACTION,
+    format_policy_io_contract,
 )
-from ..common.manifest import build_manifest, validate_manifest
+from ..common.manifest import (
+    build_manifest,
+    validate_manifest,
+    validate_transfer_manifest,
+)
 from ..common.reward import (
     BASE_HEIGHT_TARGET,
     REWARD_DT,
@@ -36,6 +44,35 @@ from .mdp import (
     sdk_joint_indices,
     validate_action_term_contract,
 )
+
+
+def relabel_isaac_backend_manager_output(output: str) -> str:
+    """Make clear which Isaac manager outputs the Go2 adapter discards."""
+
+    replacements = (
+        (
+            "[INFO] Command Manager:",
+            "[INFO] IsaacLab backend Command Manager "
+            "(internal; not the Go2 reward target):",
+        ),
+        (
+            "[INFO] Observation Manager:",
+            "[INFO] IsaacLab backend Observation Manager "
+            "(internal tensor discarded by the Go2 RL-X adapter):",
+        ),
+        (
+            "Active Observation Terms in Group: 'policy'",
+            "Active internal backend terms [not model input] in Group: 'policy'",
+        ),
+        (
+            "[INFO] Reward Manager:",
+            "[INFO] IsaacLab backend Reward Manager "
+            "(disabled; Go2 adapter computes the effective reward):",
+        ),
+    )
+    for original, replacement in replacements:
+        output = output.replace(original, replacement)
+    return output
 
 
 def project_action_targets_tensor(previous_q_target, actions):
@@ -128,7 +165,23 @@ class Go2IsaacEnv:
             from .env_cfg import make_env_cfg
             from .randomization_cfg import format_domain_randomization_report
 
-            backend = ManagerBasedRLEnv(cfg=make_env_cfg(config))
+            class ReportedManagerBasedRLEnv(ManagerBasedRLEnv):
+                def load_managers(self):
+                    captured = StringIO()
+                    try:
+                        with redirect_stdout(captured):
+                            super().load_managers()
+                    finally:
+                        output = relabel_isaac_backend_manager_output(
+                            captured.getvalue()
+                        )
+                        print(
+                            output,
+                            end="" if output.endswith("\n") else "\n",
+                            flush=True,
+                        )
+
+            backend = ReportedManagerBasedRLEnv(cfg=make_env_cfg(config))
             print(
                 format_domain_randomization_report(
                     enabled=bool(config.environment.domain_randomization),
@@ -185,6 +238,10 @@ class Go2IsaacEnv:
         self._episode_return = torch.zeros(self.nr_envs, device=robot.device)
         self._episode_length = torch.zeros(
             self.nr_envs, device=robot.device, dtype=torch.long
+        )
+        print(
+            format_policy_io_contract(self.config.target_velocity_x),
+            flush=True,
         )
 
     @staticmethod
@@ -469,3 +526,6 @@ class Go2IsaacEnv:
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
         validate_manifest(manifest, self.checkpoint_manifest(normalizer))
+
+    def validate_transfer_checkpoint_manifest(self, manifest, normalizer=None):
+        validate_transfer_manifest(manifest, self.checkpoint_manifest(normalizer))

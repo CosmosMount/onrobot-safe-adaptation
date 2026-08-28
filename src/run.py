@@ -78,16 +78,25 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
             )
         return [f"--runner.load_model={checkpoint_path}"]
 
-    directory = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
+    if checkpoint_path.is_file():
+        raise ValueError(
+            "Fine-tune/zero-shot requires an exact transfer bundle directory; "
+            "passing one combined .model file would silently mix it with sidecars "
+            "from a different training step."
+        )
+    directory = checkpoint_path
     policy = directory / "policy.model"
+    task_critic = directory / "task_critic.model"
     qsafe = directory / "qsafe.model"
-    if not policy.exists() or not qsafe.exists():
+    if not policy.exists() or not task_critic.exists() or not qsafe.exists():
         raise FileNotFoundError(
-            "Fine-tune/zero-shot requires policy.model and qsafe.model in "
+            "Fine-tune/zero-shot requires policy.model, task_critic.model, "
+            "and qsafe.model in "
             f"{directory}. Pass --checkpoint <models-directory>."
         )
     return [
         f"--algorithm.pretrained_policy_path={policy}",
+        f"--algorithm.pretrained_task_critic_path={task_critic}",
         f"--algorithm.qsafe.checkpoint_path={qsafe}",
     ]
 

@@ -41,6 +41,7 @@ def get_config(algorithm_name):
 
     config.phase = "pretrain"  # pretrain, finetune
     config.pretrained_policy_path = ""
+    config.pretrained_task_critic_path = ""
     config.dual_learning_rate = 3e-4
     config.initial_nu = 0.0
     # Algorithm 1: n_off unconstrained task-policy vector steps followed by
@@ -58,6 +59,10 @@ def get_config(algorithm_name):
     config.task_utd_ratio = 1.0
 
     config.qsafe = config_dict.ConfigDict()
+    # Experimental ablation only.  ``False`` keeps the transferred policy and
+    # SAC learner identical, but removes both QSafe action projection and the
+    # Eq. 4 actor/dual safety constraint during fine-tuning.
+    config.qsafe.enabled = True
     config.qsafe.checkpoint_path = ""
     config.qsafe.epsilon = 0.1
     config.qsafe.gamma = 0.7

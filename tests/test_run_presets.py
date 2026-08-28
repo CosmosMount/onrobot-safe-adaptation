@@ -26,6 +26,7 @@ def test_sqrl_defaults_match_paper_settings():
 
     assert config.total_timesteps == pytest.approx(5e5)
     assert config.learning_rate == pytest.approx(3e-4)
+    assert config.qsafe.enabled is True
     assert config.qsafe.epsilon == pytest.approx(0.1)
     assert config.qsafe.gamma == pytest.approx(0.7)
 
@@ -123,10 +124,12 @@ def test_canonical_mujoco_asset_matches_sdk_bridge_contract():
 
 def test_transfer_commands_use_torch_pretrain_sidecars(tmp_path: Path):
     (tmp_path / "policy.model").touch()
+    (tmp_path / "task_critic.model").touch()
     (tmp_path / "qsafe.model").touch()
     flags = _artifact_flags("finetune", str(tmp_path))
     assert flags == [
         f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}",
+        f"--algorithm.pretrained_task_critic_path={tmp_path / 'task_critic.model'}",
         f"--algorithm.qsafe.checkpoint_path={tmp_path / 'qsafe.model'}",
     ]
 
@@ -134,3 +137,12 @@ def test_transfer_commands_use_torch_pretrain_sidecars(tmp_path: Path):
 def test_eval_rejects_a_missing_flax_checkpoint(tmp_path: Path):
     with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
         _artifact_flags("eval", str(tmp_path))
+
+
+def test_transfer_rejects_a_combined_checkpoint_without_matching_sidecars(
+    tmp_path: Path,
+):
+    checkpoint = tmp_path / "step_000300032.model"
+    checkpoint.touch()
+    with pytest.raises(ValueError, match="transfer bundle directory"):
+        _artifact_flags("finetune", str(checkpoint))

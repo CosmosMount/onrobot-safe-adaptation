@@ -82,6 +82,50 @@ OBSERVATION_SPEC = ObservationSpecV3()
 ACTION_SPEC = ActionSpecV1()
 
 
+def policy_observation_rows() -> tuple[tuple[str, slice, str], ...]:
+    """Return the canonical model-input layout used by every backend."""
+
+    return (
+        ("joint_q", OBSERVATION_SPEC.joint_q, "measured joint position"),
+        ("joint_dq", OBSERVATION_SPEC.joint_dq, "measured joint velocity"),
+        ("imu_gyro", OBSERVATION_SPEC.imu_gyro, "body-frame IMU angular velocity"),
+        (
+            "body_velocity",
+            OBSERVATION_SPEC.body_velocity,
+            "robust IMU + leg-odometry estimate in the body frame",
+        ),
+        ("imu_quat", OBSERVATION_SPEC.imu_quat, "continuous WXYZ IMU quaternion"),
+        (
+            "previous_action_q_target",
+            OBSERVATION_SPEC.previous_action_q_target,
+            "previous applied joint-position target",
+        ),
+    )
+
+
+def format_policy_io_contract(target_velocity_x: float) -> str:
+    """Format the tensors actually exchanged with the RL-X policy."""
+
+    lines = [
+        "[INFO] Go2 RL-X policy I/O (actual model tensors)",
+        f"  Policy observation: shape ({OBSERVATION_SPEC.size},)",
+    ]
+    for name, indices, source in policy_observation_rows():
+        lines.append(
+            f"    [{indices.start:>2}:{indices.stop:<2}] {name:<31} {source}"
+        )
+    lines.extend(
+        (
+            "  velocity_commands: not observed by the policy",
+            "  simulator base_lin_vel: reward and diagnostics only when available",
+            "  reward velocity fallback: robust body_velocity estimate",
+            f"  reward target_velocity_x: {float(target_velocity_x):g} m/s",
+            f"  Policy action: shape ({ACTION_SPEC.size},), normalized joint-position targets",
+        )
+    )
+    return "\n".join(lines)
+
+
 def joint_order_indices(source_names: list[str] | tuple[str, ...]) -> np.ndarray:
     """Return gather indices that convert ``source_names`` into SDK order."""
 

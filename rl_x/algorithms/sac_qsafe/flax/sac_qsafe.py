@@ -29,6 +29,7 @@ from rl_x.algorithms.qsafe.flax import QSafe
 from rl_x.algorithms.qsafe.flax.projection import resolve_action_projectors
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
+    load_torch_task_critic_artifact,
     make_native_policy_artifact,
     validate_policy_contract,
 )
@@ -84,6 +85,9 @@ class SAC_QSafe:
         self.phase = config.algorithm.phase
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
+        self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
+        if self.phase == "pretrain" and not self.qsafe_enabled:
+            raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
         self.n_off = int(config.algorithm.n_off)
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
@@ -95,11 +99,13 @@ class SAC_QSafe:
         )
         if self.qsafe_updates_per_iteration < 1:
             raise ValueError("algorithm.qsafe.updates_per_iteration must be at least 1.")
-        self.nu = float(config.algorithm.initial_nu)
+        self.nu = (
+            float(config.algorithm.initial_nu) if self.qsafe_enabled else 0.0
+        )
         self.dual_learning_rate = float(config.algorithm.dual_learning_rate)
         self.dual_optimizer = (
             optax.adam(self.dual_learning_rate)
-            if self.phase == "finetune"
+            if self.phase == "finetune" and self.qsafe_enabled
             else optax.set_to_zero()
         )
         self.dual_optimizer_state = self.dual_optimizer.init(
@@ -107,6 +113,15 @@ class SAC_QSafe:
         )
 
         rlx_logger.info(f"Using device: {jax.default_backend()}")
+        if self.phase == "finetune":
+            rlx_logger.info(
+                "QSafe fine-tuning constraints: "
+                + (
+                    "enabled"
+                    if self.qsafe_enabled
+                    else "disabled (SAC ablation)"
+                )
+            )
         
         self.rng = np.random.default_rng(self.seed)
         self.key = jax.random.PRNGKey(self.seed)
@@ -190,6 +205,9 @@ class SAC_QSafe:
         )
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
+            self._load_pretrained_task_critic(
+                str(config.algorithm.pretrained_task_critic_path)
+            )
             self.observation_normalizer.freeze()
 
         self._build_action_kernels()
@@ -225,17 +243,56 @@ class SAC_QSafe:
         self.policy_state = self.policy_state.replace(
             params=artifact["policy_params"]
         )
+        if artifact["log_alpha"] is None:
+            rlx_logger.warning(
+                "Pretrained policy artifact has no SAC entropy temperature; "
+                f"using algorithm.alpha_init={float(self.config.algorithm.alpha_init):g}"
+            )
+        else:
+            entropy_params = serialization.to_state_dict(
+                self.entropy_coefficient_state.params
+            )
+            entropy_params["params"]["log_alpha"] = np.asarray(
+                artifact["log_alpha"], dtype=np.float32
+            )
+            self.entropy_coefficient_state = self.entropy_coefficient_state.replace(
+                params=serialization.from_state_dict(
+                    self.entropy_coefficient_state.params, entropy_params
+                )
+            )
+            rlx_logger.info(
+                "Transferred SAC entropy coefficient alpha: "
+                f"{float(np.exp(artifact['log_alpha'])):.9g}"
+            )
         self.observation_normalizer.load_state_dict(
             artifact["normalizer_state"], artifact["normalizer_metadata"]
         )
-        if not hasattr(self.train_env, "validate_checkpoint_manifest"):
+        if not hasattr(self.train_env, "validate_transfer_checkpoint_manifest"):
             raise ValueError(
-                "Fine-tuning environment must validate the policy checkpoint manifest"
+                "Fine-tuning environment must validate the policy transfer manifest"
             )
-        self.train_env.validate_checkpoint_manifest(
+        self.train_env.validate_transfer_checkpoint_manifest(
             artifact["environment_manifest"], self.observation_normalizer.metadata()
         )
         self.observation_normalizer.freeze()
+
+    def _load_pretrained_task_critic(self, file_path):
+        if not file_path:
+            raise ValueError(
+                "algorithm.pretrained_task_critic_path is required for finetune."
+            )
+        artifact = load_torch_task_critic_artifact(
+            file_path,
+            self.critic_state.params,
+            self.critic_state.target_params,
+        )
+        # Algorithm 2 clears D_offline but does not reinitialize the SAC
+        # critics.  Optimizer moments are intentionally fresh across backends.
+        self.critic_state = self.critic_state.replace(
+            params=artifact["online_params"],
+            target_params=artifact["target_params"],
+        )
+        rlx_logger.info("Transferred pretrained SAC task critics and targets")
 
     @staticmethod
     def _normalize_kernel(states, mean, std, epsilon):
@@ -322,29 +379,32 @@ class SAC_QSafe:
             epsilon,
             self.key,
         )
-        states, candidates, log_probs, _, selection_key = (
-            self._candidate_distribution_jit(
-                self.policy_state.params,
-                dummy_states,
-                mean,
-                std,
-                epsilon,
-                self.key,
+        if self.qsafe_enabled:
+            states, candidates, log_probs, _, selection_key = (
+                self._candidate_distribution_jit(
+                    self.policy_state.params,
+                    dummy_states,
+                    mean,
+                    std,
+                    epsilon,
+                    self.key,
+                )
             )
-        )
-        select = (
-            self.qsafe._select_pretrain_jit
-            if self.phase == "pretrain"
-            else self.qsafe._select_finetune_jit
-        )
-        selected, _, _ = select(
-            self.qsafe.state.params,
-            states,
-            candidates,
-            log_probs,
-            selection_key,
-        )
-        jax.block_until_ready((deterministic_actions, actions, selected))
+            select = (
+                self.qsafe._select_pretrain_jit
+                if self.phase == "pretrain"
+                else self.qsafe._select_finetune_jit
+            )
+            selected, _, _ = select(
+                self.qsafe.state.params,
+                states,
+                candidates,
+                log_probs,
+                selection_key,
+            )
+            jax.block_until_ready((deterministic_actions, actions, selected))
+        else:
+            jax.block_until_ready((deterministic_actions, actions))
 
     def _host_project(self, raw_states, actions):
         if self._projector_is_jax or self._host_project_actions is None:
@@ -503,7 +563,7 @@ class SAC_QSafe:
 
                 policy_loss = alpha * current_log_prob - min_q
                 safety_q = jnp.zeros_like(min_q)
-                if self.phase == "finetune":
+                if self.phase == "finetune" and self.qsafe_enabled:
                     safety_q = self.qsafe.network.apply(
                         stop_gradient(qsafe_params), state, current_action
                     ).squeeze()
@@ -638,7 +698,7 @@ class SAC_QSafe:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="pretrain"
                 )
-            elif self.phase == "finetune":
+            elif self.phase == "finetune" and self.qsafe_enabled:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="finetune"
                 )
@@ -814,7 +874,7 @@ class SAC_QSafe:
                                 self._learner_deadline_seconds,
                                 self._deadline_misses,
                             )
-                if self.phase == "finetune":
+                if self.phase == "finetune" and self.qsafe_enabled:
                     safety_value = float(optimization_metrics["qsafe/actor_value"])
                     nu_before_update = jnp.asarray(self.nu, dtype=jnp.float32)
                     dual_gradient = jnp.asarray(
@@ -871,7 +931,14 @@ class SAC_QSafe:
                 eval_state, _ = self.eval_env.reset()
                 eval_nr_episodes = 0
                 while True:
-                    _, eval_processed_action, _ = self._sample_policy_candidates(eval_state)
+                    if self.qsafe_enabled:
+                        _, eval_processed_action, _ = self._sample_policy_candidates(
+                            eval_state
+                        )
+                    else:
+                        _, eval_processed_action = self._sample_deterministic_action(
+                            eval_state
+                        )
                     try:
                         eval_state, eval_reward, eval_terminated, eval_truncated, eval_info = self.eval_env.step(
                             jax.device_get(eval_processed_action)
@@ -1039,6 +1106,7 @@ class SAC_QSafe:
                 serialization.msgpack_serialize(
                     make_native_policy_artifact(
                         self.policy_state.params,
+                        self.entropy_coefficient_state.params["params"]["log_alpha"],
                         normalizer_state,
                         normalizer_metadata,
                         environment_manifest,
@@ -1132,6 +1200,8 @@ class SAC_QSafe:
         eval_policy = str(self.config.algorithm.eval_policy)
         if eval_policy not in ("task", "safe"):
             raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
+        if eval_policy == "safe" and not self.qsafe_enabled:
+            raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
         for i in range(episodes):
             done = False
             episode_return = 0
@@ -1188,7 +1258,7 @@ class SAC_QSafe:
             )
             if episode_steps and "forward_velocity" in info:
                 summary += (
-                    f", Mean forward velocity: "
+                    f", Mean simulator forward velocity: "
                     f"{forward_velocity_sum / episode_steps:.6f}"
                 )
                 window_size = min(100, len(forward_velocity_samples))
@@ -1201,8 +1271,10 @@ class SAC_QSafe:
                     )
                 ]
                 summary += (
-                    f", Last {window_size}-step velocity: {window_means[-1]:.6f}, "
-                    f"Min {window_size}-step velocity: {min(window_means):.6f}"
+                    f", Last {window_size}-step simulator velocity: "
+                    f"{window_means[-1]:.6f}, "
+                    f"Min {window_size}-step simulator velocity: "
+                    f"{min(window_means):.6f}"
                 )
             if episode_steps and "estimated_forward_velocity" in info:
                 summary += (
@@ -1211,12 +1283,12 @@ class SAC_QSafe:
                 )
             if episode_steps and "velocity_estimation_error" in info:
                 summary += (
-                    f", Mean velocity estimation error: "
+                    f", Mean 3D velocity estimation error: "
                     f"{velocity_estimation_error_sum / episode_steps:.6f}"
                 )
             if episode_steps and "target_velocity_error" in info:
                 summary += (
-                    f", Mean target error: "
+                    f", Mean absolute forward target error: "
                     f"{target_velocity_error_sum / episode_steps:.6f}"
                 )
             rlx_logger.info(summary)

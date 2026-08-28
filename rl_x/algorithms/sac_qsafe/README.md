@@ -50,11 +50,14 @@ Fine-tuning uses the same algorithm name with:
 ```text
 --algorithm.phase=finetune
 --algorithm.pretrained_policy_path=/path/to/policy.model
+--algorithm.pretrained_task_critic_path=/path/to/task_critic.model
 --algorithm.qsafe.checkpoint_path=/path/to/qsafe.model
 ```
 
 The Flax sidecars use the `.msgpack` extension. During fine-tuning QSafe is
-frozen; the task critics and `D_offline` are initialized from scratch. Every
+frozen; `D_offline` and optimizer moments are initialized from scratch, while
+the SAC policy, both task critics and targets, and entropy temperature are
+transferred from pre-training. Every
 fine-tuning interaction uses the projected policy from Eq. 3. Candidate actions
 are sampled from the original policy, unsafe candidates are masked, and the
 remaining candidates are importance-sampled using their original policy log

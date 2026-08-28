@@ -137,3 +137,21 @@ def validate_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> None:
             )
 
     compare("", actual, expected)
+
+
+def validate_transfer_manifest(
+    actual: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    """Validate policy/QSafe compatibility while allowing a new task reward.
+
+    Changing the reward or velocity command is the defining SQRL fine-tuning
+    operation.  Policy tensor meaning, safety labels, action/reset semantics,
+    and normalization remain strict transfer invariants.
+    """
+
+    transfer_expected = {
+        key: value
+        for key, value in expected.items()
+        if key not in ("reward_version", "reward_contract")
+    }
+    validate_manifest(actual, transfer_expected)

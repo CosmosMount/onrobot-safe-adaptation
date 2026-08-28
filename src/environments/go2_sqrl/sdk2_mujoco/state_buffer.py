@@ -26,11 +26,21 @@ class SimulatorRestarted(StateBufferError):
 
 
 class StateBuffer:
-    def __init__(self, capacity: int = 4096, restart_threshold_ticks: int = 100):
+    def __init__(
+        self,
+        capacity: int = 4096,
+        restart_threshold_ticks: int = 100,
+        restart_settle_seconds: float = 5.0,
+        restart_max_forward_jump: int = 5,
+    ):
         self._frames: deque[RobotState] = deque(maxlen=int(capacity))
         self._condition = threading.Condition()
         self._last_tick: int | None = None
         self._restart_threshold = int(restart_threshold_ticks)
+        self._restart_settle_seconds = float(restart_settle_seconds)
+        self._restart_max_forward_jump = int(restart_max_forward_jump)
+        self._restart_armed = False
+        self._restart_settle_deadline = 0.0
         self._generation = 0
         self._error: Exception | None = None
 
@@ -54,24 +64,58 @@ class StateBuffer:
             raise ValueError("LowState must contain tick")
         tick = int(state.tick)
         with self._condition:
+            now = time.monotonic()
             if self._last_tick is not None:
                 if tick == self._last_tick:
                     return False
                 if tick < self._last_tick:
                     difference = self._last_tick - tick
-                    if difference >= self._restart_threshold:
+                    if self._restart_armed:
                         self._frames.clear()
                         self._generation += 1
+                        self._restart_armed = False
+                        self._restart_settle_deadline = (
+                            now + self._restart_settle_seconds
+                        )
+                    elif now < self._restart_settle_deadline:
+                        # Once an armed reset established a new generation,
+                        # any late lower tick belongs to the drained DDS epoch.
+                        return False
+                    elif difference >= self._restart_threshold:
+                        self._frames.clear()
+                        self._generation += 1
+                        self._restart_settle_deadline = (
+                            now + self._restart_settle_seconds
+                        )
                     else:
                         self._error = FrameOrderError(
                             f"Out-of-order LowState tick: {tick} after {self._last_tick}"
                         )
                         self._condition.notify_all()
                         return False
+                elif (
+                    now < self._restart_settle_deadline
+                    and tick - self._last_tick > self._restart_max_forward_jump
+                ):
+                    # A reliable DDS reader may finish delivering queued frames
+                    # from the previous simulator epoch after reset.  Ignore a
+                    # stale forward jump while the new low-tick epoch settles.
+                    return False
             self._last_tick = tick
             self._frames.append(state)
             self._condition.notify_all()
             return True
+
+    def arm_restart(self) -> None:
+        """Accept the next rollback as an explicitly requested simulator reset."""
+
+        with self._condition:
+            self._restart_armed = True
+            self._error = None
+
+    def cancel_restart(self) -> None:
+        with self._condition:
+            self._restart_armed = False
 
     def clear_error(self) -> None:
         with self._condition:

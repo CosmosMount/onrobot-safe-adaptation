@@ -198,6 +198,10 @@ def test_sdk_transition_window_discards_pre_command_backlog():
     client.push_frames(-0.25)
     result = environment.step(np.zeros((1, 12), dtype=np.float32))
     np.testing.assert_allclose(result[0][0, :12], 0.1)
+    assert result[4]["reward_uses_simulator_truth"][0] == 0.0
+    assert "forward_velocity" not in result[4]
+    assert "target_velocity_error" not in result[4]
+    assert "velocity_estimation_error" not in result[4]
     assert environment._last_tick == client.state_buffer.last_tick
 
 
