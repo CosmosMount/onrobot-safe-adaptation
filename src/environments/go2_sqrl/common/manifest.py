@@ -20,8 +20,8 @@ from .specs import (
 )
 
 
-MANIFEST_VERSION = 7
-VELOCITY_ESTIMATOR_VERSION = "proprioceptive-support-v2"
+MANIFEST_VERSION = 8
+VELOCITY_ESTIMATOR_VERSION = "contact-free-robust-kf-v1"
 FAILURE_CONTRACT_VERSION = "imu-roll-pitch-sustained-v1"
 ACTION_PIPELINE_VERSION = "sdk-absolute-position-v2"
 
@@ -40,18 +40,17 @@ def build_manifest(
             "size": OBSERVATION_SPEC.size,
             "joint_order": list(OBSERVATION_SPEC.joint_order),
             "quaternion_order": OBSERVATION_SPEC.quaternion_order,
-            "velocity_command": {
+            "body_velocity": {
                 "indices": [
-                    OBSERVATION_SPEC.velocity_command.start,
-                    OBSERVATION_SPEC.velocity_command.stop,
+                    OBSERVATION_SPEC.body_velocity.start,
+                    OBSERVATION_SPEC.body_velocity.stop,
                 ],
-                "linear_velocity_x": float(target_velocity_x),
-                "linear_velocity_y": 0.0,
-                "angular_velocity_z": 0.0,
+                "frame": "body",
+                "source": "proprioceptive_velocity_estimator",
             },
             "velocity_estimator": {
                 "version": VELOCITY_ESTIMATOR_VERSION,
-                "policy_visible": False,
+                "policy_visible": True,
                 "inputs": [
                     "joint_q",
                     "joint_dq",

@@ -11,6 +11,7 @@ from src.environments.go2_sqrl.common.specs import (
     PHYSICS_DT,
 )
 from src.run import _artifact_flags
+from rl_x.algorithms.sac_qsafe.pytorch.default_config import get_config
 
 
 def test_framework_is_selected_by_training_backend():
@@ -20,12 +21,21 @@ def test_framework_is_selected_by_training_backend():
         assert "--algorithm.name=sac_qsafe.flax" in RUN_PRESETS[command]
 
 
-def test_zero_shot_is_a_flat_deterministic_task_policy_gate():
+def test_sqrl_defaults_match_paper_settings():
+    config = get_config("sac_qsafe.pytorch")
+
+    assert config.total_timesteps == pytest.approx(5e5)
+    assert config.learning_rate == pytest.approx(3e-4)
+    assert config.qsafe.epsilon == pytest.approx(0.1)
+    assert config.qsafe.gamma == pytest.approx(0.7)
+
+
+def test_zero_shot_uses_the_sqrl_projected_policy_on_flat_ground():
     scene = Path(DEFAULT_MUJOCO_SCENE)
     assert scene.name == "scene.xml"
     assert scene.is_file()
     assert scene.parent.name == "mjcf"
-    assert "--algorithm.eval_policy=task" in RUN_PRESETS["zero-shot"]
+    assert "--algorithm.eval_policy=safe" in RUN_PRESETS["zero-shot"]
 
 
 def test_pretrain_parity_checkpoint_uses_flat_ground():
@@ -89,10 +99,23 @@ def test_canonical_mujoco_asset_matches_sdk_bridge_contract():
 
     home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     assert home_id >= 0
-    assert model.key_qpos[home_id, 2] == pytest.approx(DEFAULT_BASE_HEIGHT)
     np.testing.assert_allclose(
-        model.key_ctrl[home_id], ACTION_SPEC.default_position, atol=1e-7
+        model.key_qpos[home_id, 7:], ACTION_SPEC.default_position, atol=1e-7
     )
+    np.testing.assert_allclose(model.key_qvel[home_id], 0.0, atol=1e-12)
+    np.testing.assert_allclose(model.key_ctrl[home_id], 0.0, atol=1e-12)
+
+    # The home base height is geometry-derived: all four spherical feet begin
+    # in the contact margin, rather than suspended or deeply penetrating.
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, home_id)
+    mujoco.mj_forward(model, data)
+    foot_bottoms = []
+    for name in ("FR", "FL", "RR", "RL"):
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        foot_bottoms.append(data.geom_xpos[geom_id, 2] - model.geom_size[geom_id, 0])
+    np.testing.assert_allclose(foot_bottoms, 0.0, atol=1e-3)
+
     floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     assert floor_id >= 0
     assert model.geom_friction[floor_id, 0] == pytest.approx(0.4)

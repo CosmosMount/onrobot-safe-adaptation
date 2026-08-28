@@ -47,17 +47,32 @@ class FakeSDKClient:
         pass
 
 
-def test_sdk_environment_observation_command_reward_smoke():
+def test_sdk_environment_velocity_observation_reward_smoke():
     config = ConfigDict()
     config.environment = get_config("go2_sqrl.sdk2_mujoco")
     environment = Go2SDKMujocoEnv(config, client=FakeSDKClient())
     observation, _ = environment.reset()
     assert observation.shape == (1, 46)
-    np.testing.assert_allclose(observation[0, 27:30], [0.5, 0.0, 0.0])
+    np.testing.assert_allclose(
+        observation[0, 27:30], [0.0, 0.0, 0.0], atol=1e-8
+    )
+    estimator_updates_before_step = (
+        environment.observation_builder.velocity_estimator.update_count
+    )
     next_observation, reward, terminated, truncated, info = environment.step(
         np.zeros((1, 12), dtype=np.float32)
     )
+    assert (
+        environment.observation_builder.velocity_estimator.update_count
+        - estimator_updates_before_step
+        == 10
+    )
     assert next_observation.shape == (1, 46)
+    np.testing.assert_allclose(
+        next_observation[0, 27:30],
+        [info["estimated_forward_velocity"][0], 0.0, 0.0],
+        atol=1e-8,
+    )
     assert reward[0] == pytest.approx(-0.0030842112, abs=1e-7)
     assert not terminated[0]
     assert not truncated[0]

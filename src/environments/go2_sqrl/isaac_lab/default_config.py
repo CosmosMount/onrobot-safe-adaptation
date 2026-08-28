@@ -1,5 +1,7 @@
 from ml_collections import config_dict
 
+from ..common.estimation.velocity import configure_velocity_estimator
+
 
 def get_config(environment_name):
     config = config_dict.ConfigDict()
@@ -11,6 +13,7 @@ def get_config(environment_name):
     config.rollout_mode = "partitioned"
     config.device = "gpu"
     config.target_velocity_x = 0.5
+    configure_velocity_estimator(config)
     config.terrain_mode = "rough"
     config.domain_randomization = False
     config.friction = 0.4

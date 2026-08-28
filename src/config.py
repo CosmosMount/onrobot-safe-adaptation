@@ -91,10 +91,9 @@ RUN_PRESETS = {
         "--runner.run_name=mujoco",
         "--environment.name=go2_sqrl.sdk2_mujoco",
         "--algorithm.phase=finetune",
-        # The first transfer gate evaluates the deterministic task policy.
-        # QSafe candidate sampling is a separate gate because it is stochastic
-        # and depends on a correctly transferred safety-action contract.
-        "--algorithm.eval_policy=task",
+        # Algorithm 2 always executes the QSafe-projected policy in the target
+        # environment, including the pre-finetune zero-shot evaluation.
+        "--algorithm.eval_policy=safe",
     ),
     "finetune": JAX_ONLINE_FLAGS
     + (

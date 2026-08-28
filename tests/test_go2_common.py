@@ -40,7 +40,7 @@ def robot_state(quaternion=(1.0, 0.0, 0.0, 0.0)):
 
 def test_versioned_observation_layout_and_joint_order():
     assert OBSERVATION_SPEC.size == 46
-    assert OBSERVATION_SPEC.velocity_command == slice(27, 30)
+    assert OBSERVATION_SPEC.body_velocity == slice(27, 30)
     assert ACTION_SPEC.size == 12
     assert OBSERVATION_SPEC.previous_action_q_target == slice(34, 46)
     source = [f"{name}_joint" for name in reversed(OBSERVATION_SPEC.joint_order)]

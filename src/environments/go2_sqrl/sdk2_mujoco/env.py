@@ -11,11 +11,22 @@ from gymnasium.spaces import Box
 from rl_x.environments.safety_rollout import InvalidTransitionError
 
 from ..common.action import ActionMapper, project_actions_from_observation
-from ..common.estimation.velocity import quaternion_rotation_matrix_wxyz
+from ..common.estimation.velocity import (
+    VelocityEstimator,
+    quaternion_rotation_matrix_wxyz,
+    velocity_estimator_config_from,
+)
 from ..common.observation import ObservationBuilder
 from ..common.reward import compute_reward
 from ..common.reward import BASE_HEIGHT_TARGET
-from ..common.specs import ACTION_SIZE, DEFAULT_JOINT_POSITION, OBSERVATION_SIZE
+from ..common.specs import (
+    ACTION_SIZE,
+    CONTROL_DT,
+    DEFAULT_JOINT_POSITION,
+    OBSERVATION_SIZE,
+    PHYSICS_DT,
+    PHYSICS_STEPS_PER_ACTION,
+)
 from ..common.termination import EpisodeTracker
 from ..common.manifest import build_manifest, validate_manifest
 from .fall_detector import FallDetector
@@ -42,6 +53,20 @@ class Go2SDKMujocoEnv:
         reset_controller: MujocoResetController | None = None,
     ):
         environment = config.environment
+        if int(environment.policy_frames) != PHYSICS_STEPS_PER_ACTION:
+            raise ValueError(
+                "MuJoCo control windows must contain exactly "
+                f"{PHYSICS_STEPS_PER_ACTION} LowState frames"
+            )
+        if not np.isclose(
+            float(environment.policy_period_seconds),
+            CONTROL_DT,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"MuJoCo policy_period_seconds must remain {CONTROL_DT}s"
+            )
         self.config = environment
         self.role = role
         runner = getattr(config, "runner", None)
@@ -64,7 +89,12 @@ class Go2SDKMujocoEnv:
             )
         self.reset_controller = reset_controller
         self.action_mapper = ActionMapper()
-        self.observation_builder = ObservationBuilder()
+        self.observation_builder = ObservationBuilder(
+            VelocityEstimator(
+                dt=PHYSICS_DT,
+                config=velocity_estimator_config_from(environment),
+            )
+        )
         self.fall_detector = FallDetector(
             environment.fall_angle_threshold,
             environment.fall_consecutive_frames,
@@ -176,6 +206,18 @@ class Go2SDKMujocoEnv:
         else:
             logger.info(f"{reason} Automatically resetting MuJoCo.")
 
+        # Arm the SDK bridge before resetting physics.  LowCmd is retained by
+        # unitree_mujoco while mjData is reset, so the very first post-reset
+        # step already holds the same home pose as the MJCF keyframe.
+        if isinstance(self.client, SDKClient):
+            self.client.publish_joint_target(
+                DEFAULT_JOINT_POSITION,
+                kp=float(self.config.reset_kp),
+                kd=float(self.config.reset_kd),
+            )
+        else:
+            self.client.publish_joint_target(DEFAULT_JOINT_POSITION)
+
         generation = self.client.state_buffer.generation
         self.reset_controller.reset()
         try:
@@ -201,9 +243,31 @@ class Go2SDKMujocoEnv:
         return state
 
     def _hold_reset_pose(self, initial_state):
-        """Linearly stand up before handing control directly to the policy."""
+        """Hold an exact home reset, with interpolation as a recovery fallback."""
 
         state = initial_state
+        # A patched unitree_mujoco reset loads the named home keyframe.  Keep
+        # commanding it while DDS settles.  Once home is observed, retain the
+        # normal hold period so gravity/foot-contact transients finish before
+        # the first policy observation is built.
+        home_ready = False
+        for _ in range(
+            max(1, self._duration_steps(self.config.reset_sync_timeout_seconds))
+        ):
+            if self._reset_pose_ready(state):
+                home_ready = True
+                break
+            state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
+        if self._reset_pose_ready(state):
+            home_ready = True
+        if home_ready:
+            for _ in range(self._duration_steps(self.config.standup_hold_seconds)):
+                state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
+            if self._reset_pose_ready(state):
+                return state
+
+        # Compatibility fallback for a simulator reset that did not load the
+        # home keyframe (or for recovery from a genuinely fallen state).
         while True:
             pose_1 = np.asarray(self.config.standup_pose_1, dtype=np.float32)
             state = self._interpolate_reset_pose(
@@ -269,9 +333,7 @@ class Go2SDKMujocoEnv:
         else:
             self._last_tick = int(state.tick)
         state = self._hold_reset_pose(state)
-        observation, _ = self.observation_builder.build(
-            state, self._velocity_command()
-        )
+        observation, _ = self.observation_builder.build(state)
         self._last_observation = observation
         return observation[None, :], {}
 
@@ -285,23 +347,11 @@ class Go2SDKMujocoEnv:
             self._wait_for_simulator_restart("Go2 fall detected.")
         return self.reset()[0][0]
 
-    def _logical_reset(self, state):
-        self.action_mapper.reset()
-        self.observation_builder.reset()
-        self.fall_detector.reset()
-        self.episode.reset()
-        self._policy_blend_elapsed = 0.0
-        self._previous_reward_action.fill(0.0)
-        observation, _ = self.observation_builder.build(
-            state, self._velocity_command()
-        )
-        return observation
+    def _logical_reset(self, observation):
+        """Reset accounting without integrating the final physics frame twice."""
 
-    def _velocity_command(self):
-        return np.asarray(
-            [float(self.config.target_velocity_x), 0.0, 0.0],
-            dtype=np.float32,
-        )
+        self.episode.reset()
+        return np.asarray(observation, dtype=np.float32).copy()
 
     def step(self, actions):
         action = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_SIZE)[0]
@@ -343,8 +393,8 @@ class Go2SDKMujocoEnv:
         for frame in frames:
             failure = self.fall_detector.update(frame.imu_quat) or failure
         final_state = frames[-1]
-        observation, estimated_body_velocity = self.observation_builder.build(
-            final_state, self._velocity_command()
+        observation, estimated_body_velocity = self.observation_builder.build_many(
+            frames
         )
 
         truth = self.client.latest_training_state()
@@ -371,6 +421,10 @@ class Go2SDKMujocoEnv:
         )
         self._previous_reward_action = reward_action.copy()
         terminated, truncated = self.episode.advance(terms.total, failure)
+        estimator = self.observation_builder.velocity_estimator
+        innovation_squared = getattr(estimator, "last_innovation_squared", None)
+        support_confidence = getattr(estimator, "last_support_confidence", None)
+        covariance = getattr(estimator, "covariance", None)
 
         info = {
             "failure": np.asarray([int(failure)], dtype=np.float32),
@@ -395,6 +449,26 @@ class Go2SDKMujocoEnv:
                 [np.linalg.norm(truth_body_velocity - estimated_body_velocity)],
                 dtype=np.float32,
             ),
+            "velocity_estimator/measurement_accepted": np.asarray(
+                [float(getattr(estimator, "last_measurement_accepted", False))],
+                dtype=np.float32,
+            ),
+            "velocity_estimator/innovation_nis": np.asarray(
+                [np.nan if innovation_squared is None else innovation_squared],
+                dtype=np.float32,
+            ),
+            "velocity_estimator/support_confidence_sum": np.asarray(
+                [
+                    np.nan
+                    if support_confidence is None
+                    else np.sum(support_confidence)
+                ],
+                dtype=np.float32,
+            ),
+            "velocity_estimator/covariance_trace": np.asarray(
+                [np.nan if covariance is None else np.trace(covariance)],
+                dtype=np.float32,
+            ),
             **{key: np.asarray([value], dtype=np.float32) for key, value in terms.as_dict().items()},
         }
 
@@ -410,7 +484,7 @@ class Go2SDKMujocoEnv:
             if terminated:
                 observation = self._manual_failure_reset()
             else:
-                observation = self._logical_reset(final_state)
+                observation = self._logical_reset(observation)
             info["episode_return"] = np.asarray(
                 [terminal_info["episode_return"]], dtype=np.float32
             )

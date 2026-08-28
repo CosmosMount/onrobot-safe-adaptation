@@ -1,5 +1,7 @@
 from ml_collections import config_dict
 
+from ..common.estimation.velocity import configure_velocity_estimator
+
 
 def get_config(environment_name):
     config = config_dict.ConfigDict()
@@ -13,6 +15,7 @@ def get_config(environment_name):
     # ten fresh physical ticks. The Flax learner reports deadline misses while
     # DDS transport itself remains on the host.
     config.policy_period_seconds = 0.02
+    configure_velocity_estimator(config)
     # Runtime policy PD. Defaults reproduce the Isaac/checkpoint contract;
     # command-line overrides are MuJoCo-only sensitivity experiments.
     config.policy_kp = 25.0

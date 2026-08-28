@@ -75,7 +75,7 @@ def test_mujoco_reset_pd_defaults_settle_before_policy_takeover():
 
 def test_manifest_versions_sensor_free_estimator_and_imu_failure():
     manifest = build_manifest({"observation_size": 46})
-    assert manifest["manifest_version"] == MANIFEST_VERSION == 7
+    assert manifest["manifest_version"] == MANIFEST_VERSION == 8
     assert manifest["reward_version"] == "flashsac-go2-walk-easy-command-v3"
     assert manifest["reward_contract"]["command"]["linear_velocity_x"] == 0.5
     np.testing.assert_allclose(
@@ -84,9 +84,10 @@ def test_manifest_versions_sensor_free_estimator_and_imu_failure():
     )
     estimator = manifest["observation"]["velocity_estimator"]
     assert estimator["version"] == VELOCITY_ESTIMATOR_VERSION
-    assert estimator["policy_visible"] is False
+    assert estimator["policy_visible"] is True
     assert estimator["external_contact_sensor"] is False
-    assert manifest["observation"]["velocity_command"]["indices"] == [27, 30]
+    assert manifest["observation"]["body_velocity"]["indices"] == [27, 30]
+    assert manifest["observation"]["body_velocity"]["frame"] == "body"
     assert manifest["failure"]["version"] == FAILURE_CONTRACT_VERSION
     assert manifest["failure"]["external_contact_sensor"] is False
     assert manifest["failure"]["frame_unit"] == "physics_frames"
@@ -200,7 +201,7 @@ def test_sdk_transition_window_discards_pre_command_backlog():
     assert environment._last_tick == client.state_buffer.last_tick
 
 
-def test_reset_linearly_interpolates_through_crouch_before_policy():
+def test_non_home_reset_tries_home_before_crouch_recovery_fallback():
     class StandupClient:
         def __init__(self):
             self.state_buffer = StateBuffer()
@@ -227,8 +228,16 @@ def test_reset_linearly_interpolates_through_crouch_before_policy():
         def publish_joint_target(self, target):
             target = np.asarray(target, dtype=np.float32)
             self.targets.append(target.copy())
+            # Model a legacy reset whose first 20 ms home command cannot
+            # instantly recover the all-zero joint pose.  Subsequent targets
+            # track normally, exercising the crouch interpolation fallback.
+            measured = (
+                np.zeros(12, dtype=np.float32)
+                if len(self.targets) == 1
+                else target
+            )
             for _ in range(10):
-                self._push(target)
+                self._push(measured)
 
         def latest_training_state(self):
             return TrainingState(
@@ -247,14 +256,15 @@ def test_reset_linearly_interpolates_through_crouch_before_policy():
     environment.reset()
 
     crouch = np.asarray(config.environment.standup_pose_1, dtype=np.float32)
-    assert len(client.targets) == 5
-    np.testing.assert_allclose(client.targets[0], 0.5 * crouch)
-    np.testing.assert_allclose(client.targets[1], crouch)
+    assert len(client.targets) == 6
+    np.testing.assert_allclose(client.targets[0], DEFAULT_JOINT_POSITION)
+    np.testing.assert_allclose(client.targets[1], 0.5 * crouch)
+    np.testing.assert_allclose(client.targets[2], crouch)
     np.testing.assert_allclose(
-        client.targets[2], 0.5 * (crouch + DEFAULT_JOINT_POSITION)
+        client.targets[3], 0.5 * (crouch + DEFAULT_JOINT_POSITION)
     )
-    np.testing.assert_allclose(client.targets[3], DEFAULT_JOINT_POSITION)
     np.testing.assert_allclose(client.targets[4], DEFAULT_JOINT_POSITION)
+    np.testing.assert_allclose(client.targets[5], DEFAULT_JOINT_POSITION)
 
 
 def test_policy_directly_takes_over_after_standup():
@@ -379,6 +389,64 @@ def test_finetune_auto_resets_on_start_and_one_second_after_fall(monkeypatch):
     environment._manual_failure_reset()
     assert controller.count == 2
     assert sleeps == [pytest.approx(1.0)]
+
+
+def test_auto_reset_arms_home_before_reset_and_skips_crouch_trajectory():
+    events = []
+
+    class HomeResetClient:
+        def __init__(self):
+            self.state_buffer = StateBuffer(restart_threshold_ticks=1)
+
+        def _push(self, tick):
+            self.state_buffer.push(
+                RobotState(
+                    DEFAULT_JOINT_POSITION.copy(),
+                    np.zeros(12, dtype=np.float32),
+                    np.zeros(3, dtype=np.float32),
+                    np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    np.asarray([0.0, 0.0, 9.81], dtype=np.float32),
+                    tick=tick,
+                )
+            )
+
+        def start(self):
+            if self.state_buffer.last_tick is None:
+                self._push(100)
+
+        def publish_joint_target(self, target):
+            events.append(("target", np.asarray(target).copy()))
+
+        def latest_training_state(self):
+            return TrainingState(
+                world_velocity=np.zeros(3, dtype=np.float32),
+                base_position=np.asarray([0.0, 0.0, 0.289], dtype=np.float32),
+            )
+
+    class HomeResetController:
+        def __init__(self, client):
+            self.client = client
+
+        def reset(self):
+            events.append(("reset", None))
+            self.client._push(0)
+
+    client = HomeResetClient()
+    config = ConfigDict()
+    config.environment = get_config("go2_sqrl.sdk2_mujoco")
+    config.environment.standup_hold_seconds = 0.0
+    config.environment.reset_sync_timeout_seconds = 0.0
+    environment = Go2SDKMujocoEnv(
+        config,
+        client=client,
+        reset_controller=HomeResetController(client),
+    )
+
+    observation, _ = environment.reset()
+
+    assert [event[0] for event in events] == ["target", "reset"]
+    np.testing.assert_allclose(events[0][1], DEFAULT_JOINT_POSITION)
+    np.testing.assert_allclose(observation[0, :12], DEFAULT_JOINT_POSITION)
 
 
 def test_sdk_reset_pose_requires_upright_home_configuration():

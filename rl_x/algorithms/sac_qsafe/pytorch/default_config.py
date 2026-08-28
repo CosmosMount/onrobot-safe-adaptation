@@ -68,10 +68,6 @@ def get_config(algorithm_name):
     # The paper does not publish the finite rejection pool size.  The verified
     # Go2 reproduction uses 100 candidates and ten recent complete rollouts.
     config.qsafe.candidate_actions = 100
-    # ``importance`` follows the paper's practical finite-candidate selector.
-    # ``first_safe`` is the neutral rejection-sampling ablation used by the
-    # independent Go2 reproduction.
-    config.qsafe.finetune_selector = "importance"
     config.qsafe.max_trajectories = 10
     config.qsafe.nr_hidden_units = 256
     config.qsafe.updates_per_iteration = 1
