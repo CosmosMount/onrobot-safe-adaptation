@@ -21,6 +21,7 @@ from rl_x.algorithms.sac.flax.replay_buffer import ReplayBuffer
 from rl_x.algorithms.sac.flax.rl_train_state import RLTrainState
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
+    actor_updates_enabled,
     extract_failure_signal,
     finetune_constraints_enabled,
     restore_algorithm_config,
@@ -67,6 +68,7 @@ class SAC_QSafe:
         self.buffer_size = config.algorithm.buffer_size
         if (
             config.algorithm.phase == "pretrain"
+            and bool(config.algorithm.qsafe.enabled)
             and int(config.algorithm.qsafe.buffer_size) >= int(self.buffer_size)
         ):
             raise ValueError(
@@ -86,8 +88,6 @@ class SAC_QSafe:
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
         self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
-        if self.phase == "pretrain" and not self.qsafe_enabled:
-            raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
         self.finetune_constraints_enabled = finetune_constraints_enabled(
             self.phase, self.qsafe_enabled
         )
@@ -95,8 +95,20 @@ class SAC_QSafe:
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
             raise ValueError("algorithm.n_off must be at least 1.")
-        if self.phase == "pretrain" and self.n_safe < 1:
+        if self.phase == "pretrain" and self.qsafe_enabled and self.n_safe < 1:
             raise ValueError("algorithm.n_safe must be at least 1 during pretraining.")
+        self.finetune_actor_warmup_steps = int(
+            config.algorithm.finetune_actor_warmup_steps
+        )
+        self.finetune_actor_update_interval = int(
+            config.algorithm.finetune_actor_update_interval
+        )
+        actor_updates_enabled(
+            self.phase,
+            0,
+            self.finetune_actor_warmup_steps,
+            self.finetune_actor_update_interval,
+        )
         self.qsafe_updates_per_iteration = int(
             config.algorithm.qsafe.updates_per_iteration
         )
@@ -198,20 +210,25 @@ class SAC_QSafe:
         )
 
         self.key, qsafe_key = jax.random.split(self.key)
-        self.qsafe = QSafe(
-            config,
-            self.train_env,
-            self.rng,
-            qsafe_key,
-            self.phase,
-            defer_checkpoint_load=_defer_transfer_load,
+        self.qsafe = (
+            QSafe(
+                config,
+                self.train_env,
+                self.rng,
+                qsafe_key,
+                self.phase,
+                defer_checkpoint_load=_defer_transfer_load,
+            )
+            if self.qsafe_enabled
+            else None
         )
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
             self.observation_normalizer.freeze()
             rlx_logger.info(
-                "SQRL transfer loaded actor, observation normalizer, and frozen "
-                "QSafe only; task critics, targets, entropy temperature, replay, "
+                "Transfer loaded actor and observation normalizer"
+                + (", plus frozen QSafe" if self.qsafe_enabled else "")
+                + "; task critics, targets, entropy temperature, replay, "
                 "optimizers, and nu start fresh"
             )
 
@@ -329,7 +346,11 @@ class SAC_QSafe:
             dtype=jnp.float32,
         )
         mean, std, epsilon = self._normalizer_parameters()
-        rlx_logger.info("Compiling Flax policy and QSafe action kernels before rollout")
+        rlx_logger.info(
+            "Compiling Flax policy"
+            + (" and QSafe action" if self.qsafe_enabled else "")
+            + " kernels before rollout"
+        )
         deterministic_actions = self._deterministic_action_jit(
             self.policy_state.params,
             dummy_states,
@@ -448,7 +469,7 @@ class SAC_QSafe:
         else:
             raise ValueError(f"Unknown SQRL phase: {phase}")
         selected_actions, _, metrics = select(
-            self.qsafe.state.params,
+            self.qsafe.state.params if self.qsafe_enabled else {},
             normalized_states,
             candidate_actions,
             log_probs,
@@ -472,7 +493,7 @@ class SAC_QSafe:
                 states: np.ndarray, next_states: np.ndarray, actions: np.ndarray, rewards: np.ndarray, terminations: np.ndarray,
                 normalizer_mean: np.ndarray, normalizer_std: np.ndarray,
                 normalizer_epsilon: float, qsafe_params: flax.core.FrozenDict,
-                nu: float, key: jax.random.PRNGKey
+                nu: float, actor_update_enabled: bool, key: jax.random.PRNGKey
             ):
             raw_states = jnp.asarray(states, dtype=jnp.float32)
             raw_next_states = jnp.asarray(next_states, dtype=jnp.float32)
@@ -559,6 +580,7 @@ class SAC_QSafe:
                     "entropy/entropy": entropy,
                     "entropy/alpha": alpha,
                     "q_value/q_value": min_q,
+                    "q_value/bellman_target": y,
                     "qsafe/actor_value": safety_q,
                 }
 
@@ -582,9 +604,19 @@ class SAC_QSafe:
                 states, next_states, raw_states, raw_next_states, actions, rewards,
                 terminations, keys1, keys2)
 
-            policy_state = policy_state.apply_gradients(grads=policy_gradients)
             critic_state = critic_state.apply_gradients(grads=critic_gradients)
-            entropy_coefficient_state = entropy_coefficient_state.apply_gradients(grads=entropy_gradients)
+            policy_state = jax.lax.cond(
+                actor_update_enabled,
+                lambda value: value.apply_gradients(grads=policy_gradients),
+                lambda value: value,
+                policy_state,
+            )
+            entropy_coefficient_state = jax.lax.cond(
+                actor_update_enabled,
+                lambda value: value.apply_gradients(grads=entropy_gradients),
+                lambda value: value,
+                entropy_coefficient_state,
+            )
 
             # Update targets
             critic_state = critic_state.replace(target_params=optax.incremental_update(critic_state.params, critic_state.target_params, self.tau))
@@ -620,8 +652,9 @@ class SAC_QSafe:
             mean,
             std,
             epsilon,
-            self.qsafe.state.params,
+            self.qsafe.state.params if self.qsafe_enabled else {},
             self.nu,
+            False,
             self.key,
         )
         jax.block_until_ready(warm_result[3])
@@ -636,6 +669,7 @@ class SAC_QSafe:
         safety_state = None
         global_step = 0
         nr_updates = 0
+        nr_actor_updates = 0
         nr_episodes = 0
         nr_failures = 0
         nr_safe_env_steps = 0
@@ -654,14 +688,18 @@ class SAC_QSafe:
         logging_time_prev = None
         
         while global_step < self.total_timesteps or (
-            self.phase == "pretrain" and pretrain_stage == "safe"
+            self.phase == "pretrain" and self.qsafe_enabled and pretrain_stage == "safe"
         ):
             start_time = time.time()
             if logging_time_prev:
                 time_metrics_collection.setdefault("time/logging_time_prev", []).append(logging_time_prev)
 
 
-            is_safety_step = self.phase == "pretrain" and pretrain_stage == "safe"
+            is_safety_step = (
+                self.phase == "pretrain"
+                and self.qsafe_enabled
+                and pretrain_stage == "safe"
+            )
             if is_safety_step and safety_state is None:
                 safety_state, _ = self.eval_env.reset()
             acting_state = safety_state if is_safety_step else state
@@ -763,12 +801,17 @@ class SAC_QSafe:
                 global_step += self.nr_envs
                 nr_episodes += dones_this_rollout
                 nr_failures += int(np.sum(failure))
-                safety_metrics_collection.setdefault("qsafe/task_failure_rate", []).append(
+                failure_metric = (
+                    "qsafe/task_failure_rate"
+                    if self.qsafe_enabled
+                    else "failures/task_rate"
+                )
+                safety_metrics_collection.setdefault(failure_metric, []).append(
                     float(np.mean(failure))
                 )
                 task_steps_this_iteration += 1
                 state = next_state
-                if self.phase == "pretrain" and (
+                if self.phase == "pretrain" and self.qsafe_enabled and (
                     task_steps_this_iteration >= self.n_off
                     or global_step >= self.total_timesteps
                 ):
@@ -813,6 +856,12 @@ class SAC_QSafe:
             # Optimizing - Q-functions, policy and entropy coefficient
             if should_optimize:
                 learner_start_time = time.perf_counter()
+                update_actor = actor_updates_enabled(
+                    self.phase,
+                    global_step,
+                    self.finetune_actor_warmup_steps,
+                    self.finetune_actor_update_interval,
+                )
                 mean, std, epsilon = self._normalizer_parameters()
                 self.policy_state, self.critic_state, self.entropy_coefficient_state, optimization_metrics, self.key = update(
                     self.policy_state,
@@ -826,8 +875,9 @@ class SAC_QSafe:
                     mean,
                     std,
                     epsilon,
-                    self.qsafe.state.params,
+                    self.qsafe.state.params if self.qsafe_enabled else {},
                     self.nu,
+                    update_actor,
                     self.key,
                 )
                 jax.block_until_ready(optimization_metrics)
@@ -848,7 +898,12 @@ class SAC_QSafe:
                                 self._learner_deadline_seconds,
                                 self._deadline_misses,
                             )
-                if self.finetune_constraints_enabled:
+                optimization_metrics["finetune/actor_frozen"] = float(
+                    not update_actor
+                )
+                if not self.qsafe_enabled:
+                    optimization_metrics.pop("qsafe/actor_value", None)
+                if self.finetune_constraints_enabled and update_actor:
                     safety_value = float(optimization_metrics["qsafe/actor_value"])
                     nu_before_update = jnp.asarray(self.nu, dtype=jnp.float32)
                     dual_gradient = jnp.asarray(
@@ -872,6 +927,7 @@ class SAC_QSafe:
                 for key, value in optimization_metrics.items():
                     optimization_metrics_collection.setdefault(key, []).append(value)
                 nr_updates += 1
+                nr_actor_updates += int(update_actor)
 
             if completed_safety_block and self.qsafe.ready_to_update():
                 def sample_unconstrained_action(next_states, action_key):
@@ -968,6 +1024,11 @@ class SAC_QSafe:
                 steps_metrics["steps/nr_safe_env_steps"] = nr_safe_env_steps
                 steps_metrics["steps/nr_safe_rollouts"] = nr_safe_rollouts
                 steps_metrics["steps/nr_updates"] = nr_updates
+                steps_metrics["steps/nr_critic_updates"] = nr_updates
+                steps_metrics["steps/nr_actor_updates"] = nr_actor_updates
+                steps_metrics["finetune/actor_update_interval"] = (
+                    self.finetune_actor_update_interval
+                )
                 steps_metrics["steps/nr_episodes"] = nr_episodes
                 steps_metrics["steps/nr_failures"] = nr_failures
                 steps_metrics["steps/nr_safe_failures"] = nr_safe_failures
@@ -1059,18 +1120,20 @@ class SAC_QSafe:
             "policy": self.policy_state,
             "critic": self.critic_state,
             "entropy_coefficient": self.entropy_coefficient_state,
-            "qsafe": self.qsafe.state,
             "nu": jnp.asarray(self.nu, dtype=jnp.float32),
             "dual_optimizer_state": self.dual_optimizer_state,
         }
+        if self.qsafe_enabled:
+            checkpoint["qsafe"] = self.qsafe.state
         payload = {
             "config_algorithm": self.config.algorithm.to_dict(),
             "checkpoint": serialization.to_state_dict(checkpoint),
-            "qsafe_metadata": self.qsafe.metadata(),
             "normalizer_state": normalizer_state,
             "normalizer_metadata": normalizer_metadata,
             "environment_manifest": environment_manifest,
         }
+        if self.qsafe_enabled:
+            payload["qsafe_metadata"] = self.qsafe.metadata()
         model_file_path = os.path.join(self.save_path, model_file_name)
         with open(model_file_path, "wb") as model_file:
             model_file.write(serialization.msgpack_serialize(payload))
@@ -1087,10 +1150,11 @@ class SAC_QSafe:
                     )
                 )
             )
-        self.qsafe.save(
-            f"{self.save_path}/qsafe.msgpack",
-            include_optimizer=self.phase == "pretrain",
-        )
+        if self.qsafe_enabled:
+            self.qsafe.save(
+                f"{self.save_path}/qsafe.msgpack",
+                include_optimizer=self.phase == "pretrain",
+            )
 
         if self.track_wandb:
             wandb.save(model_file_path, base_path=self.save_path)
@@ -1108,12 +1172,13 @@ class SAC_QSafe:
         model = SAC_QSafe(
             config, train_env, eval_env, run_path, writer, _defer_transfer_load=True
         )
-        if "qsafe_metadata" not in payload:
-            raise ValueError(
-                "The Flax SAC-QSafe checkpoint is missing QSafe metadata and "
-                "cannot be safely resumed."
-            )
-        model.qsafe._validate_metadata(payload["qsafe_metadata"])
+        if model.qsafe_enabled:
+            if "qsafe_metadata" not in payload:
+                raise ValueError(
+                    "The Flax SAC-QSafe checkpoint is missing QSafe metadata and "
+                    "cannot be safely resumed."
+                )
+            model.qsafe._validate_metadata(payload["qsafe_metadata"])
         transfer_fields = {
             "normalizer_state",
             "normalizer_metadata",
@@ -1148,16 +1213,18 @@ class SAC_QSafe:
             "policy": model.policy_state,
             "critic": model.critic_state,
             "entropy_coefficient": model.entropy_coefficient_state,
-            "qsafe": model.qsafe.state,
             "nu": jnp.asarray(model.nu, dtype=jnp.float32),
             "dual_optimizer_state": model.dual_optimizer_state,
         }
+        if model.qsafe_enabled:
+            target["qsafe"] = model.qsafe.state
         checkpoint = serialization.from_state_dict(target, payload["checkpoint"])
 
         model.policy_state = checkpoint["policy"]
         model.critic_state = checkpoint["critic"]
         model.entropy_coefficient_state = checkpoint["entropy_coefficient"]
-        model.qsafe.state = checkpoint["qsafe"]
+        if model.qsafe_enabled:
+            model.qsafe.state = checkpoint["qsafe"]
         if model.phase == "finetune":
             model.qsafe.freeze()
             model.observation_normalizer.freeze()

@@ -25,6 +25,14 @@ def get_config(algorithm_name):
     # Fine-tuning initializes the target-task entropy temperature from this
     # value; alpha is deliberately not part of the SQRL transfer bundle.
     config.alpha_init = 1.0
+    # Fine-tuning creates a new task critic.  Hold the transferred actor and
+    # entropy temperature fixed until that critic has target-task experience.
+    config.finetune_actor_warmup_steps = 10000
+    # A fresh target-task critic can be exploited by the transferred actor if
+    # both are updated 1:1 immediately after warm-up.  This target-stage-only
+    # interval lets the critic track policy distribution shift; pretraining is
+    # unchanged.  Experiments select the interval explicitly.
+    config.finetune_actor_update_interval = 1
     config.log_std_min = -20
     config.log_std_max = 2
     config.nr_hidden_units = 256
@@ -57,9 +65,8 @@ def get_config(algorithm_name):
     config.task_utd_ratio = 1.0
 
     config.qsafe = config_dict.ConfigDict()
-    # Experimental ablation only.  ``False`` keeps the transferred policy and
-    # SAC learner identical, but removes both QSafe action projection and the
-    # Eq. 4 actor/dual safety constraint during fine-tuning.
+    # ``False`` is the paper's standard-SAC baseline: no safety rollouts,
+    # safety critic, action projection, Eq. 4 term, or dual update.
     config.qsafe.enabled = True
     config.qsafe.checkpoint_path = ""
     config.qsafe.epsilon = 0.1

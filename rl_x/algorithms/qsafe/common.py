@@ -7,6 +7,27 @@ def finetune_constraints_enabled(phase, qsafe_enabled):
     return str(phase) == "finetune" and bool(qsafe_enabled)
 
 
+def actor_updates_enabled(
+    phase, global_step, warmup_steps, update_interval=1
+):
+    """Keep the transferred actor fixed while a fresh target-task critic warms up."""
+
+    warmup_steps = int(warmup_steps)
+    if warmup_steps < 0:
+        raise ValueError("algorithm.finetune_actor_warmup_steps must be non-negative.")
+    update_interval = int(update_interval)
+    if update_interval < 1:
+        raise ValueError(
+            "algorithm.finetune_actor_update_interval must be at least 1."
+        )
+    if str(phase) != "finetune":
+        return True
+    global_step = int(global_step)
+    return global_step >= warmup_steps and (
+        global_step - warmup_steps
+    ) % update_interval == 0
+
+
 class VectorTrajectoryAccumulator:
     """Stage vector-env transitions and emit complete per-env trajectories."""
 

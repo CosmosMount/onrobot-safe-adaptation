@@ -127,11 +127,27 @@ class MujocoResetController:
             # emitting the synthetic key so another terminal cannot consume it.
             x11.XRaiseWindow(display, window)
             x11.XSetInputFocus(display, window, 2, 0)
+            # Deliver FocusIn before the key event. If another app was focused,
+            # GLFW can otherwise receive press/release before it processes the
+            # focus transition and silently discard the reset shortcut.
+            x11.XSync(display, 0)
+            time.sleep(0.05)
             keycode = x11.XKeysymToKeycode(display, 0xFF08)
             if not keycode:
                 raise RuntimeError("X11 could not resolve the Backspace keycode.")
-            xtst.XTestFakeKeyEvent(display, keycode, 1, 0)
-            xtst.XTestFakeKeyEvent(display, keycode, 0, 0)
+            # Clear a stale synthetic-down state left by an interrupted sender.
+            # XTest otherwise emits release/press in an implementation-dependent
+            # order and GLFW may never observe a fresh press transition.
+            if not xtst.XTestFakeKeyEvent(display, keycode, 0, 0):
+                raise RuntimeError("X11 failed to clear the Backspace key state.")
+            x11.XSync(display, 0)
+            time.sleep(0.02)
+            if not xtst.XTestFakeKeyEvent(display, keycode, 1, 0):
+                raise RuntimeError("X11 failed to send the Backspace key press.")
+            x11.XSync(display, 0)
+            time.sleep(0.02)
+            if not xtst.XTestFakeKeyEvent(display, keycode, 0, 0):
+                raise RuntimeError("X11 failed to send the Backspace key release.")
             x11.XSync(display, 0)
         finally:
             x11.XCloseDisplay(display)

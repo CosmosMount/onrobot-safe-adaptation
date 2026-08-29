@@ -400,6 +400,68 @@ def test_finetune_auto_resets_on_start_and_one_second_after_fall(monkeypatch):
     assert sleeps == [pytest.approx(1.0)]
 
 
+def test_automatic_reset_retries_a_dropped_x11_key():
+    class RetryClient:
+        def __init__(self):
+            self.state_buffer = StateBuffer(restart_threshold_ticks=1)
+            self.state_buffer.push(
+                RobotState(
+                    DEFAULT_JOINT_POSITION.copy(),
+                    np.zeros(12, dtype=np.float32),
+                    np.zeros(3, dtype=np.float32),
+                    np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    np.asarray([0.0, 0.0, 9.81], dtype=np.float32),
+                    tick=1000,
+                )
+            )
+
+        def start(self):
+            pass
+
+        def publish_joint_target(self, target):
+            del target
+
+        def latest_training_state(self):
+            return None
+
+    class DroppedFirstReset:
+        def __init__(self, client):
+            self.client = client
+            self.count = 0
+
+        def reset(self):
+            self.count += 1
+            if self.count == 2:
+                self.client.state_buffer.push(
+                    RobotState(
+                        DEFAULT_JOINT_POSITION.copy(),
+                        np.zeros(12, dtype=np.float32),
+                        np.zeros(3, dtype=np.float32),
+                        np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                        np.asarray([0.0, 0.0, 9.81], dtype=np.float32),
+                        tick=0,
+                    )
+                )
+
+    client = RetryClient()
+    controller = DroppedFirstReset(client)
+    config = ConfigDict()
+    config.environment = get_config("go2_sqrl.sdk2_mujoco")
+    config.environment.auto_reset_timeout_seconds = 0.001
+    config.environment.auto_reset_attempts = 2
+    environment = Go2SDKMujocoEnv(
+        config,
+        client=client,
+        role="train",
+        reset_controller=controller,
+    )
+
+    environment._auto_reset_simulator("Test reset.")
+
+    assert controller.count == 2
+    assert environment._generation == 1
+
+
 def test_auto_reset_arms_home_before_reset_and_skips_crouch_trajectory():
     events = []
 

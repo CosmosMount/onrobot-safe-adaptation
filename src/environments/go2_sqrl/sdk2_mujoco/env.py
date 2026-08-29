@@ -233,20 +233,33 @@ class Go2SDKMujocoEnv:
         else:
             self.client.publish_joint_target(DEFAULT_JOINT_POSITION)
 
-        generation = self.client.state_buffer.generation
-        self.client.state_buffer.arm_restart()
-        self.reset_controller.reset()
-        try:
-            self._generation = self.client.state_buffer.wait_for_restart(
-                generation,
-                timeout=float(self.config.auto_reset_timeout_seconds),
-            )
-        except StateTimeout as exc:
-            self.client.state_buffer.cancel_restart()
+        attempts = max(1, int(self.config.auto_reset_attempts))
+        last_timeout = None
+        for attempt in range(1, attempts + 1):
+            generation = self.client.state_buffer.generation
+            self.client.state_buffer.arm_restart()
+            self.reset_controller.reset()
+            try:
+                self._generation = self.client.state_buffer.wait_for_restart(
+                    generation,
+                    timeout=float(self.config.auto_reset_timeout_seconds),
+                )
+                break
+            except StateTimeout as exc:
+                last_timeout = exc
+                self.client.state_buffer.cancel_restart()
+                if attempt < attempts:
+                    logger.warning(
+                        "MuJoCo automatic reset attempt %d/%d produced no tick "
+                        "restart; retrying.",
+                        attempt,
+                        attempts,
+                    )
+        else:
             raise RuntimeError(
-                "MuJoCo received the automatic reset key, but no simulator "
-                "tick restart was observed."
-            ) from exc
+                f"MuJoCo received {attempts} automatic reset key attempts, but "
+                "no simulator tick restart was observed."
+            ) from last_timeout
         self._last_tick = None
         self.fall_detector.reset()
 

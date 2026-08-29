@@ -58,7 +58,7 @@ class QSafe:
         ).to(device)
         self.target.load_state_dict(self.online.state_dict())
         self.optimizer = None
-        if self.phase == "pretrain":
+        if self.phase == "pretrain" and bool(config.algorithm.qsafe.enabled):
             self.optimizer = torch.optim.Adam(
                 self.online.parameters(), lr=float(self.config.learning_rate)
             )
@@ -74,7 +74,11 @@ class QSafe:
             config.environment.nr_envs
         )
         self.frozen = self.phase == "finetune"
-        if self.phase == "finetune" and not defer_checkpoint_load:
+        if (
+            self.phase == "finetune"
+            and bool(config.algorithm.qsafe.enabled)
+            and not defer_checkpoint_load
+        ):
             checkpoint_path = str(self.config.checkpoint_path)
             if not checkpoint_path:
                 raise ValueError("algorithm.qsafe.checkpoint_path is required for finetune.")

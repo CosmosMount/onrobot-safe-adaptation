@@ -61,6 +61,7 @@ class SAC_QSafe:
         self.buffer_size = config.algorithm.buffer_size
         if (
             config.algorithm.phase == "pretrain"
+            and bool(config.algorithm.qsafe.enabled)
             and int(config.algorithm.qsafe.buffer_size) >= int(self.buffer_size)
         ):
             raise ValueError(
@@ -80,8 +81,6 @@ class SAC_QSafe:
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
         self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
-        if self.phase == "pretrain" and not self.qsafe_enabled:
-            raise ValueError("QSafe cannot be disabled during SQRL pre-training.")
         self.finetune_constraints_enabled = finetune_constraints_enabled(
             self.phase, self.qsafe_enabled
         )
@@ -89,7 +88,7 @@ class SAC_QSafe:
         self.n_safe = int(config.algorithm.n_safe)
         if self.n_off < 1:
             raise ValueError("algorithm.n_off must be at least 1.")
-        if self.phase == "pretrain" and self.n_safe < 1:
+        if self.phase == "pretrain" and self.qsafe_enabled and self.n_safe < 1:
             raise ValueError("algorithm.n_safe must be at least 1 during pretraining.")
         self.qsafe_updates_per_iteration = int(
             config.algorithm.qsafe.updates_per_iteration
@@ -134,13 +133,17 @@ class SAC_QSafe:
         self.policy = get_policy(config, self.train_env, self.device)
         self.critic = get_critic(config, self.train_env, self.device)
         self.entropy_coefficient = get_entropy_coefficient(config, self.train_env, self.device)
-        self.qsafe = QSafe(
-            config,
-            self.train_env,
-            self.device,
-            self.rng,
-            self.phase,
-            defer_checkpoint_load=_defer_transfer_load,
+        self.qsafe = (
+            QSafe(
+                config,
+                self.train_env,
+                self.device,
+                self.rng,
+                self.phase,
+                defer_checkpoint_load=_defer_transfer_load,
+            )
+            if self.qsafe_enabled
+            else None
         )
 
         if self.phase == "finetune" and not _defer_transfer_load:
@@ -172,8 +175,9 @@ class SAC_QSafe:
                 )
             )
             rlx_logger.info(
-                "SQRL transfer loaded actor, observation normalizer, and frozen "
-                "QSafe only; task critics, targets, entropy temperature, replay, "
+                "Transfer loaded actor and observation normalizer"
+                + (", plus frozen QSafe" if self.qsafe_enabled else "")
+                + "; task critics, targets, entropy temperature, replay, "
                 "optimizers, and nu start fresh"
             )
 
@@ -481,7 +485,7 @@ class SAC_QSafe:
         logging_time_prev = None
         
         while global_step < self.total_timesteps or (
-            self.phase == "pretrain" and pretrain_stage == "safe"
+            self.phase == "pretrain" and self.qsafe_enabled and pretrain_stage == "safe"
         ):
             start_time = time.time()
             torch.compiler.cudagraph_mark_step_begin()
@@ -491,7 +495,11 @@ class SAC_QSafe:
 
             # Algorithm 1 alternates n_off unconstrained task steps with n_safe
             # complete on-policy rollouts from the QSafe-projected policy.
-            is_safety_step = self.phase == "pretrain" and pretrain_stage == "safe"
+            is_safety_step = (
+                self.phase == "pretrain"
+                and self.qsafe_enabled
+                and pretrain_stage == "safe"
+            )
             if is_safety_step and safety_state is None:
                 safety_state, _ = self.eval_env.reset()
             acting_state = safety_state if is_safety_step else state
@@ -605,7 +613,7 @@ class SAC_QSafe:
                 )
                 task_steps_this_iteration += 1
                 state = next_state
-                if self.phase == "pretrain" and (
+                if self.phase == "pretrain" and self.qsafe_enabled and (
                     task_steps_this_iteration >= self.n_off
                     or global_step >= self.total_timesteps
                 ):
@@ -951,6 +959,10 @@ class SAC_QSafe:
             )
         nr_task_envs = int(self.train_env.nr_task_envs)
         nr_safety_envs = int(self.train_env.nr_safety_envs)
+        if self.qsafe_enabled and nr_safety_envs < 1:
+            raise ValueError("SQRL partitioned pretraining requires safety environments")
+        if not self.qsafe_enabled and nr_safety_envs != 0:
+            raise ValueError("Standard SAC pretraining requires nr_safety_envs=0")
         task_state, safety_state = self.train_env.reset_partitions()
         task_replay = ReplayBuffer(
             int(self.buffer_size),
@@ -974,8 +986,10 @@ class SAC_QSafe:
         previous_log_task_updates = 0
         previous_log_qsafe_updates = 0
         task_update_budget = TransitionUpdateBudget(self.task_utd_ratio)
-        qsafe_update_budget = AtomicTrajectoryUpdateBudget(
-            self.qsafe_updates_per_iteration
+        qsafe_update_budget = (
+            AtomicTrajectoryUpdateBudget(self.qsafe_updates_per_iteration)
+            if self.qsafe_enabled
+            else None
         )
         interval_metric_sums = {}
         interval_metric_counts = {}
@@ -1015,9 +1029,17 @@ class SAC_QSafe:
                 task_action, task_processed = preserve_policy_outputs(
                     task_action, task_processed
                 )
-                safety_action, safety_processed, projection_metrics = (
-                    self._sample_policy_candidates(safety_state, phase="pretrain")
-                )
+                if self.qsafe_enabled:
+                    safety_action, safety_processed, projection_metrics = (
+                        self._sample_policy_candidates(safety_state, phase="pretrain")
+                    )
+                else:
+                    action_shape = tuple(self.train_env.single_action_space.shape)
+                    safety_action = torch.empty(
+                        (0,) + action_shape, dtype=torch.float32, device=self.device
+                    )
+                    safety_processed = safety_action
+                    projection_metrics = {}
             task_action = task_action.cpu().numpy()
             safety_action = safety_action.cpu().numpy()
             try:
@@ -1065,16 +1087,18 @@ class SAC_QSafe:
                 task_step.reward,
                 task_step.terminated,
             )
-            completed = safety_trajectories.add_step(
-                safety_state,
-                safety_next,
-                safety_applied,
-                safety_failure,
-                safety_step.terminated,
-                safety_step.truncated,
-            )
-            for trajectory in completed:
-                self.qsafe.add_trajectory(trajectory)
+            completed = []
+            if self.qsafe_enabled:
+                completed = safety_trajectories.add_step(
+                    safety_state,
+                    safety_next,
+                    safety_applied,
+                    safety_failure,
+                    safety_step.terminated,
+                    safety_step.truncated,
+                )
+                for trajectory in completed:
+                    self.qsafe.add_trajectory(trajectory)
 
             previous_global_step = global_step
             global_step += nr_task_envs
@@ -1087,15 +1111,20 @@ class SAC_QSafe:
             record_interval_metrics(
                 {
                     "rollout/task_step_reward": np.mean(task_step.reward),
-                    "rollout/safety_step_reward": np.mean(safety_step.reward),
                     "failures/task_rate": np.mean(task_failure),
-                    "failures/safety_rate": np.mean(safety_failure),
                 }
             )
-            for pool_name, rollout_step in (
-                ("task", task_step),
-                ("safety", safety_step),
-            ):
+            if self.qsafe_enabled:
+                record_interval_metrics(
+                    {
+                        "rollout/safety_step_reward": np.mean(safety_step.reward),
+                        "failures/safety_rate": np.mean(safety_failure),
+                    }
+                )
+            rollout_pools = [("task", task_step)]
+            if self.qsafe_enabled:
+                rollout_pools.append(("safety", safety_step))
+            for pool_name, rollout_step in rollout_pools:
                 for metric_name, values in self.train_env.get_logging_info_dict(
                     rollout_step.info
                 ).items():
@@ -1137,7 +1166,8 @@ class SAC_QSafe:
             )
             eligible_after = max(0, global_step - int(self.learning_starts))
             task_update_budget.add_transitions(eligible_after - eligible_before)
-            qsafe_update_budget.add_completed(completed)
+            if self.qsafe_enabled:
+                qsafe_update_budget.add_completed(completed)
             task_state = task_step.observation
             safety_state = safety_step.observation
 
@@ -1146,7 +1176,7 @@ class SAC_QSafe:
                     task_metrics = self._partitioned_task_update(task_replay)
                     record_interval_metrics(task_metrics)
 
-            if self.qsafe.ready_to_update():
+            if self.qsafe_enabled and self.qsafe.ready_to_update():
                 def sample_unconstrained_action(normalized_states):
                     with torch.no_grad():
                         return self.policy.get_action(normalized_states)[0]
@@ -1177,9 +1207,12 @@ class SAC_QSafe:
                 self.log(
                     "steps/nr_task_updates", task_update_budget.updates, global_step
                 )
-                self.log(
-                    "steps/nr_qsafe_updates", qsafe_update_budget.updates, global_step
-                )
+                if self.qsafe_enabled:
+                    self.log(
+                        "steps/nr_qsafe_updates",
+                        qsafe_update_budget.updates,
+                        global_step,
+                    )
                 self.log(
                     "episodes/nr_task_completed", task_episode_count, global_step
                 )
@@ -1197,39 +1230,46 @@ class SAC_QSafe:
                     task_replay.size * nr_task_envs,
                     global_step,
                 )
-                self.log(
-                    "replay/qsafe_transitions",
-                    self.qsafe.replay_buffer.nr_transitions,
-                    global_step,
-                )
-                self.log(
-                    "replay/qsafe_trajectories",
-                    self.qsafe.replay_buffer.nr_trajectories,
-                    global_step,
-                )
-                self.log(
-                    "replay/qsafe_committed_transitions",
-                    qsafe_update_budget.transitions,
-                    global_step,
-                )
+                if self.qsafe_enabled:
+                    self.log(
+                        "replay/qsafe_transitions",
+                        self.qsafe.replay_buffer.nr_transitions,
+                        global_step,
+                    )
+                    self.log(
+                        "replay/qsafe_trajectories",
+                        self.qsafe.replay_buffer.nr_trajectories,
+                        global_step,
+                    )
+                if self.qsafe_enabled:
+                    self.log(
+                        "replay/qsafe_committed_transitions",
+                        qsafe_update_budget.transitions,
+                        global_step,
+                    )
                 self.log("utd/task_configured", self.task_utd_ratio, global_step)
-                self.log(
-                    "utd/qsafe_updates_per_trajectory_configured",
-                    self.qsafe_updates_per_iteration,
-                    global_step,
-                )
+                if self.qsafe_enabled:
+                    self.log(
+                        "utd/qsafe_updates_per_trajectory_configured",
+                        self.qsafe_updates_per_iteration,
+                        global_step,
+                    )
                 self.log(
                     "utd/task_effective",
                     task_update_budget.effective_ratio,
                     global_step,
                 )
-                self.log(
-                    "utd/qsafe_updates_per_trajectory_effective",
-                    qsafe_update_budget.effective_ratio,
-                    global_step,
-                )
+                if self.qsafe_enabled:
+                    self.log(
+                        "utd/qsafe_updates_per_trajectory_effective",
+                        qsafe_update_budget.effective_ratio,
+                        global_step,
+                    )
                 self.log("utd/task_credit", task_update_budget.credit, global_step)
-                self.log("utd/qsafe_credit", qsafe_update_budget.credit, global_step)
+                if self.qsafe_enabled:
+                    self.log(
+                        "utd/qsafe_credit", qsafe_update_budget.credit, global_step
+                    )
                 self.log(
                     "time/task_transitions_per_second",
                     (global_step - previous_log_step) / interval_seconds,
@@ -1241,12 +1281,13 @@ class SAC_QSafe:
                     / interval_seconds,
                     global_step,
                 )
-                self.log(
-                    "time/qsafe_updates_per_second",
-                    (qsafe_update_budget.updates - previous_log_qsafe_updates)
-                    / interval_seconds,
-                    global_step,
-                )
+                if self.qsafe_enabled:
+                    self.log(
+                        "time/qsafe_updates_per_second",
+                        (qsafe_update_budget.updates - previous_log_qsafe_updates)
+                        / interval_seconds,
+                        global_step,
+                    )
                 self.log(
                     "time/elapsed_seconds", now - training_start_time, global_step
                 )
@@ -1261,7 +1302,8 @@ class SAC_QSafe:
                 interval_start_time = now
                 previous_log_step = global_step
                 previous_log_task_updates = task_update_budget.updates
-                previous_log_qsafe_updates = qsafe_update_budget.updates
+                if self.qsafe_enabled:
+                    previous_log_qsafe_updates = qsafe_update_budget.updates
                 while next_log_step <= global_step:
                     next_log_step += logging_frequency
             if (
@@ -1325,9 +1367,6 @@ class SAC_QSafe:
             "policy_optimizer_state_dict": self.policy_optimizer.state_dict(),
             "q_optimizer_state_dict": self.q_optimizer.state_dict(),
             "entropy_optimizer_state_dict": self.entropy_optimizer.state_dict(),
-            "qsafe_state_dict": self.qsafe.state_dict(
-                include_optimizer=self.phase == "pretrain"
-            ),
             "observation_normalizer_state_dict": self.observation_normalizer.state_dict(),
             "observation_normalizer_metadata": self.observation_normalizer.metadata(),
             "environment_manifest": environment_manifest,
@@ -1335,6 +1374,10 @@ class SAC_QSafe:
         }
         if self.dual_optimizer is not None:
             save_dict["dual_optimizer_state_dict"] = self.dual_optimizer.state_dict()
+        if self.qsafe_enabled:
+            save_dict["qsafe_state_dict"] = self.qsafe.state_dict(
+                include_optimizer=self.phase == "pretrain"
+            )
         torch.save(save_dict, file_path)
         torch.save(
             {
@@ -1345,10 +1388,11 @@ class SAC_QSafe:
             },
             self.save_path + "/policy.model",
         )
-        self.qsafe.save(
-            self.save_path + "/qsafe.model",
-            include_optimizer=self.phase == "pretrain",
-        )
+        if self.qsafe_enabled:
+            self.qsafe.save(
+                self.save_path + "/qsafe.model",
+                include_optimizer=self.phase == "pretrain",
+            )
         if self.track_wandb:
             wandb.save(file_path, base_path=os.path.dirname(file_path))
     
@@ -1397,9 +1441,12 @@ class SAC_QSafe:
                 checkpoint["environment_manifest"],
                 model.observation_normalizer.metadata(),
             )
-        model.qsafe.load_state_dict(
-            checkpoint["qsafe_state_dict"], load_optimizer=model.phase == "pretrain"
-        )
+        if model.qsafe_enabled:
+            if "qsafe_state_dict" not in checkpoint:
+                raise ValueError("QSafe-enabled checkpoint is missing qsafe_state_dict")
+            model.qsafe.load_state_dict(
+                checkpoint["qsafe_state_dict"], load_optimizer=model.phase == "pretrain"
+            )
         if model.phase == "finetune":
             model.qsafe.freeze()
             model.observation_normalizer.freeze()
@@ -1520,7 +1567,7 @@ class SAC_QSafe:
         self.critic.q2_target.train()
         if self.phase == "pretrain" and not self.observation_normalizer.frozen:
             self.observation_normalizer.train()
-        if not self.qsafe.frozen:
+        if self.qsafe_enabled and not self.qsafe.frozen:
             self.qsafe.online.train()
             self.qsafe.target.train()
 
@@ -1532,8 +1579,9 @@ class SAC_QSafe:
         self.critic.q1_target.eval()
         self.critic.q2_target.eval()
         self.observation_normalizer.eval()
-        self.qsafe.online.eval()
-        self.qsafe.target.eval()
+        if self.qsafe_enabled:
+            self.qsafe.online.eval()
+            self.qsafe.target.eval()
 
     
     def general_properties():

@@ -54,6 +54,10 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
             PROJECT_ROOT
             / "runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models"
         )
+    elif checkpoint is None and command == "finetune-sac":
+        checkpoint_path = (
+            PROJECT_ROOT / "runs/go2_sqrl/pretrain/isaac_sac_height_dr_v1/models"
+        )
     elif checkpoint is None and command == "isaac-eval":
         checkpoint_path = (
             PROJECT_ROOT
@@ -66,7 +70,7 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     else:
         checkpoint_path = Path(checkpoint).expanduser().resolve()
 
-    if command in ("pretrain", "isaac-eval", "eval"):
+    if command in ("pretrain", "pretrain-sac", "isaac-eval", "eval"):
         if checkpoint_path.is_dir():
             preferred = checkpoint_path / "final.model"
             if not preferred.exists():
@@ -87,19 +91,22 @@ def _artifact_flags(command: str, checkpoint: str | None) -> list[str]:
     directory = checkpoint_path
     policy = directory / "policy.model"
     qsafe = directory / "qsafe.model"
-    if not policy.exists() or not qsafe.exists():
+    needs_qsafe = command != "finetune-sac"
+    if not policy.exists() or (needs_qsafe and not qsafe.exists()):
         raise FileNotFoundError(
-            "Fine-tune/zero-shot requires policy.model and qsafe.model in "
+            "Transfer requires policy.model"
+            + (" and qsafe.model" if needs_qsafe else "")
+            + " in "
             f"{directory}. Pass --checkpoint <models-directory>."
         )
-    return [
-        f"--algorithm.pretrained_policy_path={policy}",
-        f"--algorithm.qsafe.checkpoint_path={qsafe}",
-    ]
+    flags = [f"--algorithm.pretrained_policy_path={policy}"]
+    if needs_qsafe:
+        flags.append(f"--algorithm.qsafe.checkpoint_path={qsafe}")
+    return flags
 
 
 def _run_rlx(args, remaining: list[str]) -> int:
-    if args.command in ("zero-shot", "finetune", "eval"):
+    if args.command in ("zero-shot", "finetune", "finetune-sac", "eval"):
         # This must be set before importing JAX. The SDK environment has a host
         # replay/transport boundary and should not reserve nearly all GPU memory
         # merely to probe whether the runtime is available.
@@ -115,7 +122,7 @@ def _run_rlx(args, remaining: list[str]) -> int:
             ) from exc
     flags = list(RUN_PRESETS[args.command])
     flags.append(f"--environment.seed={args.seed}")
-    if args.command in ("zero-shot", "finetune", "eval"):
+    if args.command in ("zero-shot", "finetune", "finetune-sac", "eval"):
         flags.extend(
             (
                 f"--environment.domain_id={args.domain_id}",
@@ -142,9 +149,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "sim",
             "pretrain",
+            "pretrain-sac",
             "isaac-eval",
             "zero-shot",
             "finetune",
+            "finetune-sac",
             "eval",
         ),
     )

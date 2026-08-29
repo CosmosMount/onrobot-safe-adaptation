@@ -11,14 +11,17 @@ from src.environments.go2_sqrl.common.specs import (
     PHYSICS_DT,
 )
 from src.run import _artifact_flags
-from rl_x.algorithms.qsafe.common import finetune_constraints_enabled
+from rl_x.algorithms.qsafe.common import (
+    actor_updates_enabled,
+    finetune_constraints_enabled,
+)
 from rl_x.algorithms.sac_qsafe.pytorch.default_config import get_config
 
 
 def test_framework_is_selected_by_training_backend():
-    for command in ("pretrain", "isaac-eval"):
+    for command in ("pretrain", "pretrain-sac", "isaac-eval"):
         assert "--algorithm.name=sac_qsafe.pytorch" in RUN_PRESETS[command]
-    for command in ("zero-shot", "finetune", "eval"):
+    for command in ("zero-shot", "finetune", "finetune-sac", "eval"):
         assert "--algorithm.name=sac_qsafe.flax" in RUN_PRESETS[command]
 
 
@@ -47,6 +50,21 @@ def test_pretrain_parity_checkpoint_uses_flat_ground():
         "--runner.run_name=isaac_sqrl_height_dr_v1"
         in RUN_PRESETS["pretrain"]
     )
+
+
+def test_standard_sac_baseline_has_no_safety_partition_or_qsafe():
+    pretrain = RUN_PRESETS["pretrain-sac"]
+    assert "--environment.nr_envs=256" in pretrain
+    assert "--environment.nr_task_envs=256" in pretrain
+    assert "--environment.nr_safety_envs=0" in pretrain
+    assert "--algorithm.qsafe.enabled=false" in pretrain
+    assert "--algorithm.eval_policy=task" in pretrain
+
+    finetune = RUN_PRESETS["finetune-sac"]
+    assert "--algorithm.qsafe.enabled=false" in finetune
+    assert "--algorithm.eval_policy=task" in finetune
+    assert "--environment.target_velocity_x=0.6" in finetune
+    assert "--environment.target_velocity_x=0.6" in RUN_PRESETS["finetune"]
 
 
 def test_isaac_eval_is_single_environment_deterministic_task_policy():
@@ -134,10 +152,34 @@ def test_transfer_commands_use_torch_pretrain_sidecars(tmp_path: Path):
     ]
 
 
+def test_standard_sac_transfer_only_requires_policy(tmp_path: Path):
+    (tmp_path / "policy.model").touch()
+    assert _artifact_flags("finetune-sac", str(tmp_path)) == [
+        f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}"
+    ]
+
+
 def test_qsafe_ablation_uses_one_gate_for_action_masking_and_eq4():
     assert finetune_constraints_enabled("finetune", True) is True
     assert finetune_constraints_enabled("finetune", False) is False
     assert finetune_constraints_enabled("pretrain", True) is False
+
+
+def test_finetune_actor_waits_for_fresh_task_critic_warmup():
+    assert actor_updates_enabled("finetune", 9999, 10000) is False
+    assert actor_updates_enabled("finetune", 10000, 10000) is True
+    assert actor_updates_enabled("pretrain", 0, 10000) is True
+    with pytest.raises(ValueError, match="non-negative"):
+        actor_updates_enabled("finetune", 0, -1)
+
+
+def test_finetune_actor_update_interval_keeps_critic_ahead():
+    assert actor_updates_enabled("finetune", 10000, 10000, 10) is True
+    assert actor_updates_enabled("finetune", 10001, 10000, 10) is False
+    assert actor_updates_enabled("finetune", 10010, 10000, 10) is True
+    assert actor_updates_enabled("pretrain", 1, 10000, 10) is True
+    with pytest.raises(ValueError, match="at least 1"):
+        actor_updates_enabled("finetune", 10000, 10000, 0)
 
 
 def test_eval_rejects_a_missing_flax_checkpoint(tmp_path: Path):

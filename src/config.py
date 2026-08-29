@@ -71,6 +71,23 @@ RUN_PRESETS = {
         "--algorithm.phase=pretrain",
         "--algorithm.rollout_mode=partitioned",
     ),
+    "pretrain-sac": TORCH_PRETRAIN_FLAGS
+    + (
+        "--runner.mode=train",
+        "--runner.exp_name=pretrain",
+        "--runner.run_name=isaac_sac_height_dr_v1",
+        "--runner.save_model=true",
+        "--environment.name=go2_sqrl.isaac_lab",
+        "--environment.nr_envs=256",
+        "--environment.nr_task_envs=256",
+        "--environment.nr_safety_envs=0",
+        "--environment.terrain_mode=flat",
+        "--environment.domain_randomization=true",
+        "--algorithm.phase=pretrain",
+        "--algorithm.rollout_mode=partitioned",
+        "--algorithm.qsafe.enabled=false",
+        "--algorithm.eval_policy=task",
+    ),
     "isaac-eval": TORCH_PRETRAIN_FLAGS
     + (
         "--runner.mode=test",
@@ -103,7 +120,20 @@ RUN_PRESETS = {
         "--runner.run_name=mujoco",
         "--runner.save_model=true",
         "--environment.name=go2_sqrl.sdk2_mujoco",
+        "--environment.target_velocity_x=0.6",
         "--algorithm.phase=finetune",
+    ),
+    "finetune-sac": JAX_ONLINE_FLAGS
+    + (
+        "--runner.mode=train",
+        "--runner.exp_name=finetune",
+        "--runner.run_name=mujoco_sac",
+        "--runner.save_model=true",
+        "--environment.name=go2_sqrl.sdk2_mujoco",
+        "--environment.target_velocity_x=0.6",
+        "--algorithm.phase=finetune",
+        "--algorithm.qsafe.enabled=false",
+        "--algorithm.eval_policy=task",
     ),
     "eval": JAX_ONLINE_FLAGS
     + (

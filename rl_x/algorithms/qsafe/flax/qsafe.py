@@ -74,7 +74,7 @@ class QSafe:
         target_params = jax.tree.map(lambda value: value.copy(), params)
         qsafe_optimizer = (
             optax.adam(float(self.config.learning_rate))
-            if self.phase == "pretrain"
+            if self.phase == "pretrain" and bool(config.algorithm.qsafe.enabled)
             else optax.set_to_zero()
         )
         self.state = QSafeTrainState.create(
@@ -112,7 +112,11 @@ class QSafe:
             config.environment.nr_envs
         )
         self.frozen = self.phase == "finetune"
-        if self.phase == "finetune" and not defer_checkpoint_load:
+        if (
+            self.phase == "finetune"
+            and bool(config.algorithm.qsafe.enabled)
+            and not defer_checkpoint_load
+        ):
             checkpoint_path = str(self.config.checkpoint_path)
             if not checkpoint_path:
                 raise ValueError("algorithm.qsafe.checkpoint_path is required for finetune.")
