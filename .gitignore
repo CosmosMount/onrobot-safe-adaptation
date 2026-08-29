@@ -1,8 +1,0 @@
-.pytest_cache/
-_tests/
-tests/
-__pycache__/
-*.egg-info/
-runs/
-*.sock
-*.log

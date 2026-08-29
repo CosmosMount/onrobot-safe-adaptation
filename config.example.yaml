@@ -1,0 +1,20 @@
+experiment:
+  algorithm: sac
+  environment: go2
+  mode: train
+
+runner:
+  track_console: true
+  track_wandb: true
+  project_name: go2_rl
+  exp_name: sac_baseline
+
+algorithm:
+  device: gpu
+  learning_rate: 0.0003
+  batch_size: 256
+
+environment:
+  device: gpu
+  nr_envs: 4096
+  render: false
