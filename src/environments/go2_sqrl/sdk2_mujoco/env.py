@@ -16,10 +16,16 @@ from ..common.estimation.velocity import (
     quaternion_rotation_matrix_wxyz,
     velocity_estimator_config_from,
 )
+from ..common.estimation.kinematics import foot_position_velocity_body
 from ..common.observation import ObservationBuilder
-from ..common.reward import compute_reward
-from ..common.reward import BASE_HEIGHT_TARGET
+from ..common.reward import (
+    BASE_HEIGHT_TARGET,
+    compute_reward,
+    local_base_clearance,
+    swing_foot_clearance_error,
+)
 from ..common.specs import (
+    ACTION_SPEC,
     ACTION_SIZE,
     CONTROL_DT,
     DEFAULT_JOINT_POSITION,
@@ -103,7 +109,7 @@ class Go2SDKMujocoEnv:
         self.fall_detector = FallDetector(
             environment.fall_angle_threshold,
             environment.fall_consecutive_frames,
-            environment.fall_min_base_height,
+            environment.fall_min_base_clearance,
         )
         self.episode = EpisodeTracker(environment.episode_steps)
         self._last_tick: int | None = None
@@ -438,11 +444,44 @@ class Go2SDKMujocoEnv:
             world_velocity = np.asarray(truth.world_velocity)
         rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
         reward_body_velocity = rotation.T @ np.asarray(world_velocity)
-        base_height = BASE_HEIGHT_TARGET
+        base_clearance = BASE_HEIGHT_TARGET
+        foot_clearance_error = 0.0
+        foot_clearance = np.full(4, np.nan, dtype=np.float64)
         if truth is not None and truth.base_position is not None:
-            base_height = float(np.asarray(truth.base_position)[2])
-            height_failure = self.fall_detector.update_base_height(base_height)
+            # The canonical SDK2 MuJoCo scene has a zero-height ground plane,
+            # so world z is exactly the local terrain clearance.
+            base_clearance = float(
+                local_base_clearance(np.asarray(truth.base_position)[2], 0.0)
+            )
+            height_failure = self.fall_detector.update_base_clearance(
+                base_clearance
+            )
             failure = height_failure or failure
+            foot_position_body, joint_foot_velocity_body = (
+                foot_position_velocity_body(
+                    final_state.joint_q, final_state.joint_dq
+                )
+            )
+            relative_foot_velocity_body = (
+                joint_foot_velocity_body
+                + np.cross(
+                    np.asarray(final_state.imu_gyro, dtype=np.float64)[None, :],
+                    foot_position_body,
+                )
+            )
+            foot_position_world = (
+                np.asarray(truth.base_position, dtype=np.float64)[None, :]
+                + (rotation @ foot_position_body.T).T
+            )
+            foot_velocity_world = (
+                np.asarray(world_velocity, dtype=np.float64)[None, :]
+                + (rotation @ relative_foot_velocity_body.T).T
+            )
+            foot_clearance = foot_position_world[:, 2]
+            foot_clearance_error = swing_foot_clearance_error(
+                foot_clearance,
+                np.linalg.norm(foot_velocity_world[:, :2], axis=-1),
+            )
         else:
             height_failure = False
         terms = compute_reward(
@@ -453,10 +492,19 @@ class Go2SDKMujocoEnv:
             reward_action,
             self._previous_reward_action,
             float(self.config.target_velocity_x),
-            base_height=base_height,
+            base_clearance=base_clearance,
+            foot_clearance_error=foot_clearance_error,
         )
         self._previous_reward_action = reward_action.copy()
         terminated, truncated = self.episode.advance(terms.total, failure)
+        torque_saturation_ratio = np.nan
+        if truth is not None and truth.actuator_torque is not None:
+            torque_saturation_ratio = float(
+                np.mean(
+                    np.abs(np.asarray(truth.actuator_torque))
+                    > 0.95 * ACTION_SPEC.effort_limit
+                )
+            )
         estimator = self.observation_builder.velocity_estimator
         innovation_squared = getattr(estimator, "last_innovation_squared", None)
         support_confidence = getattr(estimator, "last_support_confidence", None)
@@ -468,6 +516,20 @@ class Go2SDKMujocoEnv:
             "failure/height": np.asarray([int(height_failure)], dtype=np.float32),
             "applied_action": mapped.applied_action[None, :],
             "policy_blend_alpha": np.asarray([alpha], dtype=np.float32),
+            "mean_foot_clearance": np.asarray(
+                [np.nan if np.isnan(foot_clearance).all() else np.nanmean(foot_clearance)],
+                dtype=np.float32,
+            ),
+            "max_foot_clearance": np.asarray(
+                [np.nan if np.isnan(foot_clearance).all() else np.nanmax(foot_clearance)],
+                dtype=np.float32,
+            ),
+            "action_saturation_ratio": np.asarray(
+                [np.mean(np.abs(reward_action) > 0.98)], dtype=np.float32
+            ),
+            "torque_saturation_ratio": np.asarray(
+                [torque_saturation_ratio], dtype=np.float32
+            ),
             "estimated_forward_velocity": np.asarray(
                 [estimated_body_velocity[0]], dtype=np.float32
             ),
@@ -578,7 +640,7 @@ class Go2SDKMujocoEnv:
         return build_manifest(
             normalizer,
             fall_angle_threshold=float(self.config.fall_angle_threshold),
-            fall_min_base_height=float(self.config.fall_min_base_height),
+            fall_min_base_clearance=float(self.config.fall_min_base_clearance),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
         )

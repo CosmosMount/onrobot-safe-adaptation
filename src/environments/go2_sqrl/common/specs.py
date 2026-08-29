@@ -24,6 +24,11 @@ DEFAULT_BASE_HEIGHT: Final = 0.27
 DEFAULT_JOINT_POSITION = np.tile(
     np.asarray([0.0, 0.9, -1.8], dtype=np.float32), 4
 )
+ACTION_SCALE = np.tile(
+    # Preserve conservative lateral hip motion while giving the sagittal
+    # joints enough range for roughly 10 cm of useful swing-foot clearance.
+    np.asarray([0.25, 0.35, 0.45], dtype=np.float32), 4
+)
 JOINT_LOWER_LIMIT = np.asarray(
     [
         -1.0472, -1.5708, -2.7227,
@@ -59,10 +64,10 @@ class ObservationSpecV3:
 
 
 @dataclass(frozen=True)
-class ActionSpecV1:
-    version: str = "go2-action-v1"
+class ActionSpecV2:
+    version: str = "go2-action-v2-per-joint-scale"
     size: int = ACTION_SIZE
-    scale: float = 0.25
+    scale: tuple[float, ...] = tuple(ACTION_SCALE.tolist())
     control_dt: float = CONTROL_DT
     max_target_rate: float = 12.0
     # Training/checkpoint actuator contract. MuJoCo-only PD sensitivity
@@ -79,25 +84,25 @@ class ActionSpecV1:
 
 
 @dataclass(frozen=True)
-class FailureSpecV2:
+class FailureSpecV3:
     """Sparse SQRL incident label shared by source and target backends."""
 
-    version: str = "tilt-or-low-base-sustained-v2"
+    version: str = "tilt-or-low-terrain-clearance-sustained-v3"
     angle_threshold: float = 0.8
-    min_base_height: float = 0.18
+    min_base_clearance: float = 0.18
     consecutive_frames: int = 5
 
 
 OBSERVATION_SPEC = ObservationSpecV3()
-ACTION_SPEC = ActionSpecV1()
-FAILURE_SPEC = FailureSpecV2()
+ACTION_SPEC = ActionSpecV2()
+FAILURE_SPEC = FailureSpecV3()
 
 
 def configure_failure_detection(config) -> None:
     """Expose the exact common SQRL failure label on an environment config."""
 
     config.fall_angle_threshold = FAILURE_SPEC.angle_threshold
-    config.fall_min_base_height = FAILURE_SPEC.min_base_height
+    config.fall_min_base_clearance = FAILURE_SPEC.min_base_clearance
     config.fall_consecutive_frames = FAILURE_SPEC.consecutive_frames
 
 

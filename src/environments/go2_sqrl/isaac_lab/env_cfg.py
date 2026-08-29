@@ -6,7 +6,7 @@ This module is imported only after :class:`isaaclab.app.AppLauncher` starts.
 from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
-from isaaclab.sensors import Imu, ImuCfg
+from isaaclab.sensors import Imu, ImuCfg, patterns
 from isaaclab.sensors.sensor_base import SensorBase
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
     LocomotionVelocityRoughEnvCfg,
@@ -16,7 +16,7 @@ from src.config import PROJECT_ROOT
 
 from ..common.specs import ACTION_SPEC, DEFAULT_BASE_HEIGHT, JOINT_NAMES
 from .randomization_cfg import configure_existing_events
-from .terrain_cfg import configure_terrain, configure_terrain_mode
+from .terrain_cfg import boxes_height_range, configure_terrain, configure_terrain_mode
 
 
 GO2_USD_PATH = PROJECT_ROOT / "assets" / "robots" / "go2" / "usd" / "go2.usd"
@@ -67,9 +67,15 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
             history_length=0,
             debug_vis=False,
         )
-        # The shared 46D contract has no terrain-height observation.  Removing
-        # the inherited scanner also avoids unnecessary Warp ray-cast kernels.
-        self.scene.height_scanner = None
+        # Terrain height is training-only truth for clearance reward/failure.
+        # The scan remains training-only truth and never enters the 46D policy
+        # input.  Its footprint covers all four feet so reward/failure heights
+        # can be referenced to the local terrain instead of world z.
+        self.scene.height_scanner.update_period = ACTION_SPEC.control_dt
+        self.scene.height_scanner.pattern_cfg = patterns.GridPatternCfg(
+            resolution=0.1,
+            size=(0.8, 0.6),
+        )
         self.observations.policy.height_scan = None
         self.decimation = 10
         self.sim.dt = 0.002
@@ -112,7 +118,10 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
         ]
         self.actions.joint_pos.preserve_order = True
         self.actions.joint_pos.use_default_offset = False
-        self.actions.joint_pos.scale = ACTION_SPEC.scale
+        self.actions.joint_pos.scale = {
+            f"{joint_name}_joint": float(scale)
+            for joint_name, scale in zip(JOINT_NAMES, ACTION_SPEC.scale)
+        }
         self.actions.joint_pos.offset = {
             f"{joint_name}_joint": float(default_position)
             for joint_name, default_position in zip(
@@ -132,6 +141,34 @@ def make_env_cfg(config, num_envs=None):
         cfg.curriculum,
         config.environment.terrain_mode,
     )
+    # A requested playback row is a frozen evaluation condition.  Otherwise
+    # the curriculum manager updates the row again during the first reset.
+    if int(config.environment.playback_terrain_level) >= 0:
+        cfg.curriculum.terrain_levels = None
+    terrain_generator = cfg.scene.terrain.terrain_generator
+    if terrain_generator is not None:
+        terrain_rows = int(config.environment.terrain_num_rows)
+        terrain_cols = int(config.environment.terrain_num_cols)
+        if terrain_rows < 1 or terrain_cols < 1:
+            raise ValueError("terrain_num_rows and terrain_num_cols must be positive")
+        terrain_generator.num_rows = terrain_rows
+        terrain_generator.num_cols = terrain_cols
+        # Isaac's random-grid implementation samples cell tops uniformly from
+        # [-amplitude, +amplitude], hence adjacent cells can differ by twice
+        # the configured amplitude.  At the highest curriculum row this makes
+        # the public value below the true worst-case adjacent height change.
+        terrain_generator.sub_terrains["boxes"].grid_height_range = boxes_height_range(
+            config.environment.boxes_max_adjacent_height_difference
+        )
+
+    if bool(config.environment.viewer_follow_robot):
+        # Anchor the viewport to env 0's robot.  Besides centering the robot at
+        # startup, asset_root makes the camera follow it throughout playback.
+        cfg.viewer.origin_type = "asset_root"
+        cfg.viewer.env_index = 0
+        cfg.viewer.asset_name = "robot"
+        cfg.viewer.eye = (2.6, 2.6, 1.6)
+        cfg.viewer.lookat = (0.0, 0.0, 0.15)
     randomization = bool(config.environment.domain_randomization)
     # The manager observation is an internal Isaac tensor discarded by the
     # Go2 adapter.  Corrupting it wastes work and does not perturb the actual

@@ -28,10 +28,14 @@ from ..common.manifest import (
 )
 from ..common.reward import (
     BASE_HEIGHT_TARGET,
+    FOOT_CLEARANCE_TARGET,
     REWARD_DT,
     REWARD_DEFAULT_JOINT_POSITION,
     REWARD_SCALES,
+    SWING_SPEED_FULL,
+    SWING_SPEED_START,
     TRACKING_SIGMA,
+    local_base_clearance,
 )
 from ..common.estimation import (
     TorchVelocityEstimator,
@@ -92,20 +96,23 @@ def project_action_targets_tensor(previous_q_target, actions):
     default = torch.as_tensor(
         DEFAULT_JOINT_POSITION, dtype=actions.dtype, device=actions.device
     )
+    scale = torch.as_tensor(
+        ACTION_SPEC.scale, dtype=actions.dtype, device=actions.device
+    )
     lower = torch.as_tensor(
         JOINT_LOWER_LIMIT, dtype=actions.dtype, device=actions.device
     )
     upper = torch.as_tensor(
         JOINT_UPPER_LIMIT, dtype=actions.dtype, device=actions.device
     )
-    raw_target = default + ACTION_SPEC.scale * actions.clamp(-1, 1)
+    raw_target = default + scale * actions.clamp(-1, 1)
     raw_target = raw_target.clamp(lower, upper)
     max_delta = ACTION_SPEC.max_target_rate * ACTION_SPEC.control_dt
     target = torch.maximum(
         torch.minimum(raw_target, previous_q_target + max_delta),
         previous_q_target - max_delta,
     )
-    applied = ((target - default) / ACTION_SPEC.scale).clamp(-1, 1)
+    applied = ((target - default) / scale).clamp(-1, 1)
     return applied, target
 
 
@@ -117,7 +124,7 @@ class TorchFallDetector:
         nr_envs: int,
         device,
         angle_threshold: float = 0.8,
-        min_base_height: float = 0.18,
+        min_base_clearance: float = 0.18,
         consecutive_frames: int = 5,
         samples_per_update: int = 1,
     ):
@@ -126,7 +133,7 @@ class TorchFallDetector:
         if samples_per_update < 1:
             raise ValueError("samples_per_update must be at least 1")
         self.angle_threshold = float(angle_threshold)
-        self.min_base_height = float(min_base_height)
+        self.min_base_clearance = float(min_base_clearance)
         self.consecutive_frames = int(consecutive_frames)
         self.samples_per_update = int(samples_per_update)
         self.tilt_count = torch.zeros(nr_envs, dtype=torch.long, device=device)
@@ -151,7 +158,7 @@ class TorchFallDetector:
             self.last_height_failure[env_ids] = False
 
     @torch.no_grad()
-    def update(self, quaternion, base_height=None):
+    def update(self, quaternion, base_clearance=None):
         quaternion = quaternion / torch.linalg.vector_norm(
             quaternion, dim=-1, keepdim=True
         ).clamp_min(1e-8)
@@ -168,14 +175,14 @@ class TorchFallDetector:
             self.tilt_count + self.samples_per_update,
             torch.zeros_like(self.tilt_count),
         )
-        if base_height is None:
+        if base_clearance is None:
             low = torch.zeros_like(tilted)
         else:
             low = torch.as_tensor(
-                base_height,
+                base_clearance,
                 dtype=quaternion.dtype,
                 device=quaternion.device,
-            ).reshape(tilted.shape) < self.min_base_height
+            ).reshape(tilted.shape) < self.min_base_clearance
         self.height_count = torch.where(
             low,
             self.height_count + self.samples_per_update,
@@ -222,6 +229,7 @@ class Go2IsaacEnv:
             )
         self.backend = backend
         self.config = config.environment
+        self._select_playback_terrain()
         self._domain_randomization = bool(self.config.domain_randomization)
         self.nr_envs = int(self.config.nr_envs)
         self.num_envs = self.nr_envs
@@ -245,6 +253,14 @@ class Go2IsaacEnv:
             self.backend.action_manager.get_term("joint_pos")
         )
         self._joint_indices = sdk_joint_indices(robot.joint_names, robot.device)
+        foot_indices, foot_names = robot.find_bodies(".*_foot")
+        if len(foot_indices) != 4:
+            raise RuntimeError(
+                f"Expected four Go2 foot bodies, got {foot_names}"
+            )
+        self._foot_body_indices = torch.as_tensor(
+            foot_indices, dtype=torch.long, device=robot.device
+        )
         self._previous_target = default_joint_target(self.nr_envs, robot.device)
         self._previous_reward_action = torch.zeros(
             (self.nr_envs, ACTION_SIZE), device=robot.device
@@ -260,7 +276,7 @@ class Go2IsaacEnv:
             self.nr_envs,
             robot.device,
             angle_threshold=float(self.config.fall_angle_threshold),
-            min_base_height=float(self.config.fall_min_base_height),
+            min_base_clearance=float(self.config.fall_min_base_clearance),
             consecutive_frames=int(self.config.fall_consecutive_frames),
             # The adapter observes orientation once after each decimated policy
             # step.  Treating that sample as the latest 10 physics frames is a
@@ -274,6 +290,44 @@ class Go2IsaacEnv:
         )
         print(
             format_policy_io_contract(self.config.target_velocity_x),
+            flush=True,
+        )
+
+    def _select_playback_terrain(self):
+        """Place all playback envs on the requested generated terrain family."""
+
+        from .terrain_cfg import playback_terrain_column
+
+        terrain_type = str(self.config.playback_terrain_type)
+        terrain_level = int(self.config.playback_terrain_level)
+        if terrain_level < -1:
+            raise ValueError("playback_terrain_level must be -1 or non-negative")
+        terrain = self.backend.scene.terrain
+        terrain_origins = getattr(terrain, "terrain_origins", None)
+        if terrain_type.lower() == "auto" and terrain_level < 0:
+            return
+        if terrain_origins is None:
+            raise ValueError(
+                "playback terrain selection requires environment.terrain_mode=rough"
+            )
+        column = playback_terrain_column(terrain_type, terrain_origins.shape[1])
+        if column is not None:
+            terrain.terrain_types.fill_(column)
+        if terrain_level >= terrain_origins.shape[0]:
+            raise ValueError(
+                f"playback_terrain_level must be -1 or less than "
+                f"{terrain_origins.shape[0]}, got {terrain_level}"
+            )
+        if terrain_level >= 0:
+            terrain.terrain_levels.fill_(terrain_level)
+        terrain.env_origins[:] = terrain_origins[
+            terrain.terrain_levels, terrain.terrain_types
+        ]
+        print(
+            f"[INFO] Playback terrain: {terrain_type.lower()} "
+            f"(column {int(terrain.terrain_types[0])}/"
+            f"{terrain_origins.shape[1] - 1}, level "
+            f"{int(terrain.terrain_levels[0])}/{terrain_origins.shape[0] - 1})",
             flush=True,
         )
 
@@ -425,8 +479,47 @@ class Go2IsaacEnv:
             -robot.data.root_ang_vel_b[:, 2].square() / TRACKING_SIGMA
         )
         lin_vel_z = body_velocity[:, 2].square()
-        base_height = robot.data.root_pos_w[:, 2]
-        base_height_error = (base_height - BASE_HEIGHT_TARGET).square()
+        terrain_hits = torch.nan_to_num(
+            self.backend.scene["height_scanner"].data.ray_hits_w,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        base_xy = robot.data.root_pos_w[:, None, :2]
+        base_hit_distance = (terrain_hits[..., :2] - base_xy).square().sum(dim=-1)
+        base_hit_count = min(4, terrain_hits.shape[1])
+        base_hit_indices = torch.topk(
+            base_hit_distance, k=base_hit_count, largest=False
+        ).indices
+        terrain_height = torch.gather(
+            terrain_hits[..., 2], 1, base_hit_indices
+        ).mean(dim=1)
+        base_clearance = local_base_clearance(
+            robot.data.root_pos_w[:, 2], terrain_height
+        )
+        base_height_error = (base_clearance - BASE_HEIGHT_TARGET).square()
+        foot_position = robot.data.body_pos_w[:, self._foot_body_indices]
+        foot_velocity = robot.data.body_lin_vel_w[:, self._foot_body_indices]
+        foot_hit_distance = (
+            foot_position[..., None, :2]
+            - terrain_hits[:, None, :, :2]
+        ).square().sum(dim=-1)
+        foot_hit_indices = foot_hit_distance.argmin(dim=-1)
+        foot_ground_height = torch.gather(
+            terrain_hits[..., 2], 1, foot_hit_indices
+        )
+        foot_clearance = foot_position[..., 2] - foot_ground_height
+        foot_horizontal_speed = torch.linalg.vector_norm(
+            foot_velocity[..., :2], dim=-1
+        )
+        swing_weight = (
+            (foot_horizontal_speed - SWING_SPEED_START)
+            / (SWING_SPEED_FULL - SWING_SPEED_START)
+        ).clamp(0.0, 1.0)
+        foot_clearance_error = (
+            swing_weight
+            * (FOOT_CLEARANCE_TARGET - foot_clearance).clamp_min(0.0).square()
+        ).mean(dim=-1)
         action_rate = (
             reward_action - self._previous_reward_action
         ).square().sum(dim=-1)
@@ -451,6 +544,9 @@ class Go2IsaacEnv:
             "base_height": REWARD_DT
             * REWARD_SCALES["base_height"]
             * base_height_error,
+            "foot_clearance": REWARD_DT
+            * REWARD_SCALES["foot_clearance"]
+            * foot_clearance_error,
             "action_rate": REWARD_DT
             * REWARD_SCALES["action_rate"]
             * action_rate,
@@ -462,7 +558,7 @@ class Go2IsaacEnv:
         self._previous_reward_action.copy_(reward_action)
         failure = self._fall_detector.update(
             self.backend.scene["imu"].data.quat_w,
-            base_height,
+            base_clearance,
         )
         failure = failure.clone()
         tilt_failure = self._fall_detector.last_tilt_failure.clone()
@@ -489,6 +585,17 @@ class Go2IsaacEnv:
             "target_velocity_error": (
                 body_velocity[:, 0] - target_velocity
             ).abs().detach().cpu().numpy(),
+            "base_clearance": base_clearance.detach().cpu().numpy(),
+            "local_terrain_height": terrain_height.detach().cpu().numpy(),
+            "mean_foot_clearance": foot_clearance.mean(dim=-1).detach().cpu().numpy(),
+            "max_foot_clearance": foot_clearance.max(dim=-1).values.detach().cpu().numpy(),
+            "action_saturation_ratio": (
+                reward_action.abs() > 0.98
+            ).float().mean(dim=-1).detach().cpu().numpy(),
+            "torque_saturation_ratio": (
+                robot.data.applied_torque[:, self._joint_indices].abs()
+                > 0.95 * ACTION_SPEC.effort_limit
+            ).float().mean(dim=-1).detach().cpu().numpy(),
             "velocity_estimation_error": torch.linalg.vector_norm(
                 estimated_body_velocity - body_velocity, dim=-1
             ).detach().cpu().numpy(),
@@ -561,10 +668,11 @@ class Go2IsaacEnv:
         return info["final_info"][index][key]
 
     def get_logging_info_dict(self, info):
+        ignored = {"failure", "applied_action", "final_observation", "final_info"}
         return {
-            "velocity_estimation_error": info["velocity_estimation_error"].tolist(),
-            "failure/tilt": info["failure/tilt"].tolist(),
-            "failure/height": info["failure/height"].tolist(),
+            key: np.asarray(value).reshape(-1).tolist()
+            for key, value in info.items()
+            if key not in ignored and not isinstance(value, list)
         }
 
     def close(self):
@@ -575,7 +683,7 @@ class Go2IsaacEnv:
         return build_manifest(
             normalizer,
             fall_angle_threshold=float(self.config.fall_angle_threshold),
-            fall_min_base_height=float(self.config.fall_min_base_height),
+            fall_min_base_clearance=float(self.config.fall_min_base_clearance),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
         )

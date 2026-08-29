@@ -74,6 +74,9 @@ def test_isaac_eval_is_single_environment_deterministic_task_policy():
     assert "--environment.nr_task_envs=1" in preset
     assert "--environment.nr_safety_envs=0" in preset
     assert "--environment.terrain_mode=flat" in preset
+    assert "--environment.viewer_follow_robot=true" in preset
+    assert "--environment.terrain_num_rows=3" in preset
+    assert "--environment.terrain_num_cols=10" in preset
     assert "--algorithm.eval_policy=task" in preset
 
 

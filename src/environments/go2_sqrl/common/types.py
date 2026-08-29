@@ -42,6 +42,7 @@ class RewardTerms:
     tracking_ang_vel: float
     lin_vel_z: float
     base_height: float
+    foot_clearance: float
     action_rate: float
     similar_to_default: float
     total: float
@@ -53,6 +54,7 @@ class RewardTerms:
             "reward/tracking_ang_vel": self.tracking_ang_vel,
             "reward/lin_vel_z": self.lin_vel_z,
             "reward/base_height": self.base_height,
+            "reward/foot_clearance": self.foot_clearance,
             "reward/action_rate": self.action_rate,
             "reward/similar_to_default": self.similar_to_default,
             "reward/total": self.total,

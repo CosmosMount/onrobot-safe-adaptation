@@ -99,6 +99,12 @@ RUN_PRESETS = {
         "--environment.nr_task_envs=1",
         "--environment.nr_safety_envs=0",
         "--environment.terrain_mode=flat",
+        # Playback follows env 0's robot and builds only 30 rough-terrain
+        # patches when terrain_mode is overridden to rough.  Training retains
+        # the environment defaults (10 x 20 patches).
+        "--environment.viewer_follow_robot=true",
+        "--environment.terrain_num_rows=3",
+        "--environment.terrain_num_cols=10",
         "--algorithm.phase=pretrain",
         "--algorithm.eval_policy=task",
     ),

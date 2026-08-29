@@ -88,15 +88,16 @@ def project_action_targets(
     default = xp.asarray(DEFAULT_JOINT_POSITION, dtype=dtype)
     lower = xp.asarray(JOINT_LOWER_LIMIT, dtype=dtype)
     upper = xp.asarray(JOINT_UPPER_LIMIT, dtype=dtype)
+    scale = xp.asarray(ACTION_SPEC.scale, dtype=dtype)
     clipped = xp.clip(action_array, -1.0, 1.0)
-    q_target = xp.clip(default + ACTION_SPEC.scale * clipped, lower, upper)
+    q_target = xp.clip(default + scale * clipped, lower, upper)
     max_delta = float(max_target_rate) * ACTION_SPEC.control_dt
     q_target = xp.clip(
         q_target,
         previous_array - max_delta,
         previous_array + max_delta,
     )
-    applied = xp.clip((q_target - default) / ACTION_SPEC.scale, -1.0, 1.0)
+    applied = xp.clip((q_target - default) / scale, -1.0, 1.0)
     return applied, q_target
 
 
@@ -126,6 +127,7 @@ def project_actions_from_observation(
 
 def normalized_action_from_target(q_target: np.ndarray) -> np.ndarray:
     q_target = np.asarray(q_target, dtype=np.float32)
+    scale = np.asarray(ACTION_SPEC.scale, dtype=np.float32)
     return np.clip(
-        (q_target - DEFAULT_JOINT_POSITION) / ACTION_SPEC.scale, -1.0, 1.0
+        (q_target - DEFAULT_JOINT_POSITION) / scale, -1.0, 1.0
     ).astype(np.float32)

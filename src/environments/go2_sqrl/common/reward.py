@@ -9,10 +9,13 @@ import numpy as np
 from .types import RewardTerms
 
 
-REWARD_VERSION = "flashsac-go2-walk-easy-command-v3"
+REWARD_VERSION = "flashsac-go2-walk-easy-command-v5-swing-clearance"
 REWARD_DT = 0.02
 TRACKING_SIGMA = 0.25
 BASE_HEIGHT_TARGET = 0.3
+FOOT_CLEARANCE_TARGET = 0.10
+SWING_SPEED_START = 0.15
+SWING_SPEED_FULL = 0.50
 REWARD_SCALES = {
     "tracking_lin_vel": 1.0,
     # The source exponential still pays 36.8% of its maximum at zero speed
@@ -22,6 +25,7 @@ REWARD_SCALES = {
     "tracking_ang_vel": 0.2,
     "lin_vel_z": -1.0,
     "base_height": -50.0,
+    "foot_clearance": -20.0,
     "action_rate": -0.005,
     "similar_to_default": -0.1,
 }
@@ -34,6 +38,26 @@ REWARD_DEFAULT_JOINT_POSITION = np.asarray(
     ],
     dtype=np.float32,
 )
+
+
+def local_base_clearance(base_world_height, local_ground_world_height):
+    """Return base height measured from the local terrain surface."""
+
+    return base_world_height - local_ground_world_height
+
+
+def swing_foot_clearance_error(foot_clearance, foot_horizontal_speed):
+    """Return a contact-free low-clearance cost active only for swing feet."""
+
+    clearance = np.asarray(foot_clearance, dtype=np.float64)
+    speed = np.asarray(foot_horizontal_speed, dtype=np.float64)
+    swing_weight = np.clip(
+        (speed - SWING_SPEED_START) / (SWING_SPEED_FULL - SWING_SPEED_START),
+        0.0,
+        1.0,
+    )
+    deficit = np.maximum(FOOT_CLEARANCE_TARGET - clearance, 0.0)
+    return float(np.mean(swing_weight * np.square(deficit)))
 
 
 def quaternion_to_rpy_wxyz(
@@ -55,7 +79,8 @@ def compute_reward(
     previous_action: np.ndarray,
     target_velocity_x: float,
     *,
-    base_height: float,
+    base_clearance: float,
+    foot_clearance_error: float = 0.0,
     target_velocity_y: float = 0.0,
     target_angular_velocity_z: float = 0.0,
 ) -> RewardTerms:
@@ -85,7 +110,7 @@ def compute_reward(
     tracking_lin_vel = math.exp(-linear_error / TRACKING_SIGMA)
     tracking_ang_vel = math.exp(-angular_error / TRACKING_SIGMA)
     lin_vel_z = float(body_velocity[2] ** 2)
-    base_height_error = (float(base_height) - BASE_HEIGHT_TARGET) ** 2
+    base_height_error = (float(base_clearance) - BASE_HEIGHT_TARGET) ** 2
     action_rate = float(
         np.square(
             np.asarray(previous_action, dtype=np.float64)
@@ -112,6 +137,9 @@ def compute_reward(
         "base_height": REWARD_DT
         * REWARD_SCALES["base_height"]
         * base_height_error,
+        "foot_clearance": REWARD_DT
+        * REWARD_SCALES["foot_clearance"]
+        * float(foot_clearance_error),
         "action_rate": REWARD_DT
         * REWARD_SCALES["action_rate"]
         * action_rate,

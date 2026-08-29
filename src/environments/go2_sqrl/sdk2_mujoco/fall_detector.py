@@ -12,11 +12,11 @@ class FallDetector:
         self,
         angle_threshold: float = 0.8,
         consecutive_frames: int = 5,
-        min_base_height: float = 0.18,
+        min_base_clearance: float = 0.18,
     ):
         self.angle_threshold = float(angle_threshold)
         self.consecutive_frames = int(consecutive_frames)
-        self.min_base_height = float(min_base_height)
+        self.min_base_clearance = float(min_base_clearance)
         self._count = 0
         self._low_height_count = 0
         self.last_tilt_failure = False
@@ -35,12 +35,12 @@ class FallDetector:
         self.last_tilt_failure = self._count >= self.consecutive_frames
         return self.last_tilt_failure
 
-    def update_base_height(self, height: float | None) -> bool:
-        if height is None or not np.isfinite(height):
+    def update_base_clearance(self, clearance: float | None) -> bool:
+        if clearance is None or not np.isfinite(clearance):
             self._low_height_count = 0
             self.last_height_failure = False
             return False
-        if float(height) < self.min_base_height:
+        if float(clearance) < self.min_base_clearance:
             self._low_height_count += 1
         else:
             self._low_height_count = 0

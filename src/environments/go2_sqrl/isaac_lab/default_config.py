@@ -17,6 +17,19 @@ def get_config(environment_name):
     configure_velocity_estimator(config)
     configure_failure_detection(config)
     config.terrain_mode = "rough"
+    # Training keeps Isaac Lab's full 10 x 20 curriculum grid.  Playback can
+    # override these independently to avoid surrounding a single robot with a
+    # needlessly large terrain field.
+    config.terrain_num_rows = 10
+    config.terrain_num_cols = 20
+    # ``MeshRandomGridTerrainCfg`` samples every box symmetrically in
+    # [-amplitude, +amplitude].  Express the public setting as the actual
+    # worst-case difference between two adjacent boxes instead of exposing
+    # Isaac Lab's easy-to-misread amplitude.
+    config.boxes_max_adjacent_height_difference = 0.14
+    config.playback_terrain_type = "auto"
+    config.playback_terrain_level = -1
+    config.viewer_follow_robot = False
     config.domain_randomization = False
     config.friction = 0.4
     config.episode_steps = 500

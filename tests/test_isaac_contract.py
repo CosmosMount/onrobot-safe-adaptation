@@ -17,6 +17,12 @@ def test_isaac_launcher_string_defaults_are_not_none():
     assert config.kit_args == ""
     assert isinstance(config.rendering_mode, str)
     assert config.terrain_mode == "rough"
+    assert config.terrain_num_rows == 10
+    assert config.terrain_num_cols == 20
+    assert config.boxes_max_adjacent_height_difference == 0.14
+    assert config.playback_terrain_type == "auto"
+    assert config.playback_terrain_level == -1
+    assert config.viewer_follow_robot is False
 
 
 def test_isaac_joint_gather_uses_sdk_order():
@@ -221,3 +227,78 @@ def test_rough_terrain_mode_preserves_generator_and_rejects_unknown_modes():
 
     with pytest.raises(ValueError, match="terrain_mode"):
         configure_terrain_mode(terrain, curriculum, "stairs-only")
+
+
+def test_rough_terrain_distribution_and_column_order_are_explicit():
+    from types import SimpleNamespace
+
+    from src.environments.go2_sqrl.isaac_lab.terrain_cfg import configure_terrain
+
+    class TerrainCfg(SimpleNamespace):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    sub_terrains = {
+        "pyramid_stairs": TerrainCfg(proportion=1.0),
+        "pyramid_stairs_inv": TerrainCfg(proportion=1.0),
+        "hf_pyramid_slope": TerrainCfg(proportion=1.0),
+        "hf_pyramid_slope_inv": TerrainCfg(proportion=1.0),
+        "boxes": TerrainCfg(proportion=0.0),
+        "random_rough": TerrainCfg(proportion=0.0),
+    }
+    terrain_generator = SimpleNamespace(sub_terrains=sub_terrains)
+    terrain_gen = SimpleNamespace(
+        MeshPlaneTerrainCfg=TerrainCfg,
+        MeshRandomGridTerrainCfg=TerrainCfg,
+        HfRandomUniformTerrainCfg=TerrainCfg,
+        HfPyramidSlopedTerrainCfg=TerrainCfg,
+        HfWaveTerrainCfg=TerrainCfg,
+        HfPyramidStairsTerrainCfg=TerrainCfg,
+        HfInvertedPyramidStairsTerrainCfg=TerrainCfg,
+    )
+
+    configure_terrain(terrain_generator, terrain_gen)
+    sub_terrains = terrain_generator.sub_terrains
+
+    assert list(sub_terrains) == [
+        "flat",
+        "boxes",
+        "random_rough",
+        "slopes",
+        "small_bumps",
+        "small_stairs",
+        "small_stairs_up",
+    ]
+    assert sub_terrains["boxes"].grid_height_range == (0.0, 0.07)
+    assert sub_terrains["random_rough"].noise_range[1] <= 0.07
+    assert sub_terrains["small_bumps"].amplitude_range[1] <= 0.07
+    assert sub_terrains["small_stairs"].step_height_range == (0.02, 0.07)
+    assert sub_terrains["small_stairs_up"].step_height_range == (0.02, 0.07)
+    assert sub_terrains["small_stairs_up"].inverted is True
+    assert sum(cfg.proportion for cfg in sub_terrains.values()) == pytest.approx(1.0)
+
+
+def test_playback_terrain_type_selects_a_representative_mixed_map_column():
+    from src.environments.go2_sqrl.isaac_lab.terrain_cfg import (
+        playback_terrain_column,
+    )
+
+    assert playback_terrain_column("auto", 20) is None
+    assert playback_terrain_column("flat", 20) == 1
+    assert playback_terrain_column("boxes", 20) == 3
+    assert playback_terrain_column("random_rough", 20) == 7
+    assert playback_terrain_column("slopes", 20) == 10
+    assert playback_terrain_column("small_bumps", 20) == 13
+    assert playback_terrain_column("small_stairs", 20) == 15
+    assert playback_terrain_column("small_stairs_up", 20) == 18
+    with pytest.raises(ValueError, match="playback_terrain_type"):
+        playback_terrain_column("unknown", 20)
+
+
+def test_boxes_height_setting_means_true_worst_case_adjacent_difference():
+    from src.environments.go2_sqrl.isaac_lab.terrain_cfg import boxes_height_range
+
+    assert boxes_height_range(0.02) == (0.0, 0.01)
+    assert boxes_height_range(0.14) == (0.0, 0.07)
+    with pytest.raises(ValueError, match="between 0 and 0.30"):
+        boxes_height_range(0.31)

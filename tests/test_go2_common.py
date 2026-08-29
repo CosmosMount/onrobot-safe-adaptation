@@ -15,9 +15,13 @@ from src.environments.go2_sqrl.common.manifest import (
     validate_transfer_manifest,
 )
 from src.environments.go2_sqrl.common.reward import (
+    FOOT_CLEARANCE_TARGET,
     REWARD_DEFAULT_JOINT_POSITION,
     compute_reward,
+    local_base_clearance,
+    swing_foot_clearance_error,
 )
+from src.environments.go2_sqrl.common.estimation.kinematics import foot_positions_body
 from src.environments.go2_sqrl.common.specs import (
     ACTION_SPEC,
     DEFAULT_JOINT_POSITION,
@@ -45,6 +49,9 @@ def test_versioned_observation_layout_and_joint_order():
     assert OBSERVATION_SPEC.size == 46
     assert OBSERVATION_SPEC.body_velocity == slice(27, 30)
     assert ACTION_SPEC.size == 12
+    np.testing.assert_allclose(
+        ACTION_SPEC.scale, [0.25, 0.35, 0.45] * 4
+    )
     assert OBSERVATION_SPEC.previous_action_q_target == slice(34, 46)
     source = [f"{name}_joint" for name in reversed(OBSERVATION_SPEC.joint_order)]
     np.testing.assert_array_equal(joint_order_indices(source), np.arange(11, -1, -1))
@@ -99,7 +106,26 @@ def test_action_limit_rate_limit_and_inverse_mapping():
     assert np.all(result.applied_action <= 1.0)
 
 
+def test_sagittal_action_range_can_clear_seven_cm_stairs():
+    default_z = foot_positions_body(DEFAULT_JOINT_POSITION)[0, 2]
+    high_step_action = np.tile([0.0, -1.0, -1.0], 4)
+    high_step_target = DEFAULT_JOINT_POSITION + np.asarray(
+        ACTION_SPEC.scale
+    ) * high_step_action
+    raised_z = foot_positions_body(high_step_target)[0, 2]
+    assert raised_z - default_z > 0.09
+
+
+def test_swing_clearance_cost_is_contact_free_and_speed_gated():
+    low_feet = np.full(4, FOOT_CLEARANCE_TARGET - 0.05)
+    assert swing_foot_clearance_error(low_feet, np.zeros(4)) == 0.0
+    assert swing_foot_clearance_error(low_feet, np.ones(4)) == pytest.approx(
+        0.05**2
+    )
+
+
 def test_reward_and_episode_semantics():
+    assert local_base_clearance(0.37, 0.07) == pytest.approx(0.3)
     terms = compute_reward(
         np.asarray([0.5, 0.0, 0.0]),
         np.asarray([1.0, 0.0, 0.0, 0.0]),
@@ -108,7 +134,7 @@ def test_reward_and_episode_semantics():
         np.zeros(12),
         np.zeros(12),
         target_velocity_x=0.5,
-        base_height=0.3,
+        base_clearance=0.3,
     )
     assert terms.tracking_lin_vel == pytest.approx(0.02)
     assert terms.velocity_error == pytest.approx(0.0)
@@ -127,7 +153,7 @@ def test_reward_and_episode_semantics():
         np.zeros(12),
         np.zeros(12),
         target_velocity_x=0.5,
-        base_height=0.3,
+        base_clearance=0.3,
     )
     assert stationary.velocity_error == pytest.approx(-0.015)
     assert stationary.total < 0.0

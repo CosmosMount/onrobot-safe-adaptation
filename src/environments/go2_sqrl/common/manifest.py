@@ -6,6 +6,7 @@ from typing import Any
 
 from .reward import (
     BASE_HEIGHT_TARGET,
+    FOOT_CLEARANCE_TARGET,
     REWARD_DT,
     REWARD_DEFAULT_JOINT_POSITION,
     REWARD_SCALES,
@@ -21,17 +22,17 @@ from .specs import (
 )
 
 
-MANIFEST_VERSION = 9
+MANIFEST_VERSION = 11
 VELOCITY_ESTIMATOR_VERSION = "contact-free-robust-kf-v1"
 FAILURE_CONTRACT_VERSION = FAILURE_SPEC.version
-ACTION_PIPELINE_VERSION = "sdk-absolute-position-v2"
+ACTION_PIPELINE_VERSION = "sdk-absolute-position-v3-per-joint-scale"
 
 
 def build_manifest(
     normalizer: dict[str, Any] | None = None,
     *,
     fall_angle_threshold: float = FAILURE_SPEC.angle_threshold,
-    fall_min_base_height: float = FAILURE_SPEC.min_base_height,
+    fall_min_base_clearance: float = FAILURE_SPEC.min_base_clearance,
     fall_consecutive_frames: int = FAILURE_SPEC.consecutive_frames,
     target_velocity_x: float = 0.5,
 ) -> dict[str, Any]:
@@ -68,7 +69,7 @@ def build_manifest(
             "pipeline_version": ACTION_PIPELINE_VERSION,
             "size": ACTION_SPEC.size,
             "joint_order": list(ACTION_SPEC.joint_order),
-            "scale": ACTION_SPEC.scale,
+            "scale": list(ACTION_SPEC.scale),
             "default_position": list(ACTION_SPEC.default_position),
             "target_semantics": "absolute_joint_position",
             "backend_offset_semantics": "shared_default_position",
@@ -95,6 +96,10 @@ def build_manifest(
             "dt": REWARD_DT,
             "tracking_sigma": TRACKING_SIGMA,
             "base_height_target": BASE_HEIGHT_TARGET,
+            "base_height_reference": "local_terrain_clearance",
+            "foot_clearance_target": FOOT_CLEARANCE_TARGET,
+            "foot_clearance_reference": "local_terrain_under_each_foot",
+            "foot_swing_signal": "world_horizontal_foot_speed",
             "reward_scales_before_dt": dict(REWARD_SCALES),
             "similar_to_default_joint_position": list(
                 REWARD_DEFAULT_JOINT_POSITION.tolist()
@@ -112,10 +117,13 @@ def build_manifest(
         },
         "failure": {
             "version": FAILURE_CONTRACT_VERSION,
-            "signal": ["imu_quaternion_roll_pitch", "base_height"],
+            "signal": [
+                "imu_quaternion_roll_pitch",
+                "base_clearance_above_local_terrain",
+            ],
             "aggregation": "tilt_or_low_base",
             "angle_threshold": float(fall_angle_threshold),
-            "min_base_height": float(fall_min_base_height),
+            "min_base_clearance": float(fall_min_base_clearance),
             "consecutive_frames": int(fall_consecutive_frames),
             "frame_unit": "physics_frames",
             "frame_dt": PHYSICS_DT,
