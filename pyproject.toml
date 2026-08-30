@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orsa"
+version = "0.1.0"
+description = "Reinforcement-learning algorithms and experiment runner for safe robot adaptation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Runner and environment interfaces shared by all targets.
+    "absl-py>=2.0",
+    "ml-collections>=0.1.1",
+    "numpy>=1.26",
+    "gymnasium>=1.0",
+]
+
+[project.optional-dependencies]
+mujoco = [
+    "mujoco>=3.1",
+    # This JAX/Flax pair is validated with the NumPy 1.26 Isaac environment;
+    # pinning prevents the resolver from selecting an incompatible major stack.
+    "jax[cuda12-local]==0.6.2; platform_system == 'Linux'",
+    "jax==0.6.2; platform_system != 'Linux'",
+    "jaxlib==0.6.2",
+    "flax==0.10.7",
+    "optax>=0.2.4,<0.3",
+    "orbax-checkpoint>=0.11,<0.12",
+    "dm-tree>=0.1.8",
+    # Used only to import an Isaac/PyTorch checkpoint during transfer.  Online
+    # policy inference and all fine-tuning updates are performed by JAX.
+    "torch>=2.7",
+    "wandb>=0.18",
+]
+inference = [
+    "jax==0.6.2",
+    "jaxlib==0.6.2",
+    "flax==0.10.7",
+    "optax>=0.2.4,<0.3",
+    "orbax-checkpoint>=0.11,<0.12",
+    "dm-tree>=0.1.8",
+    # Current RL-X Flax algorithms import wandb at module import time.
+    "wandb>=0.18",
+]
+
+[tool.setuptools.packages.find]
+include = ["rl_x*", "src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "rl_x/algorithms/qsafe/_tests"]
+markers = [
+    "isaac: requires an Isaac Lab runtime",
+    "live_sdk: requires a running unitree_mujoco simulator",
+]
