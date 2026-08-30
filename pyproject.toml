@@ -29,8 +29,7 @@ mujoco = [
     "optax>=0.2.4,<0.3",
     "orbax-checkpoint>=0.11,<0.12",
     "dm-tree>=0.1.8",
-    # Used only to import an Isaac/PyTorch checkpoint during transfer.  Online
-    # policy inference and all fine-tuning updates are performed by JAX.
+    # Used by the local SQRL runner for checkpoint transfer and fine-tuning.
     "torch>=2.7",
     "wandb>=0.18",
 ]
@@ -41,15 +40,15 @@ inference = [
     "optax>=0.2.4,<0.3",
     "orbax-checkpoint>=0.11,<0.12",
     "dm-tree>=0.1.8",
-    # Current RL-X Flax algorithms import wandb at module import time.
+    # The optional Flax algorithm modules import wandb at module import time.
     "wandb>=0.18",
 ]
 
 [tool.setuptools.packages.find]
-include = ["rl_x*", "src*"]
+include = ["algorithms*", "core*", "sqrl*", "train*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "rl_x/algorithms/qsafe/_tests"]
+testpaths = ["tests"]
 markers = [
     "isaac: requires an Isaac Lab runtime",
     "live_sdk: requires a running unitree_mujoco simulator",
