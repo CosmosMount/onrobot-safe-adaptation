@@ -17,12 +17,12 @@ from sqrl.sac.pytorch.rollout_buffer import RolloutBuffer
 sqrl_pretrain_logger = logging.getLogger("sqrl_pretrain")
 
 
-class SQRL_Pretrain_SAC:
+class SQRLPretrainer:
 
-    def __init__(self, config, env, device, safety_env=None):
+    def __init__(self, config, envs, device):
         self.config = config
-        self.env = env
-        self.safety_env = safety_env if safety_env is not None else getattr(env, "safety_env", None)
+        self.task_env = envs.task_env
+        self.safety_env = envs.safety_env
         self.device = torch.device(device)
 
         self.seed = int(config.environment.seed)
@@ -38,8 +38,11 @@ class SQRL_Pretrain_SAC:
         self.batch_size = int(config.algorithm.batch_size)
         self.safety_batch_size = int(config.algorithm.get("safety_batch_size", config.algorithm.batch_size))
         self.learning_starts = int(config.algorithm.get("learning_starts", 0))
+        # uses n_pre for outer iterations; total_timesteps is the practical task-transition budget.
+        n_pre = config.algorithm.get("n_pre", None)
+        self.nr_pretrain_iterations = None if n_pre is None else int(n_pre)
         self.nr_pretrain_steps = int(
-            config.algorithm.get("n_pre", config.algorithm.get("nr_epochs", 500_000))
+            config.algorithm.get("total_timesteps", config.algorithm.get("nr_epochs", 500_000))
         )
         self.nr_offline_steps = int(
             config.algorithm.get(
@@ -57,8 +60,10 @@ class SQRL_Pretrain_SAC:
         self.safety_buffer_size = int(config.algorithm.get("safety_buffer_size", 100_000))
         self.max_safety_trajectories = int(config.algorithm.get("max_safety_trajectories", self.nr_safety_rollouts))
 
-        if self.nr_pretrain_steps < 1:
+        if self.nr_pretrain_iterations is not None and self.nr_pretrain_iterations < 1:
             raise ValueError("n_pre must be at least 1")
+        if self.nr_pretrain_iterations is None and self.nr_pretrain_steps < 1:
+            raise ValueError("total_timesteps must be at least 1")
         if self.nr_offline_steps < 1:
             raise ValueError("n_off must be at least 1")
         if self.nr_safety_rollouts < 1:
@@ -72,11 +77,11 @@ class SQRL_Pretrain_SAC:
         torch.manual_seed(self.seed)
         torch.backends.cudnn.deterministic = True
 
-        self.policy = get_policy(config, env, self.device)
-        self.task_critic = get_task_critic(config, env, self.device)
-        self.safe_critic = get_safe_critic(config, env, self.device)
+        self.policy = get_policy(config, self.task_env, self.device)
+        self.task_critic = get_task_critic(config, self.task_env, self.device)
+        self.safe_critic = get_safe_critic(config, self.task_env, self.device)
         self.entropy_coefficient = get_entropy_coefficient(
-            config, env, self.device
+            config, self.task_env, self.device
         )
 
         learning_rate = float(config.algorithm.get("learning_rate", 3e-4))
@@ -104,8 +109,8 @@ class SQRL_Pretrain_SAC:
             **optimizer_options,
         )
 
-        self.env_as_low = np.asarray(env.single_action_space.low, dtype=np.float32)
-        self.env_as_high = np.asarray(env.single_action_space.high, dtype=np.float32)
+        self.env_as_low = np.asarray(self.task_env.single_action_space.low, dtype=np.float32)
+        self.env_as_high = np.asarray(self.task_env.single_action_space.high, dtype=np.float32)
         self.offline_replay_buffer = None
         self.safety_replay_buffer = None
         self.state = None
@@ -115,14 +120,16 @@ class SQRL_Pretrain_SAC:
         self.safety_updates = 0
 
     def train(self):
-        if self.safety_env is None or self.safety_env is self.env:
-            raise ValueError("SQRL pre-training requires an independent safety_env")
+        if self.safety_env is self.task_env:
+            raise ValueError(
+                "SQRL pre-training requires an independent safety_env or an isolated safety partition view"
+            )
 
         self.offline_replay_buffer = ReplayBuffer(
             capacity=self.task_buffer_size,
             nr_envs=self.nr_envs,
-            os_shape=self.env.single_observation_space.shape,
-            as_shape=self.env.single_action_space.shape,
+            os_shape=self.task_env.single_observation_space.shape,
+            as_shape=self.task_env.single_action_space.shape,
             rng=self.rng,
             device=self.device,
         )
@@ -130,30 +137,34 @@ class SQRL_Pretrain_SAC:
         self.safety_replay_buffer = RolloutBuffer(
             capacity=self.safety_buffer_size,
             nr_envs=self.nr_envs,
-            os_shape=self.env.single_observation_space.shape,
-            as_shape=self.env.single_action_space.shape,
+            os_shape=self.task_env.single_observation_space.shape,
+            as_shape=self.task_env.single_action_space.shape,
             rng=self.rng,
             max_trajectories=self.max_safety_trajectories,
         )
 
-        reset_result = self.env.reset()
+        reset_result = self.task_env.reset()
         self.state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
 
-        pretrain_step = 0
-        while self.task_steps < self.nr_pretrain_steps:
+        pretrain_iteration = 0
+        while (
+            pretrain_iteration < self.nr_pretrain_iterations
+            if self.nr_pretrain_iterations is not None
+            else self.task_steps < self.nr_pretrain_steps
+        ):
             for _ in range(self.nr_offline_steps):
-                if self.task_steps >= self.nr_pretrain_steps:
+                if self.nr_pretrain_iterations is None and self.task_steps >= self.nr_pretrain_steps:
                     break
                 self.train_task()
 
             # Collect k complete on-policy rollouts first, then update QSafe
             # exactly once from D_safe.
             safety_metrics = self.train_safety()
-            pretrain_step += 1
+            pretrain_iteration += 1
             sqrl_pretrain_logger.info(
-                "pretrain_step=%d task_steps=%d task_updates=%d "
+                "pretrain_iteration=%d task_steps=%d task_updates=%d "
                 "safety_rollouts=%d safety_updates=%d qsafe_loss=%.6f",
-                pretrain_step,
+                pretrain_iteration,
                 self.task_steps,
                 self.task_updates,
                 self.safety_rollouts,
@@ -167,7 +178,7 @@ class SQRL_Pretrain_SAC:
         def sample_actions():
             if self.task_steps < self.learning_starts:
                 processed_actions = np.asarray(
-                    [self.env.single_action_space.sample() for _ in range(self.nr_envs)], dtype=np.float32
+                    [self.task_env.single_action_space.sample() for _ in range(self.nr_envs)], dtype=np.float32
                 )
                 actions = 2.0 * (processed_actions - self.env_as_low) / (self.env_as_high - self.env_as_low) - 1.0
                 return actions, processed_actions
@@ -185,9 +196,9 @@ class SQRL_Pretrain_SAC:
             truncations = np.asarray(truncations, dtype=bool).reshape(self.nr_envs)
             actual_next_state = np.asarray(next_state, dtype=np.float32).copy()
             for index, single_done in enumerate(terminations | truncations):
-                if single_done and hasattr(self.env, "get_final_observation_at_index"):
+                if single_done and hasattr(self.task_env, "get_final_observation_at_index"):
                     actual_next_state[index] = np.asarray(
-                        self.env.get_final_observation_at_index(info, index), dtype=np.float32
+                        self.task_env.get_final_observation_at_index(info, index), dtype=np.float32
                     )
                 elif single_done and isinstance(info, dict) and "final_observation" in info and info["final_observation"][index] is not None:
                     actual_next_state[index] = np.asarray(info["final_observation"][index], dtype=np.float32)
@@ -257,7 +268,7 @@ class SQRL_Pretrain_SAC:
         self.task_critic.q2.train()
 
         actions, processed_actions = sample_actions()
-        next_state, rewards, terminations, truncations, info = self.env.step(processed_actions)
+        next_state, rewards, terminations, truncations, info = self.task_env.step(processed_actions)
         actual_next_state, terminations, failures = process_step(next_state, terminations, truncations, info)
         self.offline_replay_buffer.add(
             np.asarray(self.state, dtype=np.float32), actual_next_state, actions, np.asarray(rewards, dtype=np.float32),
@@ -317,7 +328,7 @@ class SQRL_Pretrain_SAC:
             return actual_next_state, terminations, truncations, failures
 
         def update_qsafe():
-            states, next_states, actions, failures, terminations, _ = self.safety_replay_buffer.sample(
+            states, next_states, actions, failures, terminations, _truncations = self.safety_replay_buffer.sample(
                 self.safety_batch_size
             )
             states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
@@ -329,8 +340,11 @@ class SQRL_Pretrain_SAC:
                 with torch.no_grad():
                     next_actions, _, _ = self.policy.get_action(next_states)
                     next_safe_q = self.safe_critic.q_target(next_states, next_actions)
+                    # A truncation only ends data collection at an external time limit. Its final observation
+                    # remains a valid successor, so only a true terminal (including every failure) stops bootstrap.
+                    bootstrap = 1.0 - terminations.reshape(-1, 1)
                     safe_target = self.safe_gamma * (
-                        next_failures + (1.0 - next_failures) * (1.0 - terminations.reshape(-1, 1)) * next_safe_q
+                        next_failures + (1.0 - next_failures) * bootstrap * next_safe_q
                     )
                 safe_q = self.safe_critic.q(states, actions)
                 qsafe_loss = F.mse_loss(safe_q, safe_target)
