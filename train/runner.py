@@ -135,11 +135,15 @@ def main(argv=None):
     if "max_safety_trajectories" not in raw_config.get("algorithm", {}):
         algorithm["max_safety_trajectories"] = int(algorithm["k"])
     config = config_dict.ConfigDict({"algorithm": algorithm, "environment": environment, "runner": runner})
+    from train.common.base import validate_environment_contract
+
+    validate_environment_contract(config.environment)
     if args.command == "show-config":
         print(config)
         return 0
 
     import torch
+
     if config.algorithm.device == "gpu" and torch.cuda.is_available():
         device = torch.device("cuda")
     elif config.algorithm.device == "mps" and torch.backends.mps.is_available():

@@ -1,6 +1,6 @@
 """Dependency-light Isaac configuration; safe to import before AppLauncher."""
 
-from train.common.base import configure_failure_detection
+from train.common.base import configure_environment_contract
 from train.common.estimation import configure_velocity_estimator
 
 from ml_collections import config_dict
@@ -15,10 +15,8 @@ def get_config(environment_name):
     config.nr_safety_envs = 64
     config.rollout_mode = "partitioned"
     config.device = "gpu"
-    config.target_velocity_x = 0.5
     configure_velocity_estimator(config)
-    configure_failure_detection(config)
-    config.terrain_mode = "rough"
+    configure_environment_contract(config)
     # Training keeps Isaac Lab's full 10 x 20 curriculum grid.  Playback can
     # override these independently to avoid surrounding a single robot with a
     # needlessly large terrain field.
@@ -32,9 +30,6 @@ def get_config(environment_name):
     config.playback_terrain_type = "auto"
     config.playback_terrain_level = -1
     config.viewer_follow_robot = False
-    config.domain_randomization = False
-    config.friction = 0.4
-    config.episode_steps = 500
     config.render = False
 
     # AppLauncher-compatible defaults consumed by the local runner.

@@ -1,7 +1,7 @@
 <mujoco model="go2">
   <compiler angle="radian" meshdir="./meshes/"/>
 
-  <option timestep="0.002" cone="elliptic" impratio="100"/>
+  <option timestep="0.002" gravity="0 0 -9.81" cone="elliptic" impratio="100"/>
 
   <default>
     <default class="go2">
@@ -61,7 +61,7 @@
   </asset>
 
   <worldbody>
-    <body name="base_link" pos="0 0 0.27" childclass="go2">
+    <body name="base_link" pos="0 0 0.289" childclass="go2">
       <freejoint/>
       <inertial pos="0.021112 0 -0.005366" quat="-0.000543471 0.713435 -0.00173769 0.700719" mass="6.921"
         diaginertia="0.107027 0.0980771 0.0244531"/>

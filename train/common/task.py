@@ -4,7 +4,8 @@ from __future__ import annotations
 from typing import Protocol, Sequence
 
 from .base import (
-    ACTION_SPEC, DEFAULT_BASE_HEIGHT, DEFAULT_JOINT_POSITION, FAILURE_SPEC,
+    ACTION_SPEC, CONTACT_FRICTION, CONTROL_DT, DEFAULT_BASE_HEIGHT,
+    DEFAULT_JOINT_POSITION, EPISODE_STEPS, FAILURE_SPEC, GRAVITY_Z,
     OBSERVATION_SPEC, PHYSICS_DT, RewardTerms, RobotState,
 )
 from .estimation import VelocityEstimator
@@ -109,55 +110,18 @@ import math
 import numpy as np
 
 
-REWARD_VERSION = "flashsac-go2-walk-easy-command-v5-swing-clearance"
-REWARD_DT = 0.02
-TRACKING_SIGMA = 0.25
-BASE_HEIGHT_TARGET = 0.3
-FOOT_CLEARANCE_TARGET = 0.10
-SWING_SPEED_START = 0.15
-SWING_SPEED_FULL = 0.50
 REWARD_SCALES = {
-    "tracking_lin_vel": 1.0,
-    # The source exponential still pays 36.8% of its maximum at zero speed
-    # for a 0.5 m/s command.  This explicit error cost makes standing still a
-    # negative-return local optimum while leaving exact tracking unchanged.
-    "velocity_error": -3.0,
-    "tracking_ang_vel": 0.2,
-    "lin_vel_z": -1.0,
-    "base_height": -50.0,
-    "foot_clearance": -20.0,
-    "action_rate": -0.005,
-    "similar_to_default": -0.1,
+    "tracking_velocity": 1.0,
+    "yaw_rate": -0.1,
+    "upright": -10.0,
+    "energy": -0.0003,
 }
-REWARD_DEFAULT_JOINT_POSITION = np.asarray(
-    [
-        0.0, 0.8, -1.5,
-        0.0, 0.8, -1.5,
-        0.0, 1.0, -1.5,
-        0.0, 1.0, -1.5,
-    ],
-    dtype=np.float32,
-)
 
 
 def local_base_clearance(base_world_height, local_ground_world_height):
     """Return base height measured from the local terrain surface."""
 
     return base_world_height - local_ground_world_height
-
-
-def swing_foot_clearance_error(foot_clearance, foot_horizontal_speed):
-    """Return a contact-free low-clearance cost active only for swing feet."""
-
-    clearance = np.asarray(foot_clearance, dtype=np.float64)
-    speed = np.asarray(foot_horizontal_speed, dtype=np.float64)
-    swing_weight = np.clip(
-        (speed - SWING_SPEED_START) / (SWING_SPEED_FULL - SWING_SPEED_START),
-        0.0,
-        1.0,
-    )
-    deficit = np.maximum(FOOT_CLEARANCE_TARGET - clearance, 0.0)
-    return float(np.mean(swing_weight * np.square(deficit)))
 
 
 def quaternion_to_rpy_wxyz(
@@ -170,84 +134,88 @@ def quaternion_to_rpy_wxyz(
     return roll, pitch, yaw
 
 
+def track_x_reward(velocity_x: float, target_velocity_x: float) -> float:
+    """Piecewise forward-velocity tracking term from Gait in Eight."""
+
+    velocity_x = float(velocity_x)
+    target_velocity_x = float(target_velocity_x)
+    if target_velocity_x <= 0.0:
+        raise ValueError("target_velocity_x must be positive")
+    if target_velocity_x <= velocity_x <= 2.0 * target_velocity_x:
+        return 1.0
+    if velocity_x <= -target_velocity_x or velocity_x >= 4.0 * target_velocity_x:
+        return 0.0
+    return 1.0 - abs(velocity_x - target_velocity_x) / (2.0 * target_velocity_x)
+
+
 def compute_reward(
-    world_velocity: np.ndarray,
+    body_velocity: np.ndarray,
     imu_quat: np.ndarray,
     imu_gyro: np.ndarray,
-    joint_q: np.ndarray,
-    action: np.ndarray,
-    previous_action: np.ndarray,
+    actuator_torque: np.ndarray,
     target_velocity_x: float,
-    *,
-    base_clearance: float,
-    foot_clearance_error: float = 0.0,
-    target_velocity_y: float = 0.0,
-    target_angular_velocity_z: float = 0.0,
 ) -> RewardTerms:
-    """Compute the source reward plus a continuous command-error penalty."""
+    """Compute Gait in Eight's non-negative fixed-forward tracking reward."""
 
-    quaternion = np.asarray(imu_quat, dtype=np.float64)
-    quaternion /= max(float(np.linalg.norm(quaternion)), 1e-8)
-    w, x, y, z = quaternion
-    rotation_body_to_world = np.asarray(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
-            [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
-            [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-    body_velocity = rotation_body_to_world.T @ np.asarray(
-        world_velocity, dtype=np.float64
-    )[:3]
-    command_xy = np.asarray(
-        [target_velocity_x, target_velocity_y], dtype=np.float64
-    )
-    linear_error = float(np.square(command_xy - body_velocity[:2]).sum())
-    angular_error = (
-        float(target_angular_velocity_z) - float(np.asarray(imu_gyro)[2])
-    ) ** 2
-    tracking_lin_vel = math.exp(-linear_error / TRACKING_SIGMA)
-    tracking_ang_vel = math.exp(-angular_error / TRACKING_SIGMA)
-    lin_vel_z = float(body_velocity[2] ** 2)
-    base_height_error = (float(base_clearance) - BASE_HEIGHT_TARGET) ** 2
-    action_rate = float(
-        np.square(
-            np.asarray(previous_action, dtype=np.float64)
-            - np.asarray(action, dtype=np.float64)
-        ).sum()
-    )
-    similar_to_default = float(
-        np.abs(
-            np.asarray(joint_q, dtype=np.float64)
-            - np.asarray(REWARD_DEFAULT_JOINT_POSITION, dtype=np.float64)
-        ).sum()
-    )
-    weighted = {
-        "tracking_lin_vel": REWARD_DT
-        * REWARD_SCALES["tracking_lin_vel"]
-        * tracking_lin_vel,
-        "velocity_error": REWARD_DT
-        * REWARD_SCALES["velocity_error"]
-        * linear_error,
-        "tracking_ang_vel": REWARD_DT
-        * REWARD_SCALES["tracking_ang_vel"]
-        * tracking_ang_vel,
-        "lin_vel_z": REWARD_DT * REWARD_SCALES["lin_vel_z"] * lin_vel_z,
-        "base_height": REWARD_DT
-        * REWARD_SCALES["base_height"]
-        * base_height_error,
-        "foot_clearance": REWARD_DT
-        * REWARD_SCALES["foot_clearance"]
-        * float(foot_clearance_error),
-        "action_rate": REWARD_DT
-        * REWARD_SCALES["action_rate"]
-        * action_rate,
-        "similar_to_default": REWARD_DT
-        * REWARD_SCALES["similar_to_default"]
-        * similar_to_default,
+    roll, pitch, _ = quaternion_to_rpy_wxyz(imu_quat)
+    raw = {
+        "tracking_velocity": REWARD_SCALES["tracking_velocity"]
+        * track_x_reward(np.asarray(body_velocity, dtype=np.float64)[0], target_velocity_x),
+        "yaw_rate": REWARD_SCALES["yaw_rate"]
+        * float(np.asarray(imu_gyro, dtype=np.float64)[2] ** 2),
+        "upright": REWARD_SCALES["upright"] * float(roll * roll + pitch * pitch),
+        "energy": REWARD_SCALES["energy"]
+        * float(np.square(np.asarray(actuator_torque, dtype=np.float64)).sum()),
     }
-    return RewardTerms(**weighted, total=sum(weighted.values()))
+    return RewardTerms(**raw, total=max(sum(raw.values()), 0.0))
+
+
+def compute_reward_tensor(
+    body_velocity,
+    imu_quat,
+    imu_gyro,
+    actuator_torque,
+    target_velocity_x: float,
+):
+    """Vectorized PyTorch form of :func:`compute_reward` for Isaac Lab."""
+
+    import torch
+
+    target = float(target_velocity_x)
+    if target <= 0.0:
+        raise ValueError("target_velocity_x must be positive")
+    velocity_x = body_velocity[:, 0]
+    tracking = 1.0 - (velocity_x - target).abs() / (2.0 * target)
+    tracking = torch.where(
+        (velocity_x >= target) & (velocity_x <= 2.0 * target),
+        torch.ones_like(tracking),
+        tracking,
+    )
+    tracking = torch.where(
+        (velocity_x <= -target) | (velocity_x >= 4.0 * target),
+        torch.zeros_like(tracking),
+        tracking,
+    )
+    quaternion = imu_quat / torch.linalg.vector_norm(
+        imu_quat, dim=-1, keepdim=True
+    ).clamp_min(1e-8)
+    w, x, y, z = quaternion.unbind(dim=-1)
+    roll = torch.atan2(
+        2.0 * (w * x + y * z),
+        1.0 - 2.0 * (x.square() + y.square()),
+    )
+    pitch = torch.asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0))
+    terms = {
+        "tracking_velocity": REWARD_SCALES["tracking_velocity"] * tracking,
+        "yaw_rate": REWARD_SCALES["yaw_rate"] * imu_gyro[:, 2].square(),
+        "upright": REWARD_SCALES["upright"]
+        * (roll.square() + pitch.square()),
+        "energy": REWARD_SCALES["energy"]
+        * actuator_torque.square().sum(dim=-1),
+    }
+    total = torch.stack(tuple(terms.values()), dim=0).sum(dim=0).clamp_min(0.0)
+    return terms, total
+
 
 class EpisodeTracker:
     def __init__(self, max_steps: int = 500):
@@ -269,13 +237,6 @@ class EpisodeTracker:
 from typing import Any
 
 
-# Transfer checkpoint compatibility contract.
-MANIFEST_VERSION = 11
-VELOCITY_ESTIMATOR_VERSION = "contact-free-robust-kf-v1"
-FAILURE_CONTRACT_VERSION = FAILURE_SPEC.version
-ACTION_PIPELINE_VERSION = "sdk-absolute-position-v3-per-joint-scale"
-
-
 def build_manifest(
     normalizer: dict[str, Any] | None = None,
     *,
@@ -283,11 +244,20 @@ def build_manifest(
     fall_min_base_clearance: float = FAILURE_SPEC.min_base_clearance,
     fall_consecutive_frames: int = FAILURE_SPEC.consecutive_frames,
     target_velocity_x: float = 0.5,
+    domain_randomization: bool = False,
 ) -> dict[str, Any]:
     return {
-        "manifest_version": MANIFEST_VERSION,
+        "environment": {
+            "terrain": "flat",
+            "domain_randomization": bool(domain_randomization),
+            "friction": CONTACT_FRICTION,
+            "gravity_z": GRAVITY_Z,
+            "physics_dt": PHYSICS_DT,
+            "control_dt": CONTROL_DT,
+            "episode_steps": EPISODE_STEPS,
+            "target_velocity_x": float(target_velocity_x),
+        },
         "observation": {
-            "version": OBSERVATION_SPEC.version,
             "size": OBSERVATION_SPEC.size,
             "joint_order": list(OBSERVATION_SPEC.joint_order),
             "quaternion_order": OBSERVATION_SPEC.quaternion_order,
@@ -300,7 +270,6 @@ def build_manifest(
                 "source": "proprioceptive_velocity_estimator",
             },
             "velocity_estimator": {
-                "version": VELOCITY_ESTIMATOR_VERSION,
                 "policy_visible": True,
                 "inputs": [
                     "joint_q",
@@ -313,8 +282,6 @@ def build_manifest(
             },
         },
         "action": {
-            "version": ACTION_SPEC.version,
-            "pipeline_version": ACTION_PIPELINE_VERSION,
             "size": ACTION_SPEC.size,
             "joint_order": list(ACTION_SPEC.joint_order),
             "scale": list(ACTION_SPEC.scale),
@@ -335,36 +302,29 @@ def build_manifest(
             "joint_position": list(ACTION_SPEC.default_position),
             "base_height": DEFAULT_BASE_HEIGHT,
         },
-        "reward_version": REWARD_VERSION,
         "reward_contract": {
-            "source": (
-                "https://github.com/Holiday-Robot/FlashSAC/blob/main/"
-                "flash_rl/envs/genesis_envs/go2_walk_easy.py"
+            "source": "https://arxiv.org/abs/2503.08375",
+            "name": "r_total-track-x",
+            "time_scaling": "none",
+            "tracking_velocity": (
+                "1 in [target, 2*target]; 0 at <=-target or >=4*target; "
+                "otherwise 1-|vx-target|/(2*target)"
             ),
-            "dt": REWARD_DT,
-            "tracking_sigma": TRACKING_SIGMA,
-            "base_height_target": BASE_HEIGHT_TARGET,
-            "base_height_reference": "local_terrain_clearance",
-            "foot_clearance_target": FOOT_CLEARANCE_TARGET,
-            "foot_clearance_reference": "local_terrain_under_each_foot",
-            "foot_swing_signal": "world_horizontal_foot_speed",
-            "reward_scales_before_dt": dict(REWARD_SCALES),
-            "similar_to_default_joint_position": list(
-                REWARD_DEFAULT_JOINT_POSITION.tolist()
-            ),
-            "linear_velocity_frame": "full_quaternion_body_frame",
+            "linear_velocity_frame": "body",
+            "penalty_scales": {
+                "yaw_rate_squared": -0.1,
+                "roll_pitch_squared": -10.0,
+                "joint_torque_squared": -0.0003,
+            },
+            "clip": "max(sum, 0)",
             "command": {
                 "linear_velocity_x": float(target_velocity_x),
                 "linear_velocity_y": 0.0,
                 "angular_velocity_z": 0.0,
             },
             "failure_reward_shaping": False,
-            "stationary_local_optimum_fix": (
-                "negative_squared_xy_velocity_command_error"
-            ),
         },
         "failure": {
-            "version": FAILURE_CONTRACT_VERSION,
             "signal": [
                 "imu_quaternion_roll_pitch",
                 "base_clearance_above_local_terrain",
@@ -402,16 +362,28 @@ def validate_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> None:
 def validate_transfer_manifest(
     actual: dict[str, Any], expected: dict[str, Any]
 ) -> None:
-    """Validate policy/QSafe compatibility while allowing a new task reward.
+    """Validate shared semantics while allowing intended phase differences."""
 
-    Changing the reward or velocity command is the defining SQRL fine-tuning
-    operation.  Policy tensor meaning, safety labels, action/reset semantics,
-    and normalization remain strict transfer invariants.
-    """
-
-    transfer_expected = {
-        key: value
-        for key, value in expected.items()
-        if key not in ("reward_version", "reward_contract")
+    actual = {
+        **actual,
+        "environment": {
+            key: value for key, value in actual.get("environment", {}).items()
+            if key not in ("domain_randomization", "target_velocity_x")
+        },
+        "reward_contract": {
+            key: value for key, value in actual.get("reward_contract", {}).items()
+            if key != "command"
+        },
     }
-    validate_manifest(actual, transfer_expected)
+    expected = {
+        **expected,
+        "environment": {
+            key: value for key, value in expected.get("environment", {}).items()
+            if key not in ("domain_randomization", "target_velocity_x")
+        },
+        "reward_contract": {
+            key: value for key, value in expected.get("reward_contract", {}).items()
+            if key != "command"
+        },
+    }
+    validate_manifest(actual, expected)

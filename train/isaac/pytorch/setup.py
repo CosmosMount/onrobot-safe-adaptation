@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from train.config import PROJECT_ROOT
 from train.common.base import (
-    ACTION_SPEC, DEFAULT_BASE_HEIGHT, DEFAULT_JOINT_POSITION, JOINT_NAMES,
+    ACTION_SPEC, CONTACT_FRICTION, DEFAULT_BASE_HEIGHT, DEFAULT_JOINT_POSITION,
+    EPISODE_STEPS, GRAVITY_Z, JOINT_NAMES, PHYSICS_DT,
 )
 
 import numpy as np
@@ -486,20 +487,21 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
             size=(0.8, 0.6),
         )
         self.observations.policy.height_scan = None
-        self.decimation = 10
-        self.sim.dt = 0.002
+        self.decimation = int(ACTION_SPEC.control_dt / PHYSICS_DT)
+        self.sim.dt = PHYSICS_DT
+        self.sim.gravity = (0.0, 0.0, GRAVITY_Z)
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 10.0
+        self.episode_length_s = EPISODE_STEPS * ACTION_SPEC.control_dt
         self.commands.base_velocity.debug_vis = False
         configure_terrain(self.scene.terrain.terrain_generator, terrain_gen)
         configure_existing_events(
             self.events,
             enabled=False,
-            friction=0.4,
+            friction=CONTACT_FRICTION,
         )
         # ManagerBasedRLEnv requires a reward manager, but its output is not
         # part of the Go2 SQRL contract.  The adapter computes the shared
-        # FlashSAC walk-easy reward itself, so disable every inherited term.
+        # Gait in Eight tracking reward itself, so disable every inherited term.
         for reward_name in (
             "track_lin_vel_xy_exp",
             "track_ang_vel_z_exp",
@@ -545,6 +547,9 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
 
 def make_env_cfg(config, num_envs=None):
     cfg = Go2SQRLIsaacEnvCfg()
+    cfg.episode_length_s = (
+        int(config.environment.episode_steps) * ACTION_SPEC.control_dt
+    )
     configure_terrain_mode(
         cfg.scene.terrain,
         cfg.curriculum,

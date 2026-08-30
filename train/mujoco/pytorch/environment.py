@@ -9,9 +9,11 @@ from ml_collections import config_dict
 
 from sqrl.sac.environment import InvalidTransitionError
 from train.common.base import (
-    ACTION_SIZE, ACTION_SPEC, CONTROL_DT, DEFAULT_JOINT_POSITION, Go2Environment,
-    PHYSICS_DT, PHYSICS_STEPS_PER_ACTION, ActionMapper,
-    configure_failure_detection, format_policy_io_contract,
+    ACTION_SIZE, ACTION_SPEC, CONTROL_DT, DEFAULT_JOINT_POSITION,
+    Go2Environment, PHYSICS_DT,
+    PHYSICS_STEPS_PER_ACTION, ActionMapper,
+    configure_environment_contract, format_policy_io_contract,
+    validate_environment_contract,
 )
 from train.common.estimation import (
     VelocityEstimator, configure_velocity_estimator,
@@ -20,9 +22,8 @@ from train.common.estimation import (
 )
 from .sdk import MujocoResetController, SDKClient, StateBufferError, StateTimeout
 from train.common.task import (
-    BASE_HEIGHT_TARGET, EpisodeTracker, ObservationBuilder, compute_reward,
-    local_base_clearance, quaternion_to_rpy_wxyz,
-    swing_foot_clearance_error,
+    EpisodeTracker, ObservationBuilder, compute_reward, local_base_clearance,
+    quaternion_to_rpy_wxyz,
 )
 
 def get_config(environment_name):
@@ -32,16 +33,8 @@ def get_config(environment_name):
     config.nr_envs = 1
     config.domain_id = 1
     config.interface = "lo"
-    config.policy_frames = 10
-    # LowState is published at 500 Hz; one policy/learner iteration consumes
-    # ten fresh physical ticks while DDS transport remains on the host.
-    config.policy_period_seconds = 0.02
     configure_velocity_estimator(config)
-    configure_failure_detection(config)
-    # Runtime policy PD. Defaults reproduce the Isaac/checkpoint contract;
-    # command-line overrides are MuJoCo-only sensitivity experiments.
-    config.policy_kp = 25.0
-    config.policy_kd = 0.5
+    configure_environment_contract(config)
     config.state_timeout = 1.0
     config.manual_reset_timeout = -1.0
     config.auto_reset_on_start = True
@@ -77,14 +70,6 @@ def get_config(environment_name):
     # Position alone can look ready while the legs are still oscillating.
     config.reset_max_joint_velocity = 0.5
     config.reset_min_base_height = 0.20
-    config.episode_steps = 500
-    # The policy has no command input, so evaluation must use the fixed velocity
-    # objective on which it was pre-trained.
-    config.target_velocity_x = 0.5
-
-    config.kp = 25.0
-    config.kd = 0.5
-
     return config
 
 class FallDetector:
@@ -151,6 +136,7 @@ class Go2MujocoEnv(Go2Environment):
         reset_controller: MujocoResetController | None = None,
     ):
         environment = config.environment
+        validate_environment_contract(environment)
         if int(environment.policy_frames) != PHYSICS_STEPS_PER_ACTION:
             raise ValueError(
                 "MuJoCo control windows must contain exactly "
@@ -194,7 +180,6 @@ class Go2MujocoEnv(Go2Environment):
         self._last_observation: np.ndarray | None = None
         self._policy_blend_elapsed = 0.0
         self._initial_simulator_reset_done = False
-        self._previous_reward_action = np.zeros(ACTION_SIZE, dtype=np.float32)
         logger.info(
             "\n" + format_policy_io_contract(environment.target_velocity_x)
         )
@@ -424,7 +409,6 @@ class Go2MujocoEnv(Go2Environment):
         self.fall_detector.reset()
         self.episode.reset()
         self._policy_blend_elapsed = 0.0
-        self._previous_reward_action.fill(0.0)
         # Capture the measured reset pose before issuing any command. Stand-up
         # interpolation begins from this feedback, not from an assumed pose.
         state = self.client.state_buffer.latest_state
@@ -474,7 +458,6 @@ class Go2MujocoEnv(Go2Environment):
             dtype=np.float32,
         )
         mapped = self.action_mapper.apply(blended_action)
-        reward_action = np.clip(mapped.raw_action, -1.0, 1.0)
         # Learner updates can take longer than one control interval while the C++
         # simulator continues publishing LowState.  Discard that backlog by
         # anchoring the next ten-frame window at the latest pre-command tick.
@@ -502,74 +485,44 @@ class Go2MujocoEnv(Go2Environment):
         )
 
         truth = self.client.latest_training_state()
-        if truth is None:
-            rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
-            world_velocity = rotation @ estimated_body_velocity
-        else:
-            world_velocity = np.asarray(truth.world_velocity)
+        if truth is None or truth.base_position is None:
+            raise InvalidTransitionError(
+                "MuJoCo reward requires synchronized trunk velocity and position"
+            )
+        if final_state.actuator_torque is None:
+            raise InvalidTransitionError("MuJoCo reward requires joint torque feedback")
+        world_velocity = np.asarray(truth.world_velocity)
         rotation = quaternion_rotation_matrix_wxyz(final_state.imu_quat)
         reward_body_velocity = rotation.T @ np.asarray(world_velocity)
-        base_clearance = BASE_HEIGHT_TARGET
-        foot_clearance_error = 0.0
-        foot_clearance = np.full(4, np.nan, dtype=np.float64)
-        if truth is not None and truth.base_position is not None:
-            # The canonical SDK2 MuJoCo scene has a zero-height ground plane,
-            # so world z is exactly the local terrain clearance.
-            base_clearance = float(
-                local_base_clearance(np.asarray(truth.base_position)[2], 0.0)
-            )
-            height_failure = self.fall_detector.update_base_clearance(
-                base_clearance
-            )
-            failure = height_failure or failure
-            foot_position_body, joint_foot_velocity_body = (
-                foot_position_velocity_body(
-                    final_state.joint_q, final_state.joint_dq
-                )
-            )
-            relative_foot_velocity_body = (
-                joint_foot_velocity_body
-                + np.cross(
-                    np.asarray(final_state.imu_gyro, dtype=np.float64)[None, :],
-                    foot_position_body,
-                )
-            )
-            foot_position_world = (
-                np.asarray(truth.base_position, dtype=np.float64)[None, :]
-                + (rotation @ foot_position_body.T).T
-            )
-            foot_velocity_world = (
-                np.asarray(world_velocity, dtype=np.float64)[None, :]
-                + (rotation @ relative_foot_velocity_body.T).T
-            )
-            foot_clearance = foot_position_world[:, 2]
-            foot_clearance_error = swing_foot_clearance_error(
-                foot_clearance,
-                np.linalg.norm(foot_velocity_world[:, :2], axis=-1),
-            )
-        else:
-            height_failure = False
+        # The canonical SDK2 MuJoCo scene has a zero-height ground plane,
+        # so world z is exactly the local terrain clearance.
+        base_clearance = float(
+            local_base_clearance(np.asarray(truth.base_position)[2], 0.0)
+        )
+        height_failure = self.fall_detector.update_base_clearance(base_clearance)
+        failure = height_failure or failure
+        foot_position_body, _ = foot_position_velocity_body(
+            final_state.joint_q, final_state.joint_dq
+        )
+        foot_position_world = (
+            np.asarray(truth.base_position, dtype=np.float64)[None, :]
+            + (rotation @ foot_position_body.T).T
+        )
+        foot_clearance = foot_position_world[:, 2]
         terms = compute_reward(
-            world_velocity,
+            reward_body_velocity,
             final_state.imu_quat,
             final_state.imu_gyro,
-            final_state.joint_q,
-            reward_action,
-            self._previous_reward_action,
+            final_state.actuator_torque,
             float(self.config.target_velocity_x),
-            base_clearance=base_clearance,
-            foot_clearance_error=foot_clearance_error,
         )
-        self._previous_reward_action = reward_action.copy()
         terminated, truncated = self.episode.advance(terms.total, failure)
-        torque_saturation_ratio = np.nan
-        if truth is not None and truth.actuator_torque is not None:
-            torque_saturation_ratio = float(
-                np.mean(
-                    np.abs(np.asarray(truth.actuator_torque))
-                    > 0.95 * ACTION_SPEC.effort_limit
-                )
+        torque_saturation_ratio = float(
+            np.mean(
+                np.abs(np.asarray(final_state.actuator_torque))
+                > 0.95 * ACTION_SPEC.effort_limit
             )
+        )
         estimator = self.observation_builder.velocity_estimator
         innovation_squared = getattr(estimator, "last_innovation_squared", None)
         support_confidence = getattr(estimator, "last_support_confidence", None)
@@ -590,17 +543,13 @@ class Go2MujocoEnv(Go2Environment):
                 dtype=np.float32,
             ),
             "action_saturation_ratio": np.asarray(
-                [np.mean(np.abs(reward_action) > 0.98)], dtype=np.float32
+                [np.mean(np.abs(mapped.applied_action) > 0.98)], dtype=np.float32
             ),
             "torque_saturation_ratio": np.asarray(
                 [torque_saturation_ratio], dtype=np.float32
             ),
             "estimated_forward_velocity": np.asarray(
                 [estimated_body_velocity[0]], dtype=np.float32
-            ),
-            "reward_uses_simulator_truth": np.asarray(
-                [float(truth is not None)],
-                dtype=np.float32,
             ),
             "velocity_estimator/measurement_accepted": np.asarray(
                 [float(getattr(estimator, "last_measurement_accepted", False))],
@@ -624,31 +573,30 @@ class Go2MujocoEnv(Go2Environment):
             ),
             **{key: np.asarray([value], dtype=np.float32) for key, value in terms.as_dict().items()},
         }
-        if truth is not None:
-            info.update(
-                {
-                    "forward_velocity": np.asarray(
-                        [reward_body_velocity[0]], dtype=np.float32
-                    ),
-                    "target_velocity_error": np.asarray(
-                        [
-                            abs(
-                                float(self.config.target_velocity_x)
-                                - float(reward_body_velocity[0])
-                            )
-                        ],
-                        dtype=np.float32,
-                    ),
-                    "velocity_estimation_error": np.asarray(
-                        [
-                            np.linalg.norm(
-                                reward_body_velocity - estimated_body_velocity
-                            )
-                        ],
-                        dtype=np.float32,
-                    ),
-                }
-            )
+        info.update(
+            {
+                "forward_velocity": np.asarray(
+                    [reward_body_velocity[0]], dtype=np.float32
+                ),
+                "target_velocity_error": np.asarray(
+                    [
+                        abs(
+                            float(self.config.target_velocity_x)
+                            - float(reward_body_velocity[0])
+                        )
+                    ],
+                    dtype=np.float32,
+                ),
+                "velocity_estimation_error": np.asarray(
+                    [
+                        np.linalg.norm(
+                            reward_body_velocity - estimated_body_velocity
+                        )
+                    ],
+                    dtype=np.float32,
+                ),
+            }
+        )
 
         terminal_info = None
         final_observation = None

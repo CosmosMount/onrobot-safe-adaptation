@@ -11,7 +11,7 @@ from sqrl.sac.environment import RolloutStep
 from train.common.base import (
     ACTION_SIZE, ACTION_SPEC, DEFAULT_JOINT_POSITION, Go2Environment,
     PHYSICS_STEPS_PER_ACTION, format_policy_io_contract,
-    project_action_targets_tensor,
+    project_action_targets_tensor, validate_environment_contract,
 )
 from train.common.estimation import TorchVelocityEstimator, velocity_estimator_config_from
 from .setup import (
@@ -20,11 +20,7 @@ from .setup import (
     playback_terrain_column, relabel_isaac_backend_manager_output, sdk_joint_indices,
     validate_action_term_contract,
 )
-from train.common.task import (
-    BASE_HEIGHT_TARGET, FOOT_CLEARANCE_TARGET, REWARD_DEFAULT_JOINT_POSITION,
-    REWARD_DT, REWARD_SCALES, SWING_SPEED_FULL, SWING_SPEED_START,
-    TRACKING_SIGMA, local_base_clearance,
-)
+from train.common.task import compute_reward_tensor, local_base_clearance
 
 class TorchFallDetector:
     """Vectorized common tilt-or-low-base SQRL incident detector."""
@@ -106,6 +102,7 @@ class TorchFallDetector:
 # Partitioned source environment.
 class Go2IsaacEnv(Go2Environment):
     def __init__(self, config, backend=None):
+        validate_environment_contract(config.environment)
         self._owns_backend = backend is None
         if backend is None:
             from isaaclab.envs import ManagerBasedRLEnv
@@ -156,9 +153,6 @@ class Go2IsaacEnv(Go2Environment):
             foot_indices, dtype=torch.long, device=robot.device
         )
         self._previous_target = default_joint_target(self.nr_envs, robot.device)
-        self._previous_reward_action = torch.zeros(
-            (self.nr_envs, ACTION_SIZE), device=robot.device
-        )
         self._previous_quaternion = None
         self._velocity_estimator = TorchVelocityEstimator(
             self.nr_envs,
@@ -276,7 +270,6 @@ class Go2IsaacEnv(Go2Environment):
             dtype=self._previous_target.dtype,
             device=self._previous_target.device,
         )
-        self._previous_reward_action[env_ids] = 0.0
         self._velocity_estimator.reset(env_ids)
         self._fall_detector.reset(env_ids)
         if self._previous_quaternion is not None:
@@ -293,7 +286,6 @@ class Go2IsaacEnv(Go2Environment):
         self._previous_target = default_joint_target(
             self.nr_envs, self._robot.device
         )
-        self._previous_reward_action.zero_()
         self._previous_quaternion = None
         self._velocity_estimator.reset()
         self._fall_detector.reset()
@@ -322,7 +314,6 @@ class Go2IsaacEnv(Go2Environment):
         applied_action, target = project_action_targets_tensor(
             self._previous_target, action
         )
-        reward_action = action.clamp(-1.0, 1.0)
         self._previous_target = target
 
         _, _, backend_terminated, truncated, extras = self.backend.step(applied_action)
@@ -338,21 +329,6 @@ class Go2IsaacEnv(Go2Environment):
         # value, so retain a snapshot for sim-to-sim diagnostics.
         target_velocity = float(self.config.target_velocity_x)
         body_velocity = robot.data.root_lin_vel_b.clone()
-        tracking_lin_vel = torch.exp(
-            -(
-                (target_velocity - body_velocity[:, 0]).square()
-                + body_velocity[:, 1].square()
-            )
-            / TRACKING_SIGMA
-        )
-        velocity_error = (
-            (target_velocity - body_velocity[:, 0]).square()
-            + body_velocity[:, 1].square()
-        )
-        tracking_ang_vel = torch.exp(
-            -robot.data.root_ang_vel_b[:, 2].square() / TRACKING_SIGMA
-        )
-        lin_vel_z = body_velocity[:, 2].square()
         terrain_hits = torch.nan_to_num(
             self.backend.scene["height_scanner"].data.ray_hits_w,
             nan=0.0,
@@ -371,65 +347,25 @@ class Go2IsaacEnv(Go2Environment):
         base_clearance = local_base_clearance(
             robot.data.root_pos_w[:, 2], terrain_height
         )
-        base_height_error = (base_clearance - BASE_HEIGHT_TARGET).square()
         foot_position = robot.data.body_pos_w[:, self._foot_body_indices]
-        foot_velocity = robot.data.body_lin_vel_w[:, self._foot_body_indices]
         foot_hit_distance = (
-            foot_position[..., None, :2]
-            - terrain_hits[:, None, :, :2]
+            foot_position[..., None, :2] - terrain_hits[:, None, :, :2]
         ).square().sum(dim=-1)
         foot_hit_indices = foot_hit_distance.argmin(dim=-1)
         foot_ground_height = torch.gather(
             terrain_hits[..., 2], 1, foot_hit_indices
         )
         foot_clearance = foot_position[..., 2] - foot_ground_height
-        foot_horizontal_speed = torch.linalg.vector_norm(
-            foot_velocity[..., :2], dim=-1
+
+        imu = self.backend.scene["imu"]
+        torque = robot.data.applied_torque[:, self._joint_indices]
+        reward_terms, reward = compute_reward_tensor(
+            body_velocity,
+            imu.data.quat_w,
+            imu.data.ang_vel_b,
+            torque,
+            target_velocity,
         )
-        swing_weight = (
-            (foot_horizontal_speed - SWING_SPEED_START)
-            / (SWING_SPEED_FULL - SWING_SPEED_START)
-        ).clamp(0.0, 1.0)
-        foot_clearance_error = (
-            swing_weight
-            * (FOOT_CLEARANCE_TARGET - foot_clearance).clamp_min(0.0).square()
-        ).mean(dim=-1)
-        action_rate = (
-            reward_action - self._previous_reward_action
-        ).square().sum(dim=-1)
-        joint_q = robot.data.joint_pos[:, self._joint_indices]
-        default_joint_q = torch.as_tensor(
-            REWARD_DEFAULT_JOINT_POSITION,
-            dtype=joint_q.dtype,
-            device=joint_q.device,
-        )
-        similar_to_default = torch.abs(joint_q - default_joint_q).sum(dim=-1)
-        reward_terms = {
-            "tracking_lin_vel": REWARD_DT
-            * REWARD_SCALES["tracking_lin_vel"]
-            * tracking_lin_vel,
-            "velocity_error": REWARD_DT
-            * REWARD_SCALES["velocity_error"]
-            * velocity_error,
-            "tracking_ang_vel": REWARD_DT
-            * REWARD_SCALES["tracking_ang_vel"]
-            * tracking_ang_vel,
-            "lin_vel_z": REWARD_DT * REWARD_SCALES["lin_vel_z"] * lin_vel_z,
-            "base_height": REWARD_DT
-            * REWARD_SCALES["base_height"]
-            * base_height_error,
-            "foot_clearance": REWARD_DT
-            * REWARD_SCALES["foot_clearance"]
-            * foot_clearance_error,
-            "action_rate": REWARD_DT
-            * REWARD_SCALES["action_rate"]
-            * action_rate,
-            "similar_to_default": REWARD_DT
-            * REWARD_SCALES["similar_to_default"]
-            * similar_to_default,
-        }
-        reward = torch.stack(tuple(reward_terms.values()), dim=0).sum(dim=0)
-        self._previous_reward_action.copy_(reward_action)
         failure = self._fall_detector.update(
             self.backend.scene["imu"].data.quat_w,
             base_clearance,
@@ -464,7 +400,7 @@ class Go2IsaacEnv(Go2Environment):
             "mean_foot_clearance": foot_clearance.mean(dim=-1).detach().cpu().numpy(),
             "max_foot_clearance": foot_clearance.max(dim=-1).values.detach().cpu().numpy(),
             "action_saturation_ratio": (
-                reward_action.abs() > 0.98
+                applied_action.abs() > 0.98
             ).float().mean(dim=-1).detach().cpu().numpy(),
             "torque_saturation_ratio": (
                 robot.data.applied_torque[:, self._joint_indices].abs()

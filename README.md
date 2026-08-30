@@ -65,7 +65,7 @@ python -m pip install -e ".[mujoco]"
 
 ```bash
 python -m pip check
-python -c "import torch, mujoco; from train.common.base import ACTION_SPEC; print(ACTION_SPEC.version)"
+python -c "import torch, mujoco; from train.common.base import ACTION_SPEC; print(ACTION_SPEC.size)"
 python -c "import isaaclab, isaacsim; print('Isaac Lab environment is ready')"
 ```
 
@@ -82,12 +82,15 @@ one update per newly collected transition; changing the number of parallel
 environments therefore no longer silently changes the optimization budget.
 QSafe updates are credited only when complete safety trajectories are committed.
 
-The Go2 transfer manifest is deliberately strict. Manifest v11 records the SDK
-joint order, shared reset pose, absolute joint-target semantics, PD gains,
-torque limits, and the common tilt-or-low-base failure label. Older checkpoints
-are rejected; run `python -m train.runner pretrain` again instead of reusing policy
-and safety-critic weights trained with different tensor or incident semantics.
-The source and target tasks both use flat ground. Source pre-training enables
-bounded transfer randomization for friction, base/leg mass, COM, actuator
-gains, reset state, and proprioceptive sensor noise. Rough terrain remains a
-later robustness gate.
+The Go2 transfer manifest records the SDK joint order, shared reset pose,
+absolute joint-target semantics, PD gains, torque limits, and the common
+tilt-or-low-base failure label. Transfer checks keep those semantics strict
+while allowing the intended phase differences: Isaac pre-training enables
+domain randomization, and MuJoCo fine-tuning/evaluation uses a 0.6 m/s forward
+target instead of the 0.5 m/s pre-training target. Both backends retain flat
+ground, nominal friction, control timing, actuator contract, reset pose,
+failure label, episode horizon, and the same reward formula. MuJoCo also models
+small actuator-force sensor noise to better represent the measurement path used
+by the torque penalty. The reward is the non-negative Gait in Eight
+fixed-forward tracking objective: piecewise velocity tracking with yaw-rate,
+upright-orientation, and joint-torque energy penalties.

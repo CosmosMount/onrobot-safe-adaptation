@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from core.types import ObservationSpaceType
+from algorithms.types import ObservationSpaceType
 from algorithms.droq.pytorch.qnetwork import VectorQNetwork
 
 

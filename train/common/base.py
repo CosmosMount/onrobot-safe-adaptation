@@ -19,7 +19,10 @@ CONTROL_DT: Final = 0.02
 PHYSICS_DT: Final = 0.002
 PHYSICS_STEPS_PER_ACTION: Final = 10
 EPISODE_STEPS: Final = 500
-DEFAULT_BASE_HEIGHT: Final = 0.27
+DEFAULT_BASE_HEIGHT: Final = 0.289
+TARGET_VELOCITY_X: Final = 0.5
+CONTACT_FRICTION: Final = 0.4
+GRAVITY_Z: Final = -9.81
 
 DEFAULT_JOINT_POSITION = np.tile(
     np.asarray([0.0, 0.9, -1.8], dtype=np.float32), 4
@@ -50,8 +53,7 @@ JOINT_UPPER_LIMIT = np.asarray(
 
 
 @dataclass(frozen=True)
-class ObservationSpecV3:
-    version: str = "go2-observation-v3-body-velocity"
+class ObservationSpec:
     size: int = OBSERVATION_SIZE
     joint_q: slice = field(default_factory=lambda: slice(0, 12))
     joint_dq: slice = field(default_factory=lambda: slice(12, 24))
@@ -64,8 +66,7 @@ class ObservationSpecV3:
 
 
 @dataclass(frozen=True)
-class ActionSpecV2:
-    version: str = "go2-action-v2-per-joint-scale"
+class ActionSpec:
     size: int = ACTION_SIZE
     scale: tuple[float, ...] = tuple(ACTION_SCALE.tolist())
     control_dt: float = CONTROL_DT
@@ -84,19 +85,18 @@ class ActionSpecV2:
 
 
 @dataclass(frozen=True)
-class FailureSpecV3:
+class FailureSpec:
     """Sparse SQRL incident label shared by source and target backends."""
 
-    version: str = "tilt-or-low-terrain-clearance-sustained-v3"
     angle_threshold: float = 0.8
     min_base_clearance: float = 0.18
     consecutive_frames: int = 5
 
 
 # Canonical source/target tensor contract.
-OBSERVATION_SPEC = ObservationSpecV3()
-ACTION_SPEC = ActionSpecV2()
-FAILURE_SPEC = FailureSpecV3()
+OBSERVATION_SPEC = ObservationSpec()
+ACTION_SPEC = ActionSpec()
+FAILURE_SPEC = FailureSpec()
 
 
 def configure_failure_detection(config) -> None:
@@ -105,6 +105,63 @@ def configure_failure_detection(config) -> None:
     config.fall_angle_threshold = FAILURE_SPEC.angle_threshold
     config.fall_min_base_clearance = FAILURE_SPEC.min_base_clearance
     config.fall_consecutive_frames = FAILURE_SPEC.consecutive_frames
+
+
+def configure_environment_contract(config) -> None:
+    """Apply the nominal settings shared by Isaac Lab and MuJoCo."""
+
+    config.target_velocity_x = TARGET_VELOCITY_X
+    config.terrain_mode = "flat"
+    config.domain_randomization = False
+    config.friction = CONTACT_FRICTION
+    config.gravity_z = GRAVITY_Z
+    config.reset_base_height = DEFAULT_BASE_HEIGHT
+    config.physics_dt = PHYSICS_DT
+    config.control_dt = CONTROL_DT
+    config.policy_frames = PHYSICS_STEPS_PER_ACTION
+    config.policy_period_seconds = CONTROL_DT
+    config.episode_steps = EPISODE_STEPS
+    config.policy_kp = ACTION_SPEC.kp
+    config.policy_kd = ACTION_SPEC.kd
+    configure_failure_detection(config)
+
+
+def validate_environment_contract(config) -> None:
+    """Validate shared physics while allowing intentional phase settings."""
+
+    expected = {
+        "terrain_mode": "flat",
+        "friction": CONTACT_FRICTION,
+        "gravity_z": GRAVITY_Z,
+        "reset_base_height": DEFAULT_BASE_HEIGHT,
+        "physics_dt": PHYSICS_DT,
+        "control_dt": CONTROL_DT,
+        "policy_frames": PHYSICS_STEPS_PER_ACTION,
+        "policy_period_seconds": CONTROL_DT,
+        "episode_steps": EPISODE_STEPS,
+        "policy_kp": ACTION_SPEC.kp,
+        "policy_kd": ACTION_SPEC.kd,
+        "fall_angle_threshold": FAILURE_SPEC.angle_threshold,
+        "fall_min_base_clearance": FAILURE_SPEC.min_base_clearance,
+        "fall_consecutive_frames": FAILURE_SPEC.consecutive_frames,
+    }
+    for name, value in expected.items():
+        actual = getattr(config, name, None)
+        if isinstance(value, float):
+            aligned = actual is not None and np.isclose(float(actual), value, rtol=0.0, atol=1e-12)
+        else:
+            aligned = actual == value
+        if not aligned:
+            raise ValueError(f"environment.{name} must be {value!r}, got {actual!r}")
+    target_velocity_x = getattr(config, "target_velocity_x", None)
+    if target_velocity_x is None or not np.isfinite(float(target_velocity_x)) or float(target_velocity_x) <= 0.0:
+        raise ValueError(f"environment.target_velocity_x must be positive, got {target_velocity_x!r}")
+    domain_randomization = getattr(config, "domain_randomization", None)
+    if not isinstance(domain_randomization, (bool, np.bool_)):
+        raise ValueError(
+            "environment.domain_randomization must be a boolean, "
+            f"got {domain_randomization!r}"
+        )
 
 
 def format_policy_io_contract(target_velocity_x: float) -> str:
@@ -162,6 +219,7 @@ class RobotState:
     imu_gyro: Array
     imu_quat: Array
     imu_accelerometer: Array | None = None
+    actuator_torque: Array | None = None
     tick: int | None = None
 
 
@@ -181,26 +239,18 @@ class ActionResult:
 
 @dataclass(slots=True)
 class RewardTerms:
-    tracking_lin_vel: float
-    velocity_error: float
-    tracking_ang_vel: float
-    lin_vel_z: float
-    base_height: float
-    foot_clearance: float
-    action_rate: float
-    similar_to_default: float
+    tracking_velocity: float
+    yaw_rate: float
+    upright: float
+    energy: float
     total: float
 
     def as_dict(self) -> dict[str, float]:
         return {
-            "reward/tracking_lin_vel": self.tracking_lin_vel,
-            "reward/velocity_error": self.velocity_error,
-            "reward/tracking_ang_vel": self.tracking_ang_vel,
-            "reward/lin_vel_z": self.lin_vel_z,
-            "reward/base_height": self.base_height,
-            "reward/foot_clearance": self.foot_clearance,
-            "reward/action_rate": self.action_rate,
-            "reward/similar_to_default": self.similar_to_default,
+            "reward/tracking_velocity": self.tracking_velocity,
+            "reward/yaw_rate": self.yaw_rate,
+            "reward/upright": self.upright,
+            "reward/energy": self.energy,
             "reward/total": self.total,
         }
 
@@ -345,10 +395,11 @@ class Go2Environment:
 
     def __init__(self, config, nr_envs):
         from types import SimpleNamespace
-        from core.types import ActionSpaceType, ObservationSpaceType
+        from algorithms.types import ActionSpaceType, ObservationSpaceType
         from gymnasium.spaces import Box
 
         self.config = config.environment
+        validate_environment_contract(self.config)
         self.nr_envs = self.num_envs = int(nr_envs)
         self.single_observation_space = Box(low=-np.inf, high=np.inf, shape=(OBSERVATION_SIZE,), dtype=np.float32)
         self.single_action_space = Box(low=-1.0, high=1.0, shape=(ACTION_SIZE,), dtype=np.float32)
@@ -402,6 +453,7 @@ class Go2Environment:
             fall_min_base_clearance=float(self.config.fall_min_base_clearance),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
+            domain_randomization=bool(self.config.domain_randomization),
         )
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):

@@ -208,6 +208,9 @@ def decode_low_state(message: Any) -> RobotState:
         imu_gyro=np.asarray(_read(imu.gyroscope), dtype=np.float32)[:3],
         imu_quat=np.asarray(_read(imu.quaternion), dtype=np.float32)[:4],
         imu_accelerometer=np.asarray(_read(imu.accelerometer), dtype=np.float32)[:3],
+        actuator_torque=np.asarray(
+            [float(_read(motor.tau_est)) for motor in motors], dtype=np.float32
+        ),
         tick=int(_read(message.tick)),
     )
 
@@ -299,10 +302,7 @@ class SDKClient:
 
     def _on_low_state(self, message: Any) -> None:
         state = decode_low_state(message)
-        motors = _read(message.motor_state)[:ACTION_SIZE]
-        self._latest_torque = np.asarray(
-            [float(_read(motor.tau_est)) for motor in motors], dtype=np.float32
-        )
+        self._latest_torque = np.asarray(state.actuator_torque, dtype=np.float32)
         self.state_buffer.push(state)
 
     def _on_high_state(self, message: Any) -> None:

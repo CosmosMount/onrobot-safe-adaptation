@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from core.types import ObservationSpaceType
+from algorithms.types import ObservationSpaceType
 from algorithms.sac.pytorch.qnetwork import get_q_network
 
 
