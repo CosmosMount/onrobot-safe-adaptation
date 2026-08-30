@@ -38,6 +38,7 @@ class SQRLPretrainer:
         self.batch_size = int(config.algorithm.batch_size)
         self.safety_batch_size = int(config.algorithm.get("safety_batch_size", config.algorithm.batch_size))
         self.learning_starts = int(config.algorithm.get("learning_starts", 0))
+        self.task_utd_ratio = float(config.algorithm.get("task_utd_ratio", 1.0))
         # uses n_pre for outer iterations; total_timesteps is the practical task-transition budget.
         n_pre = config.algorithm.get("n_pre", None)
         self.nr_pretrain_iterations = None if n_pre is None else int(n_pre)
@@ -70,6 +71,8 @@ class SQRLPretrainer:
             raise ValueError("k must be at least 1")
         if self.max_safe_action_samples < 1:
             raise ValueError("max_safe_action_samples must be at least 1")
+        if not np.isfinite(self.task_utd_ratio) or self.task_utd_ratio < 0.0:
+            raise ValueError("task_utd_ratio must be a finite non-negative value")
         if self.bf16_mixed_precision_training and self.device.type != "cuda":
             raise ValueError("bfloat16 mixed precision training requires CUDA")
 
@@ -116,6 +119,7 @@ class SQRLPretrainer:
         self.state = None
         self.task_steps = 0
         self.task_updates = 0
+        self.task_update_credit = 0.0
         self.safety_rollouts = 0
         self.safety_updates = 0
 
@@ -275,11 +279,17 @@ class SQRLPretrainer:
             terminations.astype(np.float32), failures
         )
         self.state = next_state
+        previous_task_steps = self.task_steps
         self.task_steps += self.nr_envs
-
-        if self.task_steps < self.learning_starts:
-            return None
-        return update_networks()
+        eligible_before = max(0, previous_task_steps - self.learning_starts)
+        eligible_after = max(0, self.task_steps - self.learning_starts)
+        self.task_update_credit += (eligible_after - eligible_before) * self.task_utd_ratio
+        nr_updates = int(np.floor(self.task_update_credit + 1e-12))
+        self.task_update_credit -= nr_updates
+        metrics = None
+        for _ in range(nr_updates):
+            metrics = update_networks()
+        return metrics
 
     def train_safety(self):
         def sample_actions(state):
@@ -287,25 +297,24 @@ class SQRLPretrainer:
                 device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training
             ):
                 state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-                accepted = torch.zeros(self.nr_envs, dtype=torch.bool, device=self.device)
-                best_safe_q = torch.full((self.nr_envs,), torch.inf, device=self.device)
-                actions = torch.empty(
-                    (self.nr_envs,) + self.safety_env.single_action_space.shape, dtype=torch.float32, device=self.device
-                )
-                processed_actions = torch.empty_like(actions)
-
-                for _ in range(self.max_safe_action_samples):
-                    candidate_actions, candidate_processed_actions, _ = self.policy.get_action(state)
-                    candidate_safe_q = self.safe_critic.q(state, candidate_actions).reshape(self.nr_envs)
-                    unresolved = ~accepted
-                    better_candidate = unresolved & (candidate_safe_q < best_safe_q)
-                    actions[better_candidate] = candidate_actions[better_candidate]
-                    processed_actions[better_candidate] = candidate_processed_actions[better_candidate]
-                    best_safe_q[better_candidate] = candidate_safe_q[better_candidate]
-                    accepted |= unresolved & (candidate_safe_q < self.epsilon_safe)
-                    if bool(accepted.all()):
-                        break
-            return actions.cpu().numpy(), processed_actions.cpu().numpy()
+                candidate_states = state[:, None, :].expand(-1, self.max_safe_action_samples, -1)
+                flat_states = candidate_states.reshape(self.nr_envs * self.max_safe_action_samples, -1)
+                actions, processed_actions, _ = self.policy.get_action(flat_states)
+                actions = actions.reshape((self.nr_envs, self.max_safe_action_samples) + self.safety_env.single_action_space.shape)
+                processed_actions = processed_actions.reshape_as(actions)
+                safe_q = self.safe_critic.q(
+                    flat_states, actions.reshape(self.nr_envs * self.max_safe_action_samples, -1)
+                ).reshape(self.nr_envs, self.max_safe_action_samples)
+                safe_mask = safe_q < self.epsilon_safe
+                fallback = ~safe_mask.any(dim=1)
+                boundary_q = torch.where(safe_mask, safe_q, torch.full_like(safe_q, -torch.inf))
+                selected = boundary_q.argmax(dim=1)
+                selected = torch.where(fallback, safe_q.argmin(dim=1), selected)
+                indices = torch.arange(self.nr_envs, device=self.device)
+            return (
+                actions[indices, selected].float().cpu().numpy(),
+                processed_actions[indices, selected].float().cpu().numpy(),
+            )
 
         def process_step(next_state, terminations, truncations, info):
             terminations = np.asarray(terminations, dtype=bool).reshape(self.nr_envs)

@@ -30,6 +30,7 @@ class SQRLFinetuner:
         self.tau = float(config.algorithm.tau)
         self.batch_size = int(config.algorithm.batch_size)
         self.nr_target_steps = int(config.algorithm.get("n_target", config.algorithm.get("total_timesteps", 500_000)))
+        self.task_utd_ratio = float(config.algorithm.get("task_utd_ratio", 1.0))
         self.epsilon_safe = float(config.algorithm.get("epsilon_safe", 0.1))
         self.nr_action_candidates = int(config.algorithm.get("max_safe_action_samples", 100))
         self.buffer_size = int(config.algorithm.get("task_buffer_size", config.algorithm.get("buffer_size", 1_000_000)))
@@ -39,6 +40,8 @@ class SQRLFinetuner:
             raise ValueError("n_target must be at least 1")
         if self.nr_action_candidates < 1:
             raise ValueError("max_safe_action_samples must be at least 1")
+        if not np.isfinite(self.task_utd_ratio) or self.task_utd_ratio < 0.0:
+            raise ValueError("task_utd_ratio must be a finite non-negative value")
         if self.bf16_mixed_precision_training and self.device.type != "cuda":
             raise ValueError("bfloat16 mixed precision training requires CUDA")
 
@@ -77,6 +80,7 @@ class SQRLFinetuner:
         self.state = None
         self.target_steps = 0
         self.updates = 0
+        self.task_update_credit = 0.0
 
     def train(self):
         def sample_actions(state):
@@ -225,9 +229,14 @@ class SQRLFinetuner:
             )
             self.state = next_state
             self.target_steps += self.nr_envs
-            metrics = update_networks()
+            self.task_update_credit += self.nr_envs * self.task_utd_ratio
+            nr_updates = int(np.floor(self.task_update_credit + 1e-12))
+            self.task_update_credit -= nr_updates
+            metrics = None
+            for _ in range(nr_updates):
+                metrics = update_networks()
 
-            if self.target_steps % self.logging_frequency < self.nr_envs:
+            if metrics is not None and self.target_steps % self.logging_frequency < self.nr_envs:
                 sqrl_finetune_logger.info(
                     "target_steps=%d updates=%d failure_rate=%.6f fallback_rate=%.6f "
                     "selected_safe_q=%.6f policy_loss=%.6f nu=%.6f",
