@@ -28,8 +28,7 @@ class QNetwork(nn.Module):
             nn.Linear(nr_hidden_units, nr_hidden_units),
             nn.ReLU(),
             nn.Linear(nr_hidden_units, 1),
-            # QSafe represents a discounted probability of failure.
-            nn.Sigmoid()
+            nn.Tanh()
         )
 
     
