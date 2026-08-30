@@ -5,16 +5,39 @@ experiment:
 
 runner:
   track_console: true
-  track_wandb: true
+  track_tb: false
+  track_wandb: false
+  wandb_entity: placeholder
   project_name: go2_rl
   exp_name: sac_baseline
+  run_name: sac_run
+  notes: SAC baseline
+  save_model: true
+  load_model: ""
+  nr_test_episodes: 10
 
 algorithm:
   device: gpu
+  compile_mode: reduce-overhead
+  bf16_mixed_precision_training: true
+  total_timesteps: 1000000000
   learning_rate: 0.0003
+  anneal_learning_rate: false
+  buffer_size: 1000000
+  learning_starts: 5000
   batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  target_entropy: auto
+  log_std_min: -20
+  log_std_max: 2
+  nr_hidden_units: 256
+  logging_frequency: 300
+  evaluation_frequency: -1
+  evaluation_episodes: 10
 
 environment:
+  seed: 0
   device: gpu
   nr_envs: 4096
   render: false

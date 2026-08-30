@@ -1,7 +1,7 @@
 import torch.nn as nn
 
-from rlx.types import ObservationSpaceType
-from rlx.algorithms.sac.pytorch.network import get_q_network
+from core.types import ObservationSpaceType
+from algorithms.sac.pytorch.qnetwork import get_q_network
 
 
 def get_critic(config, env, device):

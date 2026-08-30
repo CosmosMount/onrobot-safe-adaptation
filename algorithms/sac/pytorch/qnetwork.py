@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from rlx.types import ObservationSpaceType
+from core.types import ObservationSpaceType
 
 def get_q_network(config, env, device):
     observation_space_type = env.general_properties.observation_space_type

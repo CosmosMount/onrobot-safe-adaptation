@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.distributions.normal import Normal
 
-from rlx.types import ActionSpaceType, ObservationSpaceType
+from core.types import ActionSpaceType, ObservationSpaceType
 
 def get_policy(config, env, device):
 

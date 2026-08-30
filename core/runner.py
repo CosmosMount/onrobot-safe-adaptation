@@ -12,7 +12,7 @@ import yaml
 from absl import logging as absl_logging
 from ml_collections import config_dict
 
-from rlx.manager import (
+from core.manager import (
     get_algorithm_config,
     get_algorithm_general_properties,
     get_algorithm_model_class,
@@ -20,7 +20,7 @@ from rlx.manager import (
     get_environment_create_train_and_eval_env,
     get_environment_general_properties,
 )
-from rlx.types import DLFrameworkType, SimulationType
+from core.types import DLFrameworkType, SimulationType
 
 
 os.environ["WANDB__SERVICE_WAIT"] = "600"
@@ -108,6 +108,7 @@ def get_runner_default_config(runner_mode):
     return config_dict.ConfigDict({
         "mode": runner_mode,
         "track_console": False,
+        "track_tb": False,
         "track_wandb": False,
         "wandb_entity": "placeholder",
         "project_name": "placeholder",
@@ -163,7 +164,10 @@ class Runner:
         self._create_train_and_eval_env = get_environment_create_train_and_eval_env(environment_name)
         self._explicit_algorithm_params = get_explicit_config_params(algorithm_overrides, "algorithm")
 
-        self._config = config_dict.ConfigDict()
+        # Preserve additional top-level YAML sections (for example ``sqrl`` or
+        # ``safety``) while replacing the standard sections with their
+        # default-merged versions below.
+        self._config = config_dict.ConfigDict(yaml_config)
         self._config.experiment = config_dict.ConfigDict(experiment_config)
         self._config.runner = runner_config
         self._config.algorithm = algorithm_config
@@ -377,16 +381,32 @@ class Runner:
 
     def train(self):
         run_path = self.get_run_path()
-        if self._config.runner.save_model or self._config.runner.track_wandb:
+        if self._config.runner.save_model or self._config.runner.track_tb or self._config.runner.track_wandb:
             os.makedirs(run_path, exist_ok=True)
 
         wandb = self.initialize_wandb(run_path) if self._config.runner.track_wandb else None
+        writer = None
+        if self._config.runner.track_tb:
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(run_path)
+            flattened_config = self._config.to_dict()
+            writer.add_text(
+                "hyperparameters",
+                "|section|parameter|value|\n|-|-|-|\n"
+                + "\n".join(
+                    f"|{section}|{key}|{value}|"
+                    for section, values in flattened_config.items()
+                    if isinstance(values, Mapping)
+                    for key, value in values.items()
+                ),
+            )
         train_env, eval_env = self._create_train_and_eval_env(self._config)
 
         if self._config.runner.load_model:
-            model = self._model_class.load(self._config, train_env, eval_env, run_path, None, self._explicit_algorithm_params)
+            model = self._model_class.load(self._config, train_env, eval_env, run_path, writer, self._explicit_algorithm_params)
         else:
-            model = self._model_class(self._config, train_env, eval_env, run_path, None)
+            model = self._model_class(self._config, train_env, eval_env, run_path, writer)
 
         try:
             model.train()
@@ -395,6 +415,8 @@ class Runner:
         finally:
             train_env.close()
             eval_env.close()
+            if writer:
+                writer.close()
             if wandb:
                 wandb.finish()
             if self.environment_uses_isaac_lab:
@@ -404,6 +426,8 @@ class Runner:
     def test(self):
         if self._config.runner.track_wandb:
             raise ValueError("Wandb is not supported in test mode")
+        if self._config.runner.track_tb:
+            raise ValueError("Tensorboard is not supported in test mode")
         if self._config.runner.save_model:
             raise ValueError("Saving model is not supported in test mode")
 
