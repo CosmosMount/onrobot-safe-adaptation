@@ -1,0 +1,76 @@
+{
+  "conclusion": "NOT_USEFUL_FOR_CURRENT_TASK",
+  "created_utc": "2026-08-30T12:35:59.153644+00:00",
+  "interpretation": "The requested 100k five-seed A/B was stopped by the user after two complete paired seeds; this partial result is diagnostic only. Offline calibration and frozen protection explain the result but are not conjunctive gates.",
+  "post_run_action": "REPORT_BEFORE_ANY_MODIFICATION",
+  "primary_evidence": {
+    "completed_seeds": [
+      0,
+      1
+    ],
+    "evaluation_100k": {
+      "A": {
+        "episodes": 40,
+        "falls": 0,
+        "stable_successes": 0,
+        "stuck": 40
+      },
+      "B": {
+        "episodes": 40,
+        "falls": 21,
+        "stable_successes": 0,
+        "stuck": 18
+      }
+    },
+    "per_seed": [
+      {
+        "evaluation_fall_delta_B_minus_A": 20,
+        "seed": 0,
+        "training_fall_delta_B_minus_A": -76
+      },
+      {
+        "evaluation_fall_delta_B_minus_A": 1,
+        "seed": 1,
+        "training_fall_delta_B_minus_A": -72
+      }
+    ],
+    "requested_seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "status": "PARTIAL_USER_STOP",
+    "training": {
+      "A": {
+        "episodes": 572,
+        "fall_rate": 0.5856643356643356,
+        "falls": 335,
+        "stable_successes": 89,
+        "stuck": 122
+      },
+      "B": {
+        "episodes": 468,
+        "fall_rate": 0.3995726495726496,
+        "falls": 187,
+        "stable_successes": 154,
+        "stuck": 93
+      }
+    }
+  },
+  "profile": "frs_diagnostic_v1",
+  "supporting_evidence": {
+    "offline_strict_status": "WARN",
+    "offline_support": false,
+    "protection": {
+      "diagnostic_status": "WARN",
+      "fall_reduction": -0.6,
+      "reference_pass": false,
+      "stable_success_delta": 0.0,
+      "stuck_rate": 0.71,
+      "velocity_retention": 1.0849452415057947
+    },
+    "protection_support": false
+  }
+}

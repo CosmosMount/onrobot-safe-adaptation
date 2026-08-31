@@ -1,7 +1,9 @@
 import os
+import json
 import logging
 import time
 from collections import deque
+from pathlib import Path
 import tree
 import numpy as np
 import jax
@@ -21,6 +23,8 @@ from rl_x.algorithms.sac.flax.replay_buffer import ReplayBuffer
 from rl_x.algorithms.sac.flax.rl_train_state import RLTrainState
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
+    GaitEvaluationMetrics,
+    TASK_ACTION_CONTRACT,
     actor_updates_enabled,
     extract_failure_signal,
     finetune_constraints_enabled,
@@ -43,6 +47,15 @@ from rl_x.algorithms.sac_qsafe.flax.observation_normalizer import (
 from rl_x.environments.safety_rollout import InvalidTransitionError
 
 rlx_logger = logging.getLogger("rl_x")
+
+
+def _apply_gradients_if_enabled(train_state, gradients, enabled):
+    return jax.lax.cond(
+        enabled,
+        lambda value: value.apply_gradients(grads=gradients),
+        lambda value: value,
+        train_state,
+    )
 
 
 class SAC_QSafe:
@@ -109,6 +122,17 @@ class SAC_QSafe:
             self.finetune_actor_warmup_steps,
             self.finetune_actor_update_interval,
         )
+        self.task_utd_ratio = float(config.algorithm.task_utd_ratio)
+        if not np.isclose(self.task_utd_ratio, 1.0):
+            raise ValueError(
+                "The serial Flax/MuJoCo learner currently supports exactly "
+                "task_utd_ratio=1.0 (one critic update per transition)."
+            )
+        self.checkpoint_frequency = int(config.algorithm.checkpoint_frequency)
+        if self.checkpoint_frequency == 0 or self.checkpoint_frequency < -1:
+            raise ValueError(
+                "algorithm.checkpoint_frequency must be -1 or a positive integer"
+            )
         self.qsafe_updates_per_iteration = int(
             config.algorithm.qsafe.updates_per_iteration
         )
@@ -156,10 +180,14 @@ class SAC_QSafe:
             self._projector_is_jax,
         ) = resolve_action_projectors(self.train_env)
         if self._host_project_actions is not None and not self._projector_is_jax:
+            if self.finetune_constraints_enabled:
+                raise ValueError(
+                    "Flax QSafe Eq.4 requires a differentiable JAX-compatible "
+                    "environment.project_actions hook."
+                )
             rlx_logger.warning(
-                "Environment project_actions is NumPy-only. Rollout candidates "
-                "will be projected on the host, while differentiable SAC actor "
-                "and target kernels must use identity projection."
+                "Environment project_actions is NumPy-only. Applied-action "
+                "task SAC requires a differentiable projector during learning."
             )
 
         self.policy, self.get_processed_action = get_policy(config, self.train_env)
@@ -182,7 +210,7 @@ class SAC_QSafe:
             total_steps = self.total_timesteps - self.learning_starts
             fraction = 1.0 - (step / total_steps)
             return self.learning_rate * fraction
-        
+
         self.q_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
         self.policy_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
         self.entropy_learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
@@ -222,6 +250,8 @@ class SAC_QSafe:
             if self.qsafe_enabled
             else None
         )
+        self._qsafe_reset_masks = {}
+        self._last_qsafe_observations = {}
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
             self.observation_normalizer.freeze()
@@ -268,11 +298,16 @@ class SAC_QSafe:
         self.observation_normalizer.load_state_dict(
             artifact["normalizer_state"], artifact["normalizer_metadata"]
         )
-        if not hasattr(self.train_env, "validate_transfer_checkpoint_manifest"):
+        validator = getattr(
+            self.train_env,
+            "validate_actor_checkpoint_manifest",
+            getattr(self.train_env, "validate_transfer_checkpoint_manifest", None),
+        )
+        if validator is None:
             raise ValueError(
                 "Fine-tuning environment must validate the policy transfer manifest"
             )
-        self.train_env.validate_transfer_checkpoint_manifest(
+        validator(
             artifact["environment_manifest"], self.observation_normalizer.metadata()
         )
         self.observation_normalizer.freeze()
@@ -294,20 +329,18 @@ class SAC_QSafe:
         def deterministic(params, raw_states, mean, std, epsilon):
             states = self._normalize_kernel(raw_states, mean, std, epsilon)
             action_mean, _ = self.policy.apply(params, states)
-            actions = jnp.tanh(action_mean)
-            return self._jax_project_actions(raw_states, actions)
+            return jnp.tanh(action_mean)
 
         def unconstrained(params, raw_states, mean, std, epsilon, key):
             states = self._normalize_kernel(raw_states, mean, std, epsilon)
             action_mean, action_logstd = self.policy.apply(params, states)
             key, action_key = jax.random.split(key)
-            actions = jnp.tanh(
+            raw_actions = jnp.tanh(
                 action_mean
                 + jnp.exp(action_logstd)
                 * jax.random.normal(action_key, shape=action_mean.shape)
             )
-            actions = self._jax_project_actions(raw_states, actions)
-            return actions, key
+            return raw_actions, key
 
         def candidates(params, raw_states, mean, std, epsilon, key):
             states = self._normalize_kernel(raw_states, mean, std, epsilon)
@@ -323,14 +356,21 @@ class SAC_QSafe:
             pretanh = action_mean + action_std * jax.random.normal(
                 action_key, shape=action_mean.shape
             )
-            candidate_actions = jnp.tanh(pretanh)
-            candidate_actions = self._project_flat_candidates(
-                raw_states, candidate_actions
+            raw_candidate_actions = jnp.tanh(pretanh)
+            applied_candidate_actions = self._project_flat_candidates(
+                raw_states, raw_candidate_actions
             )
             log_probs = squashed_gaussian_log_probability(
                 pretanh, action_mean, action_logstd
             )
-            return states, candidate_actions, log_probs, key, selection_key
+            return (
+                states,
+                raw_candidate_actions,
+                applied_candidate_actions,
+                log_probs,
+                key,
+                selection_key,
+            )
 
         self._deterministic_action_jit = jax.jit(deterministic)
         self._unconstrained_action_jit = jax.jit(unconstrained)
@@ -367,7 +407,7 @@ class SAC_QSafe:
             self.key,
         )
         if self.qsafe_enabled:
-            states, candidates, log_probs, _, selection_key = (
+            states, _, applied_candidates, log_probs, _, selection_key = (
                 self._candidate_distribution_jit(
                     self.policy_state.params,
                     dummy_states,
@@ -382,10 +422,18 @@ class SAC_QSafe:
                 if self.phase == "pretrain"
                 else self.qsafe._select_finetune_jit
             )
+            qsafe_states = (
+                jnp.zeros(
+                    (nr_envs, self.qsafe.observation_shape[0]),
+                    dtype=jnp.float32,
+                )
+                if self.qsafe.version == 2
+                else states
+            )
             selected, _, _ = select(
                 self.qsafe.state.params,
-                states,
-                candidates,
+                qsafe_states,
+                applied_candidates,
                 log_probs,
                 selection_key,
             )
@@ -408,7 +456,7 @@ class SAC_QSafe:
             self.observation_normalizer.update(states)
         raw_states = jnp.asarray(states, dtype=jnp.float32)
         mean, std, epsilon = self._normalizer_parameters()
-        actions, self.key = self._unconstrained_action_jit(
+        raw_actions, self.key = self._unconstrained_action_jit(
             self.policy_state.params,
             raw_states,
             mean,
@@ -416,28 +464,31 @@ class SAC_QSafe:
             epsilon,
             self.key,
         )
-        actions = self._host_project(states, actions)
-        return actions, self.get_processed_action(actions)
+        applied_actions = self._jax_project_actions(raw_states, raw_actions)
+        applied_actions = self._host_project(states, applied_actions)
+        return raw_actions, self.get_processed_action(applied_actions)
 
     def _sample_deterministic_action(self, states):
         raw_states = jnp.asarray(states, dtype=jnp.float32)
         mean, std, epsilon = self._normalizer_parameters()
-        actions = self._deterministic_action_jit(
+        raw_actions = self._deterministic_action_jit(
             self.policy_state.params,
             raw_states,
             mean,
             std,
             epsilon,
         )
-        actions = self._host_project(states, actions)
-        return actions, self.get_processed_action(actions)
+        applied_actions = self._jax_project_actions(raw_states, raw_actions)
+        applied_actions = self._host_project(states, applied_actions)
+        return raw_actions, self.get_processed_action(applied_actions)
 
-    def _sample_policy_candidates(self, states, phase=None):
+    def _sample_policy_candidates(self, states, phase=None, stream="task"):
         raw_states = jnp.asarray(states, dtype=jnp.float32)
         mean, std, epsilon = self._normalizer_parameters()
         (
             normalized_states,
-            candidate_actions,
+            raw_candidate_actions,
+            applied_candidate_actions,
             log_probs,
             self.key,
             selection_key,
@@ -450,16 +501,20 @@ class SAC_QSafe:
             self.key,
         )
         if not self._projector_is_jax and self._host_project_actions is not None:
-            nr_envs, nr_candidates = candidate_actions.shape[:2]
+            nr_envs, nr_candidates = raw_candidate_actions.shape[:2]
             repeated_states = np.repeat(
                 np.asarray(states, dtype=np.float32)[:, None, :], nr_candidates, axis=1
             )
             projected = self._host_project_actions(
                 repeated_states.reshape((nr_envs * nr_candidates, -1)),
-                jax.device_get(candidate_actions).reshape((nr_envs * nr_candidates, -1)),
+                jax.device_get(raw_candidate_actions).reshape(
+                    (nr_envs * nr_candidates, -1)
+                ),
             )
-            candidate_actions = jnp.asarray(projected, dtype=jnp.float32).reshape(
-                candidate_actions.shape
+            applied_candidate_actions = jnp.asarray(
+                projected, dtype=jnp.float32
+            ).reshape(
+                raw_candidate_actions.shape
             )
         phase = phase or self.phase
         if phase == "pretrain":
@@ -468,14 +523,37 @@ class SAC_QSafe:
             select = self.qsafe._select_finetune_jit
         else:
             raise ValueError(f"Unknown SQRL phase: {phase}")
-        selected_actions, _, metrics = select(
+        if self.qsafe.version == 2:
+            safety_observations = self.qsafe.rollout_observations(
+                np.asarray(states, dtype=np.float32),
+                reset_mask=self._qsafe_reset_masks.pop(stream, None),
+                stream=stream,
+            )
+            safety_observations = self.qsafe.normalize_observations(
+                safety_observations
+            )
+        else:
+            safety_observations = normalized_states
+        self._last_qsafe_observations[stream] = np.asarray(
+            self.qsafe._rollout_histories[stream].frames.reshape(
+                len(states), -1
+            )
+            if self.qsafe.version == 2
+            else states,
+            dtype=np.float32,
+        )
+        selected_applied_actions, selected_indices, metrics = select(
             self.qsafe.state.params if self.qsafe_enabled else {},
-            normalized_states,
-            candidate_actions,
+            safety_observations,
+            applied_candidate_actions,
             log_probs,
             selection_key,
         )
-        absolute_z = jnp.abs(normalized_states)
+        batch_indices = jnp.arange(raw_candidate_actions.shape[0])
+        selected_raw_actions = raw_candidate_actions[
+            batch_indices, selected_indices
+        ]
+        absolute_z = jnp.abs(safety_observations)
         metrics = {
             **metrics,
             "qsafe/observation_abs_z_p95": jnp.quantile(
@@ -483,7 +561,11 @@ class SAC_QSafe:
             ),
             "qsafe/observation_ood_fraction": jnp.mean(absolute_z > 5.0),
         }
-        return selected_actions, self.get_processed_action(selected_actions), metrics
+        return (
+            selected_raw_actions,
+            self.get_processed_action(selected_applied_actions),
+            metrics,
+        )
         
     
     def train(self):
@@ -491,9 +573,11 @@ class SAC_QSafe:
         def update(
                 policy_state: TrainState, critic_state: RLTrainState, entropy_coefficient_state: TrainState,
                 states: np.ndarray, next_states: np.ndarray, actions: np.ndarray, rewards: np.ndarray, terminations: np.ndarray,
+                safety_states: np.ndarray,
                 normalizer_mean: np.ndarray, normalizer_std: np.ndarray,
                 normalizer_epsilon: float, qsafe_params: flax.core.FrozenDict,
-                nu: float, actor_update_enabled: bool, key: jax.random.PRNGKey
+                nu: float, actor_update_enabled: bool,
+                key: jax.random.PRNGKey
             ):
             raw_states = jnp.asarray(states, dtype=jnp.float32)
             raw_next_states = jnp.asarray(next_states, dtype=jnp.float32)
@@ -510,6 +594,7 @@ class SAC_QSafe:
             def loss_fn(policy_params: flax.core.FrozenDict, critic_params: flax.core.FrozenDict, entropy_coefficient_params: flax.core.FrozenDict,
                         state: np.ndarray, next_state: np.ndarray,
                         raw_state: np.ndarray, raw_next_state: np.ndarray,
+                        safety_state: np.ndarray,
                         action: np.ndarray, reward: np.ndarray, terminated: np.ndarray,
                         key1: jax.random.PRNGKey, key2: jax.random.PRNGKey
                 ):
@@ -517,9 +602,9 @@ class SAC_QSafe:
                 next_action_mean, next_action_logstd = self.policy.apply(stop_gradient(policy_params), next_state)
                 next_action_std = jnp.exp(next_action_logstd)
                 next_action_pretanh = next_action_mean + next_action_std * jax.random.normal(key1, shape=next_action_mean.shape)
-                next_policy_action = jnp.tanh(next_action_pretanh)
-                next_action = self._jax_project_actions(
-                    raw_next_state[None, :], next_policy_action[None, :]
+                next_task_action = jnp.tanh(next_action_pretanh)
+                next_applied_action = self._jax_project_actions(
+                    raw_next_state[None, :], next_task_action[None, :]
                 )[0]
                 next_log_prob = squashed_gaussian_log_probability(
                     next_action_pretanh,
@@ -530,7 +615,9 @@ class SAC_QSafe:
                 alpha_with_grad = self.entropy_coefficient.apply(entropy_coefficient_params)
                 alpha = stop_gradient(alpha_with_grad)
 
-                next_q_target = self.critic.apply(critic_state.target_params, next_state, next_action)
+                next_q_target = self.critic.apply(
+                    critic_state.target_params, next_state, next_applied_action
+                )
                 min_next_q_target = jnp.min(next_q_target)
 
                 y = reward + self.gamma * (1 - terminated) * (min_next_q_target - alpha * next_log_prob)
@@ -542,9 +629,9 @@ class SAC_QSafe:
                 current_action_mean, current_action_logstd = self.policy.apply(policy_params, state)
                 current_action_std = jnp.exp(current_action_logstd)
                 current_action_pretanh = current_action_mean + current_action_std * jax.random.normal(key2, shape=current_action_mean.shape)
-                current_policy_action = jnp.tanh(current_action_pretanh)
-                current_action = self._jax_project_actions(
-                    raw_state[None, :], current_policy_action[None, :]
+                current_task_action = jnp.tanh(current_action_pretanh)
+                current_applied_action = self._jax_project_actions(
+                    raw_state[None, :], current_task_action[None, :]
                 )[0]
                 current_log_prob = squashed_gaussian_log_probability(
                     current_action_pretanh,
@@ -553,14 +640,18 @@ class SAC_QSafe:
                 )
                 entropy = stop_gradient(-current_log_prob)
 
-                q = self.critic.apply(stop_gradient(critic_params), state, current_action)
+                q = self.critic.apply(
+                    stop_gradient(critic_params), state, current_applied_action
+                )
                 min_q = jnp.min(q)
 
                 policy_loss = alpha * current_log_prob - min_q
                 safety_q = jnp.zeros_like(min_q)
                 if self.finetune_constraints_enabled:
                     safety_q = self.qsafe.network.apply(
-                        stop_gradient(qsafe_params), state, current_action
+                        stop_gradient(qsafe_params),
+                        safety_state,
+                        current_applied_action,
                     ).squeeze()
                     policy_loss = policy_loss + nu * (
                         safety_q - self.qsafe.epsilon
@@ -582,6 +673,12 @@ class SAC_QSafe:
                     "q_value/q_value": min_q,
                     "q_value/bellman_target": y,
                     "qsafe/actor_value": safety_q,
+                    "policy/raw_action_abs_mean": jnp.mean(
+                        jnp.abs(current_task_action)
+                    ),
+                    "policy/applied_action_abs_mean": jnp.mean(
+                        jnp.abs(current_applied_action)
+                    ),
                 }
 
                 return loss, (metrics)
@@ -589,7 +686,7 @@ class SAC_QSafe:
 
             vmap_loss_fn = jax.vmap(
                 loss_fn,
-                in_axes=(None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                in_axes=(None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
                 out_axes=0,
             )
             safe_mean = lambda x: jnp.mean(x) if x is not None else x
@@ -601,30 +698,38 @@ class SAC_QSafe:
 
             (loss, (metrics)), (policy_gradients, critic_gradients, entropy_gradients) = grad_loss_fn(
                 policy_state.params, critic_state.params, entropy_coefficient_state.params,
-                states, next_states, raw_states, raw_next_states, actions, rewards,
+                states, next_states, raw_states, raw_next_states, safety_states,
+                actions, rewards,
                 terminations, keys1, keys2)
 
             critic_state = critic_state.apply_gradients(grads=critic_gradients)
-            policy_state = jax.lax.cond(
-                actor_update_enabled,
-                lambda value: value.apply_gradients(grads=policy_gradients),
-                lambda value: value,
-                policy_state,
+            policy_state = _apply_gradients_if_enabled(
+                policy_state, policy_gradients, actor_update_enabled
             )
-            entropy_coefficient_state = jax.lax.cond(
-                actor_update_enabled,
-                lambda value: value.apply_gradients(grads=entropy_gradients),
-                lambda value: value,
+            # The actor and thermostat are one coupled policy update. Freezing
+            # both avoids alpha wind-up while the fresh task critic learns.
+            entropy_coefficient_state = _apply_gradients_if_enabled(
                 entropy_coefficient_state,
+                entropy_gradients,
+                actor_update_enabled,
             )
 
             # Update targets
             critic_state = critic_state.replace(target_params=optax.incremental_update(critic_state.params, critic_state.target_params, self.tau))
 
-            metrics["lr/learning_rate"] = policy_state.opt_state.hyperparams["learning_rate"]
-            metrics["gradients/policy_grad_norm"] = optax.global_norm(policy_gradients)
+            metrics["lr/policy_learning_rate"] = policy_state.opt_state.hyperparams[
+                "learning_rate"
+            ]
+            metrics["lr/learning_rate"] = critic_state.opt_state.hyperparams[
+                "learning_rate"
+            ]
+            metrics["gradients/policy_grad_norm"] = jnp.where(
+                actor_update_enabled, optax.global_norm(policy_gradients), 0.0
+            )
             metrics["gradients/critic_grad_norm"] = optax.global_norm(critic_gradients)
-            metrics["gradients/entropy_grad_norm"] = optax.global_norm(entropy_gradients)
+            metrics["gradients/entropy_grad_norm"] = jnp.where(
+                actor_update_enabled, optax.global_norm(entropy_gradients), 0.0
+            )
 
             return policy_state, critic_state, entropy_coefficient_state, metrics, key
         
@@ -639,6 +744,15 @@ class SAC_QSafe:
             dtype=jnp.float32,
         )
         dummy_scalars = jnp.zeros((self.batch_size,), dtype=jnp.float32)
+        dummy_safety_states = jnp.zeros(
+            (
+                self.batch_size,
+                self.qsafe.observation_shape[0]
+                if self.qsafe_enabled
+                else dummy_states.shape[-1],
+            ),
+            dtype=jnp.float32,
+        )
         mean, std, epsilon = self._normalizer_parameters()
         warm_result = update(
             self.policy_state,
@@ -649,6 +763,7 @@ class SAC_QSafe:
             dummy_actions,
             dummy_scalars,
             dummy_scalars,
+            dummy_safety_states,
             mean,
             std,
             epsilon,
@@ -661,15 +776,31 @@ class SAC_QSafe:
 
         self.set_train_mode()
 
-        offline_replay_buffer = ReplayBuffer(int(self.buffer_size), self.nr_envs, self.train_env.single_observation_space.shape, self.train_env.single_action_space.shape, self.rng)
+        offline_replay_buffer = ReplayBuffer(
+            int(self.buffer_size),
+            self.nr_envs,
+            self.train_env.single_observation_space.shape,
+            self.train_env.single_action_space.shape,
+            self.rng,
+            auxiliary_state_shape=(
+                self.qsafe.observation_shape
+                if self.finetune_constraints_enabled
+                and self.qsafe.version == 2
+                else None
+            ),
+        )
 
         saving_return_buffer = deque(maxlen=100 * self.nr_envs)
 
         state, _ = self.train_env.reset()
+        if self.qsafe_enabled:
+            self.qsafe.clear_rollout_history()
+            self._qsafe_reset_masks.clear()
         safety_state = None
         global_step = 0
         nr_updates = 0
         nr_actor_updates = 0
+        nr_alpha_updates = 0
         nr_episodes = 0
         nr_failures = 0
         nr_safe_env_steps = 0
@@ -686,6 +817,11 @@ class SAC_QSafe:
         steps_metrics = {}
         prev_saving_end_time = None
         logging_time_prev = None
+        next_checkpoint = (
+            self.checkpoint_frequency
+            if self.checkpoint_frequency > 0
+            else None
+        )
         
         while global_step < self.total_timesteps or (
             self.phase == "pretrain" and self.qsafe_enabled and pretrain_stage == "safe"
@@ -702,17 +838,19 @@ class SAC_QSafe:
             )
             if is_safety_step and safety_state is None:
                 safety_state, _ = self.eval_env.reset()
+                self.qsafe.clear_rollout_history("safety")
+                self._qsafe_reset_masks.pop("safety", None)
             acting_state = safety_state if is_safety_step else state
             interaction_env = self.eval_env if is_safety_step else self.train_env
             completed_safety_block = False
             dones_this_rollout = 0
             if is_safety_step:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
-                    acting_state, phase="pretrain"
+                    acting_state, phase="pretrain", stream="safety"
                 )
             elif self.finetune_constraints_enabled:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
-                    acting_state, phase="finetune"
+                    acting_state, phase="finetune", stream="task"
                 )
             else:
                 action, processed_action = self._sample_unconstrained_action(
@@ -734,6 +872,8 @@ class SAC_QSafe:
                 recovered_state, _ = interaction_env.reset()
                 if is_safety_step:
                     safety_state = recovered_state
+                    self.qsafe.clear_rollout_history("safety")
+                    self._qsafe_reset_masks.pop("safety", None)
                     safety_collector = CompletedTrajectoryCollector(
                         self.nr_envs, self.n_safe
                     )
@@ -746,6 +886,10 @@ class SAC_QSafe:
                 info.get("applied_action", host_action), dtype=np.float32
             ).reshape(host_action.shape)
             done = terminated | truncated
+            if self.qsafe_enabled:
+                self._qsafe_reset_masks[
+                    "safety" if is_safety_step else "task"
+                ] = np.asarray(done, dtype=bool)
             actual_next_state = next_state.copy()
             for i, single_done in enumerate(done):
                 if single_done:
@@ -796,7 +940,17 @@ class SAC_QSafe:
                     safety_state = next_state
             else:
                 offline_replay_buffer.add(
-                    state, actual_next_state, applied_action, reward, terminated
+                    state,
+                    actual_next_state,
+                    applied_action,
+                    reward,
+                    terminated,
+                    auxiliary_states=(
+                        self._last_qsafe_observations["task"]
+                        if self.finetune_constraints_enabled
+                        and self.qsafe.version == 2
+                        else None
+                    ),
                 )
                 global_step += self.nr_envs
                 nr_episodes += dones_this_rollout
@@ -850,7 +1004,19 @@ class SAC_QSafe:
 
             # Optimizing - Prepare batches
             if should_optimize:
-                batch_states, batch_next_states, batch_actions, batch_rewards, batch_terminations = offline_replay_buffer.sample(self.batch_size)
+                replay_sample = offline_replay_buffer.sample(self.batch_size)
+                (
+                    batch_states,
+                    batch_next_states,
+                    batch_actions,
+                    batch_rewards,
+                    batch_terminations,
+                ) = replay_sample[:5]
+                safety_batch_states = (
+                    self.qsafe.normalize_observations(replay_sample[5])
+                    if len(replay_sample) == 6
+                    else batch_states
+                )
 
 
             # Optimizing - Q-functions, policy and entropy coefficient
@@ -872,6 +1038,7 @@ class SAC_QSafe:
                     batch_actions,
                     batch_rewards,
                     batch_terminations,
+                    safety_batch_states,
                     mean,
                     std,
                     epsilon,
@@ -899,8 +1066,11 @@ class SAC_QSafe:
                                 self._deadline_misses,
                             )
                 optimization_metrics["finetune/actor_frozen"] = float(
-                    not update_actor
+                    self.phase == "finetune"
+                    and global_step < self.finetune_actor_warmup_steps
                 )
+                optimization_metrics["updates/actor_enabled"] = float(update_actor)
+                optimization_metrics["updates/alpha_enabled"] = float(update_actor)
                 if not self.qsafe_enabled:
                     optimization_metrics.pop("qsafe/actor_value", None)
                 if self.finetune_constraints_enabled and update_actor:
@@ -928,6 +1098,7 @@ class SAC_QSafe:
                     optimization_metrics_collection.setdefault(key, []).append(value)
                 nr_updates += 1
                 nr_actor_updates += int(update_actor)
+                nr_alpha_updates += int(update_actor)
 
             if completed_safety_block and self.qsafe.ready_to_update():
                 def sample_unconstrained_action(next_states, action_key):
@@ -959,11 +1130,14 @@ class SAC_QSafe:
             if should_evaluate:
                 self.set_eval_mode()
                 eval_state, _ = self.eval_env.reset()
+                if self.qsafe_enabled:
+                    self.qsafe.clear_rollout_history("eval")
+                    self._qsafe_reset_masks.pop("eval", None)
                 eval_nr_episodes = 0
                 while True:
                     if self.qsafe_enabled:
                         _, eval_processed_action, _ = self._sample_policy_candidates(
-                            eval_state
+                            eval_state, stream="eval"
                         )
                     else:
                         _, eval_processed_action = self._sample_deterministic_action(
@@ -978,6 +1152,9 @@ class SAC_QSafe:
                             "Discarding invalid evaluation transition: %s", exc
                         )
                         eval_state, _ = self.eval_env.reset()
+                        if self.qsafe_enabled:
+                            self.qsafe.clear_rollout_history("eval")
+                            self._qsafe_reset_masks.pop("eval", None)
                         continue
                     eval_failure = extract_failure_signal(
                         eval_info, eval_terminated, self.nr_envs
@@ -986,6 +1163,10 @@ class SAC_QSafe:
                         "eval/failure_rate", []
                     ).extend(eval_failure.tolist())
                     eval_done = eval_terminated | eval_truncated
+                    if self.qsafe_enabled:
+                        self._qsafe_reset_masks["eval"] = np.asarray(
+                            eval_done, dtype=bool
+                        )
                     for i, single_done in enumerate(eval_done):
                         if single_done:
                             eval_nr_episodes += 1
@@ -1002,6 +1183,14 @@ class SAC_QSafe:
 
 
             # Saving
+            if (
+                self.save_model
+                and next_checkpoint is not None
+                and global_step >= next_checkpoint
+            ):
+                self.save(f"step_{global_step:09d}.model")
+                while next_checkpoint <= global_step:
+                    next_checkpoint += self.checkpoint_frequency
             if should_try_to_save:
                 mean_return = np.mean(saving_return_buffer)
                 if mean_return > self.best_mean_return:
@@ -1026,6 +1215,7 @@ class SAC_QSafe:
                 steps_metrics["steps/nr_updates"] = nr_updates
                 steps_metrics["steps/nr_critic_updates"] = nr_updates
                 steps_metrics["steps/nr_actor_updates"] = nr_actor_updates
+                steps_metrics["steps/nr_alpha_updates"] = nr_alpha_updates
                 steps_metrics["finetune/actor_update_interval"] = (
                     self.finetune_actor_update_interval
                 )
@@ -1126,6 +1316,7 @@ class SAC_QSafe:
         if self.qsafe_enabled:
             checkpoint["qsafe"] = self.qsafe.state
         payload = {
+            "task_action_contract": TASK_ACTION_CONTRACT,
             "config_algorithm": self.config.algorithm.to_dict(),
             "checkpoint": serialization.to_state_dict(checkpoint),
             "normalizer_state": normalizer_state,
@@ -1134,6 +1325,15 @@ class SAC_QSafe:
         }
         if self.qsafe_enabled:
             payload["qsafe_metadata"] = self.qsafe.metadata()
+            payload["qsafe_normalizer_state"] = (
+                self.qsafe.observation_normalizer.state_dict()
+            )
+            payload["qsafe_normalizer_metadata"] = (
+                self.qsafe.observation_normalizer.metadata()
+            )
+            payload["qsafe_calibration_report"] = dict(
+                self.qsafe.calibration_report
+            )
         model_file_path = os.path.join(self.save_path, model_file_name)
         with open(model_file_path, "wb") as model_file:
             model_file.write(serialization.msgpack_serialize(payload))
@@ -1143,7 +1343,9 @@ class SAC_QSafe:
                 serialization.msgpack_serialize(
                     make_native_policy_artifact(
                         self.policy_state.params,
-                        None,
+                        serialization.to_state_dict(
+                            self.entropy_coefficient_state.params
+                        )["params"]["log_alpha"],
                         normalizer_state,
                         normalizer_metadata,
                         environment_manifest,
@@ -1163,6 +1365,17 @@ class SAC_QSafe:
     def load(config, train_env, eval_env, run_path, writer, explicitly_set_algorithm_params):
         with open(config.runner.load_model, "rb") as model_file:
             payload = serialization.msgpack_restore(model_file.read())
+        action_contract = payload.get("task_action_contract")
+        if (
+            action_contract != TASK_ACTION_CONTRACT
+            and str(config.runner.mode) != "test"
+        ):
+            raise ValueError(
+                "Cannot resume task learning from a checkpoint with action "
+                "contract "
+                f"{action_contract!r}; expected {TASK_ACTION_CONTRACT!r}. "
+                "Load its policy sidecar for actor-only transfer instead."
+            )
         loaded_algorithm_config = payload["config_algorithm"]
         restore_algorithm_config(
             config.algorithm,
@@ -1225,8 +1438,17 @@ class SAC_QSafe:
         model.entropy_coefficient_state = checkpoint["entropy_coefficient"]
         if model.qsafe_enabled:
             model.qsafe.state = checkpoint["qsafe"]
+            if model.qsafe.version == 2:
+                model.qsafe.observation_normalizer.load_state_dict(
+                    payload["qsafe_normalizer_state"],
+                    payload["qsafe_normalizer_metadata"],
+                )
+                model.qsafe.calibration_report = dict(
+                    payload.get("qsafe_calibration_report", {})
+                )
         if model.phase == "finetune":
-            model.qsafe.freeze()
+            if model.qsafe_enabled:
+                model.qsafe.freeze()
             model.observation_normalizer.freeze()
         model.nu = float(checkpoint["nu"])
         model.dual_optimizer_state = checkpoint["dual_optimizer_state"]
@@ -1241,6 +1463,8 @@ class SAC_QSafe:
             raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
         if eval_policy == "safe" and not self.qsafe_enabled:
             raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
+        gait_results = []
+        episode_records = []
         for i in range(episodes):
             done = False
             episode_return = 0
@@ -1251,12 +1475,18 @@ class SAC_QSafe:
             estimated_forward_velocity_sum = 0.0
             velocity_estimation_error_sum = 0.0
             target_velocity_error_sum = 0.0
+            gait_metrics = GaitEvaluationMetrics()
             state, _ = self.eval_env.reset()
+            if self.qsafe_enabled:
+                self.qsafe.clear_rollout_history("eval")
+                self._qsafe_reset_masks.pop("eval", None)
             while not done:
                 if eval_policy == "task":
                     _, processed_action = self._sample_deterministic_action(state)
                 else:
-                    _, processed_action, _ = self._sample_policy_candidates(state)
+                    _, processed_action, _ = self._sample_policy_candidates(
+                        state, stream="eval"
+                    )
                 try:
                     state, reward, terminated, truncated, info = self.eval_env.step(
                         jax.device_get(processed_action)
@@ -1270,9 +1500,12 @@ class SAC_QSafe:
                     continue
                 failures = extract_failure_signal(info, terminated, self.nr_envs)
                 done = terminated | truncated
+                if self.qsafe_enabled:
+                    self._qsafe_reset_masks["eval"] = np.asarray(done, dtype=bool)
                 episode_return += reward
                 episode_steps += 1
                 episode_failures += int(np.sum(failures))
+                gait_metrics.update(info)
                 if "forward_velocity" in info:
                     forward_velocity = float(
                         np.mean(np.asarray(info["forward_velocity"]))
@@ -1331,6 +1564,42 @@ class SAC_QSafe:
                     f"{target_velocity_error_sum / episode_steps:.6f}"
                 )
             rlx_logger.info(summary)
+            gait_result = gait_metrics.result(episode_failures)
+            gait_results.append(gait_result)
+            episode_records.append(
+                {
+                    "episode": i + 1,
+                    "return": float(np.mean(episode_return)),
+                    "length": int(episode_steps),
+                    "fall": bool(episode_failures),
+                    "mean_forward_velocity": (
+                        float(forward_velocity_sum / episode_steps)
+                        if episode_steps and forward_velocity_samples
+                        else float("nan")
+                    ),
+                    "last_100_velocity": (
+                        float(np.mean(forward_velocity_samples[-100:]))
+                        if forward_velocity_samples
+                        else float("nan")
+                    ),
+                    **gait_result,
+                }
+            )
+        rlx_logger.info(GaitEvaluationMetrics.format_suite(gait_results))
+        result_path = str(self.config.algorithm.evaluation_results_path)
+        if result_path:
+            destination = Path(result_path).expanduser().resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "episodes": episode_records,
+                "policy": eval_policy,
+                "checkpoint": str(self.config.runner.load_model),
+            }
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            temporary.replace(destination)
     
 
     def set_train_mode(self):

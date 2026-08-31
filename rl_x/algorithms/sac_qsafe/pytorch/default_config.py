@@ -6,6 +6,9 @@ def get_config(algorithm_name):
     config.name = algorithm_name
     config.device = "gpu"
     config.compile_mode = "reduce-overhead"
+    # Compilation is valuable for long training runs but its per-process cost
+    # dominates short evaluation/data-collection jobs.
+    config.compile_policy = True
     # The SQRL reproduction uses full precision. In the Go2 flat baseline,
     # bf16 caused the SAC critic loss to diverge by 10k transitions.
     config.bf16_mixed_precision_training = False
@@ -25,8 +28,9 @@ def get_config(algorithm_name):
     # Fine-tuning initializes the target-task entropy temperature from this
     # value; alpha is deliberately not part of the SQRL transfer bundle.
     config.alpha_init = 1.0
-    # Fine-tuning creates a new task critic.  Hold the transferred actor and
-    # entropy temperature fixed until that critic has target-task experience.
+    # Fine-tuning creates a new task critic. Hold the transferred actor and
+    # fresh entropy temperature fixed until that critic has target-task
+    # experience; they subsequently update together.
     config.finetune_actor_warmup_steps = 10000
     # A fresh target-task critic can be exploited by the transferred actor if
     # both are updated 1:1 immediately after warm-up.  This target-stage-only
@@ -45,6 +49,9 @@ def get_config(algorithm_name):
     config.evaluation_frequency = -1
     config.evaluation_episodes = 10
     config.eval_policy = "safe"  # safe, task
+    # Optional machine-readable episode results for paired protection and
+    # milestone evaluations. Empty keeps ordinary evaluation side-effect free.
+    config.evaluation_results_path = ""
 
     config.phase = "pretrain"  # pretrain, finetune
     config.pretrained_policy_path = ""
@@ -68,6 +75,13 @@ def get_config(algorithm_name):
     # ``False`` is the paper's standard-SAC baseline: no safety rollouts,
     # safety critic, action projection, Eq. 4 term, or dual update.
     config.qsafe.enabled = True
+    # v2 is actor-independent: five raw 46D proprioceptive frames (100 ms)
+    # have their own normalizer and feed a sigmoid failure-risk critic.
+    config.qsafe.version = 2
+    config.qsafe.history_length = 5
+    config.qsafe.control_dt = 0.02
+    config.qsafe.enable_observation_normalization = True
+    config.qsafe.normalizer_epsilon = 1e-8
     config.qsafe.checkpoint_path = ""
     config.qsafe.epsilon = 0.1
     config.qsafe.gamma = 0.7
@@ -81,4 +95,22 @@ def get_config(algorithm_name):
     config.qsafe.max_trajectories = 10
     config.qsafe.nr_hidden_units = 256
     config.qsafe.updates_per_iteration = 1
+    # Optional trajectory-atomic collection used to build universal QSafe v2.
+    # It is deliberately off for every normal train/eval preset.
+    config.qsafe.dataset = config_dict.ConfigDict()
+    config.qsafe.dataset.enabled = False
+    config.qsafe.dataset.directory = ""
+    config.qsafe.dataset.actor_id = ""
+    config.qsafe.dataset.map_seed = 0
+    config.qsafe.dataset.episode_offset = 0
+    config.qsafe.dataset.split = "train"
+    config.qsafe.dataset.terrain = ""
+    config.qsafe.dataset.action_noise = 0.0
+    config.qsafe.dataset.store_candidates = True
+    # In paired protection evaluation both arms draw the same ordered stochastic
+    # candidate pool. The baseline executes candidate zero; the protected arm
+    # applies Eq. 3 to that pool. A step-indexed RNG stream isolates candidate
+    # sampling from simulator and QSafe construction randomness.
+    config.qsafe.paired_candidate_evaluation = False
+    config.qsafe.eval_candidate_seed = 0
     return config

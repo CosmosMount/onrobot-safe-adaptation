@@ -20,9 +20,15 @@ from ..common.estimation.kinematics import foot_position_velocity_body
 from ..common.observation import ObservationBuilder
 from ..common.reward import (
     BASE_HEIGHT_TARGET,
+    add_terminal_failure_penalty,
     compute_reward,
+    deterministic_ground_height,
     local_base_clearance,
+    movement_reward_gate,
+    state_estimated_trot_phase_reward,
     swing_foot_clearance_error,
+    swing_foot_clearance_overshoot_error,
+    swing_weights,
 )
 from ..common.specs import (
     ACTION_SPEC,
@@ -32,11 +38,13 @@ from ..common.specs import (
     OBSERVATION_SIZE,
     PHYSICS_DT,
     PHYSICS_STEPS_PER_ACTION,
+    action_profile,
     format_policy_io_contract,
 )
 from ..common.termination import EpisodeTracker
 from ..common.manifest import (
     build_manifest,
+    validate_actor_transfer_manifest,
     validate_manifest,
     validate_transfer_manifest,
 )
@@ -99,7 +107,10 @@ class Go2SDKMujocoEnv:
                 window_title=environment.mujoco_window_title
             )
         self.reset_controller = reset_controller
-        self.action_mapper = ActionMapper()
+        self.action_contract = action_profile(environment.action_profile)
+        self.action_mapper = ActionMapper(
+            action_scale=self.action_contract["scale"]
+        )
         self.observation_builder = ObservationBuilder(
             VelocityEstimator(
                 dt=PHYSICS_DT,
@@ -118,12 +129,14 @@ class Go2SDKMujocoEnv:
         self._policy_blend_elapsed = 0.0
         self._initial_simulator_reset_done = False
         self._previous_reward_action = np.zeros(ACTION_SIZE, dtype=np.float32)
+        self._episode_start_x = 0.0
+        self._episode_max_progress = 0.0
+        self._velocity_history = []
         logger.info(
             "\n" + format_policy_io_contract(environment.target_velocity_x)
         )
 
-    @staticmethod
-    def project_actions(states, actions):
+    def project_actions(self, states, actions):
         """Project actions using only the previous target encoded in ``states``.
 
         This hook is side-effect free so an algorithm may apply it to replay,
@@ -132,7 +145,11 @@ class Go2SDKMujocoEnv:
         array namespace when the installed array implementation exposes it.
         """
 
-        return project_actions_from_observation(states, actions)
+        return project_actions_from_observation(
+            states,
+            actions,
+            action_scale=self.action_contract["scale"],
+        )
 
     def _wait_window(self, count: int | None = None):
         count = int(count or self.config.policy_frames)
@@ -369,6 +386,13 @@ class Go2SDKMujocoEnv:
         else:
             self._last_tick = int(state.tick)
         state = self._hold_reset_pose(state)
+        truth = self.client.latest_training_state()
+        if truth is not None and truth.base_position is not None:
+            self._episode_start_x = float(np.asarray(truth.base_position)[0])
+        else:
+            self._episode_start_x = 0.0
+        self._episode_max_progress = 0.0
+        self._velocity_history = []
         observation, _ = self.observation_builder.build(state)
         self._last_observation = observation
         return observation[None, :], {}
@@ -446,12 +470,20 @@ class Go2SDKMujocoEnv:
         reward_body_velocity = rotation.T @ np.asarray(world_velocity)
         base_clearance = BASE_HEIGHT_TARGET
         foot_clearance_error = 0.0
+        foot_clearance_overshoot_error = 0.0
+        phase_reward = 0.0
+        swing_weight = np.zeros(4, dtype=np.float64)
         foot_clearance = np.full(4, np.nan, dtype=np.float64)
         if truth is not None and truth.base_position is not None:
-            # The canonical SDK2 MuJoCo scene has a zero-height ground plane,
-            # so world z is exactly the local terrain clearance.
+            base_position = np.asarray(truth.base_position, dtype=np.float64)
+            base_ground_height = deterministic_ground_height(
+                base_position[0],
+                terrain_profile=self.config.terrain_profile,
+                step_start_x=self.config.step_start_x,
+                step_height=self.config.step_height,
+            )
             base_clearance = float(
-                local_base_clearance(np.asarray(truth.base_position)[2], 0.0)
+                local_base_clearance(base_position[2], base_ground_height)
             )
             height_failure = self.fall_detector.update_base_clearance(
                 base_clearance
@@ -470,20 +502,80 @@ class Go2SDKMujocoEnv:
                 )
             )
             foot_position_world = (
-                np.asarray(truth.base_position, dtype=np.float64)[None, :]
+                base_position[None, :]
                 + (rotation @ foot_position_body.T).T
             )
             foot_velocity_world = (
                 np.asarray(world_velocity, dtype=np.float64)[None, :]
                 + (rotation @ relative_foot_velocity_body.T).T
             )
-            foot_clearance = foot_position_world[:, 2]
+            foot_ground_height = deterministic_ground_height(
+                foot_position_world[:, 0],
+                terrain_profile=self.config.terrain_profile,
+                step_start_x=self.config.step_start_x,
+                step_height=self.config.step_height,
+            )
+            foot_clearance = foot_position_world[:, 2] - foot_ground_height
             foot_clearance_error = swing_foot_clearance_error(
                 foot_clearance,
                 np.linalg.norm(foot_velocity_world[:, :2], axis=-1),
+                target=float(self.config.foot_clearance_target),
+                aggregation=str(self.config.clearance_reward_mode),
+            )
+            foot_clearance_overshoot_error = (
+                swing_foot_clearance_overshoot_error(
+                    foot_clearance,
+                    np.linalg.norm(foot_velocity_world[:, :2], axis=-1),
+                    upper_target=float(
+                        self.config.foot_clearance_upper_target
+                    ),
+                )
+            )
+            foot_horizontal_speed = np.linalg.norm(
+                foot_velocity_world[:, :2], axis=-1
+            )
+            swing_weight = swing_weights(foot_horizontal_speed)
+            phase_reward = state_estimated_trot_phase_reward(
+                foot_clearance,
+                foot_velocity_world[:, 2],
+                foot_horizontal_speed,
+                target=float(self.config.foot_clearance_target),
+                reference_frequency=float(
+                    self.config.phase_reference_frequency
+                ),
             )
         else:
             height_failure = False
+        if truth is not None and truth.base_position is not None:
+            progress = float(np.asarray(truth.base_position)[0]) - self._episode_start_x
+            self._episode_max_progress = max(self._episode_max_progress, progress)
+            self._velocity_history.append(float(reward_body_velocity[0]))
+            if len(self._velocity_history) > 100:
+                self._velocity_history.pop(0)
+        last_velocity = (
+            float(np.mean(self._velocity_history))
+            if self._velocity_history
+            else float(reward_body_velocity[0])
+        )
+        crossing_success = self._episode_max_progress >= float(
+            self.config.step_success_distance
+        )
+        stuck = (not failure) and last_velocity < 0.1
+        stable_success = crossing_success and not failure and last_velocity >= 0.1
+        movement_gate = float(
+            movement_reward_gate(
+                reward_body_velocity[0],
+                start=float(self.config.phase_velocity_gate_start),
+                full=float(self.config.phase_velocity_gate_full),
+            )
+        )
+        stable_progress_reward = float(
+            self._episode_max_progress
+            >= float(self.config.stable_progress_start)
+            and base_clearance
+            >= float(self.config.stable_progress_min_base_clearance)
+            and not failure
+        ) * movement_gate
         terms = compute_reward(
             world_velocity,
             final_state.imu_quat,
@@ -494,9 +586,31 @@ class Go2SDKMujocoEnv:
             float(self.config.target_velocity_x),
             base_clearance=base_clearance,
             foot_clearance_error=foot_clearance_error,
+            foot_clearance_scale=float(
+                self.config.foot_clearance_reward_scale
+            ),
+            foot_clearance_overshoot_error=(
+                foot_clearance_overshoot_error
+            ),
+            foot_clearance_overshoot_scale=float(
+                self.config.foot_clearance_overshoot_scale
+            ),
+            phase_reward=phase_reward,
+            phase_reward_scale=float(self.config.phase_reward_scale),
+            phase_movement_gate=movement_gate,
+            stable_progress_reward=stable_progress_reward,
+            stable_progress_scale=float(self.config.stable_progress_scale),
         )
         self._previous_reward_action = reward_action.copy()
-        terminated, truncated = self.episode.advance(terms.total, failure)
+        failure_reward = float(
+            add_terminal_failure_penalty(
+                0.0,
+                failure,
+                float(self.config.terminal_failure_penalty),
+            )
+        )
+        total_reward = float(terms.total) + failure_reward
+        terminated, truncated = self.episode.advance(total_reward, failure)
         torque_saturation_ratio = np.nan
         if truth is not None and truth.actuator_torque is not None:
             torque_saturation_ratio = float(
@@ -524,11 +638,42 @@ class Go2SDKMujocoEnv:
                 [np.nan if np.isnan(foot_clearance).all() else np.nanmax(foot_clearance)],
                 dtype=np.float32,
             ),
+            "swing_weighted_foot_clearance": np.asarray(
+                [
+                    np.nan
+                    if np.sum(swing_weight) <= 0.0
+                    else np.sum(swing_weight * foot_clearance)
+                    / np.sum(swing_weight)
+                ],
+                dtype=np.float32,
+            ),
+            **{
+                f"swing_clearance/{leg}": np.asarray(
+                    [foot_clearance[index] if swing_weight[index] > 0.0 else np.nan],
+                    dtype=np.float32,
+                )
+                for index, leg in enumerate(("fr", "fl", "rr", "rl"))
+            },
+            "swing_ratio/fr": np.asarray([swing_weight[0]], dtype=np.float32),
+            "swing_ratio/fl": np.asarray([swing_weight[1]], dtype=np.float32),
+            "swing_ratio/rr": np.asarray([swing_weight[2]], dtype=np.float32),
+            "swing_ratio/rl": np.asarray([swing_weight[3]], dtype=np.float32),
             "action_saturation_ratio": np.asarray(
                 [np.mean(np.abs(reward_action) > 0.98)], dtype=np.float32
             ),
             "torque_saturation_ratio": np.asarray(
                 [torque_saturation_ratio], dtype=np.float32
+            ),
+            "terrain/forward_progress": np.asarray(
+                [self._episode_max_progress], dtype=np.float32
+            ),
+            "terrain/success": np.asarray([crossing_success], dtype=np.float32),
+            "terrain/stable_success": np.asarray(
+                [stable_success], dtype=np.float32
+            ),
+            "terrain/stuck": np.asarray([stuck], dtype=np.float32),
+            "terrain/last_100_velocity": np.asarray(
+                [last_velocity], dtype=np.float32
             ),
             "estimated_forward_velocity": np.asarray(
                 [estimated_body_velocity[0]], dtype=np.float32
@@ -557,7 +702,12 @@ class Go2SDKMujocoEnv:
                 [np.nan if covariance is None else np.trace(covariance)],
                 dtype=np.float32,
             ),
-            **{key: np.asarray([value], dtype=np.float32) for key, value in terms.as_dict().items()},
+            **{
+                key: np.asarray([value], dtype=np.float32)
+                for key, value in terms.as_dict().items()
+            },
+            "reward/failure": np.asarray([failure_reward], dtype=np.float32),
+            "reward/total": np.asarray([total_reward], dtype=np.float32),
         }
         if truth is not None:
             info.update(
@@ -593,9 +743,18 @@ class Go2SDKMujocoEnv:
                 **{key: float(value[0]) for key, value in info.items() if np.asarray(value).size == 1},
                 "episode_return": self.episode.episode_return,
                 "episode_length": self.episode.steps,
+                "fall": bool(failure),
+                "success": bool(crossing_success),
+                "stable_success": bool(stable_success),
+                "stuck": bool(stuck),
+                "forward_progress": float(self._episode_max_progress),
+                "last_100_velocity": float(last_velocity),
             }
             if terminated:
                 observation = self._manual_failure_reset()
+            elif str(self.config.terrain_profile) == "single_step_up":
+                self._auto_reset_simulator("Step-scene episode completed.")
+                observation = self.reset()[0][0]
             else:
                 observation = self._logical_reset(observation)
             info["episode_return"] = np.asarray(
@@ -610,7 +769,7 @@ class Go2SDKMujocoEnv:
         self._last_observation = observation
         return (
             observation[None, :],
-            np.asarray([terms.total], dtype=np.float32),
+            np.asarray([total_reward], dtype=np.float32),
             np.asarray([terminated], dtype=bool),
             np.asarray([truncated], dtype=bool),
             info,
@@ -643,6 +802,36 @@ class Go2SDKMujocoEnv:
             fall_min_base_clearance=float(self.config.fall_min_base_clearance),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
+            foot_clearance_target=float(self.config.foot_clearance_target),
+            phase_reference_frequency=float(
+                self.config.phase_reference_frequency
+            ),
+            phase_reward_scale=float(self.config.phase_reward_scale),
+            clearance_reward_mode=str(self.config.clearance_reward_mode),
+            foot_clearance_upper_target=float(
+                self.config.foot_clearance_upper_target
+            ),
+            foot_clearance_overshoot_scale=float(
+                self.config.foot_clearance_overshoot_scale
+            ),
+            phase_velocity_gate_start=float(
+                self.config.phase_velocity_gate_start
+            ),
+            phase_velocity_gate_full=float(
+                self.config.phase_velocity_gate_full
+            ),
+            stable_progress_start=float(self.config.stable_progress_start),
+            stable_progress_min_base_clearance=float(
+                self.config.stable_progress_min_base_clearance
+            ),
+            stable_progress_scale=float(self.config.stable_progress_scale),
+            terminal_failure_penalty=float(
+                self.config.terminal_failure_penalty
+            ),
+            action_profile=str(self.config.action_profile),
+            foot_clearance_reward_scale=float(
+                self.config.foot_clearance_reward_scale
+            ),
         )
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
@@ -650,3 +839,8 @@ class Go2SDKMujocoEnv:
 
     def validate_transfer_checkpoint_manifest(self, manifest, normalizer=None):
         validate_transfer_manifest(manifest, self.checkpoint_manifest(normalizer))
+
+    def validate_actor_checkpoint_manifest(self, manifest, normalizer=None):
+        validate_actor_transfer_manifest(
+            manifest, self.checkpoint_manifest(normalizer)
+        )

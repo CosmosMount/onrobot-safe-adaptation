@@ -29,6 +29,9 @@ ACTION_SCALE = np.tile(
     # joints enough range for roughly 10 cm of useful swing-foot clearance.
     np.asarray([0.25, 0.35, 0.45], dtype=np.float32), 4
 )
+LEGACY_ACTION_SCALE = np.full(ACTION_SIZE, 0.25, dtype=np.float32)
+DEFAULT_ACTION_PROFILE: Final = "per_joint_v2"
+LEGACY_ACTION_PROFILE: Final = "legacy_v1"
 JOINT_LOWER_LIMIT = np.asarray(
     [
         -1.0472, -1.5708, -2.7227,
@@ -96,6 +99,28 @@ class FailureSpecV3:
 OBSERVATION_SPEC = ObservationSpecV3()
 ACTION_SPEC = ActionSpecV2()
 FAILURE_SPEC = FailureSpecV3()
+
+
+def action_profile(profile: str):
+    """Return the physical action contract for a named checkpoint family."""
+
+    profile = str(profile)
+    if profile == DEFAULT_ACTION_PROFILE:
+        return {
+            "version": ACTION_SPEC.version,
+            "pipeline_version": "sdk-absolute-position-v3-per-joint-scale",
+            "scale": ACTION_SCALE.copy(),
+        }
+    if profile == LEGACY_ACTION_PROFILE:
+        return {
+            "version": "go2-action-v1",
+            "pipeline_version": "sdk-absolute-position-v2",
+            "scale": LEGACY_ACTION_SCALE.copy(),
+        }
+    raise ValueError(
+        "action_profile must be 'per_joint_v2' or 'legacy_v1', "
+        f"got {profile!r}"
+    )
 
 
 def configure_failure_detection(config) -> None:

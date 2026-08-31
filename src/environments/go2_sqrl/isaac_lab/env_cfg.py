@@ -16,7 +16,12 @@ from src.config import PROJECT_ROOT
 
 from ..common.specs import ACTION_SPEC, DEFAULT_BASE_HEIGHT, JOINT_NAMES
 from .randomization_cfg import configure_existing_events
-from .terrain_cfg import boxes_height_range, configure_terrain, configure_terrain_mode
+from .terrain_cfg import (
+    boxes_height_range,
+    configure_terrain,
+    configure_terrain_mode,
+    configure_terrain_profile,
+)
 
 
 GO2_USD_PATH = PROJECT_ROOT / "assets" / "robots" / "go2" / "usd" / "go2.usd"
@@ -141,6 +146,17 @@ def make_env_cfg(config, num_envs=None):
         cfg.curriculum,
         config.environment.terrain_mode,
     )
+    configure_terrain_profile(
+        cfg.scene.terrain.terrain_generator,
+        cfg.curriculum,
+        terrain_gen,
+        config.environment.terrain_profile,
+        step_height=config.environment.step_height,
+        boxes_max_adjacent_height_difference=(
+            config.environment.boxes_max_adjacent_height_difference
+        ),
+        high_clearance_stage=config.environment.high_clearance_stage,
+    )
     # A requested playback row is a frozen evaluation condition.  Otherwise
     # the curriculum manager updates the row again during the first reset.
     if int(config.environment.playback_terrain_level) >= 0:
@@ -157,9 +173,11 @@ def make_env_cfg(config, num_envs=None):
         # [-amplitude, +amplitude], hence adjacent cells can differ by twice
         # the configured amplitude.  At the highest curriculum row this makes
         # the public value below the true worst-case adjacent height change.
-        terrain_generator.sub_terrains["boxes"].grid_height_range = boxes_height_range(
-            config.environment.boxes_max_adjacent_height_difference
-        )
+        boxes = terrain_generator.sub_terrains.get("boxes")
+        if boxes is not None:
+            boxes.grid_height_range = boxes_height_range(
+                config.environment.boxes_max_adjacent_height_difference
+            )
 
     if bool(config.environment.viewer_follow_robot):
         # Anchor the viewport to env 0's robot.  Besides centering the robot at

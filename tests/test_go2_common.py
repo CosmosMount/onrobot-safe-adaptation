@@ -17,9 +17,14 @@ from src.environments.go2_sqrl.common.manifest import (
 from src.environments.go2_sqrl.common.reward import (
     FOOT_CLEARANCE_TARGET,
     REWARD_DEFAULT_JOINT_POSITION,
+    add_terminal_failure_penalty,
     compute_reward,
+    deterministic_ground_height,
     local_base_clearance,
+    movement_reward_gate,
     swing_foot_clearance_error,
+    swing_foot_clearance_overshoot_error,
+    state_estimated_trot_phase_reward,
 )
 from src.environments.go2_sqrl.common.estimation.kinematics import foot_positions_body
 from src.environments.go2_sqrl.common.specs import (
@@ -122,10 +127,62 @@ def test_swing_clearance_cost_is_contact_free_and_speed_gated():
     assert swing_foot_clearance_error(low_feet, np.ones(4)) == pytest.approx(
         0.05**2
     )
+    # A single swinging leg is no longer divided by all four feet.
+    assert swing_foot_clearance_error(
+        low_feet, np.asarray([1.0, 0.0, 0.0, 0.0])
+    ) == pytest.approx(0.05**2)
+    assert swing_foot_clearance_error(
+        low_feet,
+        np.asarray([1.0, 0.0, 0.0, 0.0]),
+        aggregation="legacy_mean",
+    ) == pytest.approx(0.05**2 / 4.0)
+
+
+def test_high_clearance_overshoot_and_forward_gate_are_bounded():
+    clearance = np.asarray([0.08, 0.12, 0.14, 0.22])
+    speed = np.ones(4)
+    expected = (0.02**2 + 0.10**2) / 4.0
+    assert swing_foot_clearance_overshoot_error(
+        clearance, speed, upper_target=0.12
+    ) == pytest.approx(expected)
+    np.testing.assert_allclose(
+        movement_reward_gate(
+            np.asarray([0.05, 0.10, 0.15, 0.20, 0.30]),
+            start=0.10,
+            full=0.20,
+        ),
+        [0.0, 0.0, 0.5, 1.0, 1.0],
+    )
+    assert movement_reward_gate(0.0, start=0.0, full=0.0) == pytest.approx(1.0)
+
+
+def test_state_estimated_phase_rewards_active_diagonal_trot_only():
+    target = 0.07
+    diagonal = np.asarray([target, 0.0, 0.0, target])
+    active = np.ones(4)
+    assert state_estimated_trot_phase_reward(
+        diagonal, np.zeros(4), active, target=target
+    ) == pytest.approx(1.0, abs=3e-6)
+    assert state_estimated_trot_phase_reward(
+        np.zeros(4), np.zeros(4), np.zeros(4), target=target
+    ) == pytest.approx(0.0)
+    all_same = state_estimated_trot_phase_reward(
+        np.full(4, target), np.zeros(4), active, target=target
+    )
+    assert all_same == pytest.approx(0.5, abs=3e-6)
 
 
 def test_reward_and_episode_semantics():
     assert local_base_clearance(0.37, 0.07) == pytest.approx(0.3)
+    np.testing.assert_allclose(
+        deterministic_ground_height(
+            np.asarray([0.5, 0.999, 1.0, 2.0]),
+            terrain_profile="single_step_up",
+            step_start_x=1.0,
+            step_height=0.04,
+        ),
+        [0.0, 0.0, 0.04, 0.04],
+    )
     terms = compute_reward(
         np.asarray([0.5, 0.0, 0.0]),
         np.asarray([1.0, 0.0, 0.0, 0.0]),
@@ -141,6 +198,9 @@ def test_reward_and_episode_semantics():
     assert terms.tracking_ang_vel == pytest.approx(0.004)
     assert terms.lin_vel_z == pytest.approx(0.0)
     assert terms.base_height == pytest.approx(0.0)
+    assert terms.foot_clearance_overshoot == pytest.approx(0.0)
+    assert terms.phase == pytest.approx(0.0)
+    assert terms.stable_progress == pytest.approx(0.0)
     assert terms.action_rate == pytest.approx(0.0)
     assert terms.similar_to_default == pytest.approx(0.0)
     assert terms.total == pytest.approx(0.024)
@@ -181,3 +241,45 @@ def test_checkpoint_manifest_rejects_contract_drift():
     incompatible_observation["observation"]["size"] = 48
     with pytest.raises(ValueError, match="observation.size"):
         validate_transfer_manifest(incompatible_observation, expected)
+
+
+def test_high_clearance_reward_is_an_optional_transfer_task_contract():
+    source = build_manifest({"observation_size": 46})
+    assert "high_clearance" not in source["reward_contract"]
+    target = build_manifest(
+        {"observation_size": 46},
+        foot_clearance_upper_target=0.12,
+        foot_clearance_overshoot_scale=-10.0,
+        phase_velocity_gate_start=0.1,
+        phase_velocity_gate_full=0.2,
+        stable_progress_scale=0.5,
+    )
+    assert target["reward_version"] != source["reward_version"]
+    assert target["reward_contract"]["high_clearance"][
+        "policy_observation_changed"
+    ] is False
+    validate_transfer_manifest(source, target)
+    with pytest.raises(ValueError, match="reward_version"):
+        validate_manifest(source, target)
+
+
+def test_terminal_failure_penalty_is_one_shot_and_optional_reward_contract():
+    rewards = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
+    failures = np.asarray([False, True, False])
+    np.testing.assert_allclose(
+        add_terminal_failure_penalty(rewards, failures, -10.0),
+        [1.0, -9.0, 1.0],
+    )
+
+    source = build_manifest({"observation_size": 46})
+    assert source["reward_contract"]["failure_reward_shaping"] is False
+    assert "terminal_failure_penalty" not in source["reward_contract"]
+
+    target = build_manifest(
+        {"observation_size": 46}, terminal_failure_penalty=-10.0
+    )
+    assert target["reward_contract"]["failure_reward_shaping"] is True
+    assert target["reward_contract"]["terminal_failure_penalty"] == -10.0
+    validate_transfer_manifest(source, target)
+    with pytest.raises(ValueError, match="failure_reward_shaping"):
+        validate_manifest(source, target)

@@ -5,7 +5,10 @@ import torch.nn as nn
 
 def get_entropy_coefficient(config, env, device):
     compile_mode = config.algorithm.compile_mode
-    entropy_coefficient = torch.compile(EntropyCoefficient(config, env, device).to(device), mode=compile_mode)
+    entropy_coefficient = EntropyCoefficient(config, env, device).to(device)
+    if not bool(config.algorithm.compile_policy):
+        return entropy_coefficient
+    entropy_coefficient = torch.compile(entropy_coefficient, mode=compile_mode)
     entropy_coefficient.forward = torch.compile(entropy_coefficient.forward, mode=compile_mode)
     entropy_coefficient.loss = torch.compile(entropy_coefficient.loss, mode=compile_mode)
     return entropy_coefficient

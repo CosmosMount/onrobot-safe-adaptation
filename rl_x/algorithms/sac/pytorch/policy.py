@@ -1,10 +1,34 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rl_x.environments.action_space_type import ActionSpaceType
 from rl_x.environments.observation_space_type import ObservationSpaceType
+
+
+def squashed_gaussian_log_probability(pretanh, mean, log_std):
+    """Return ``log pi(tanh(z) | state)`` over action dimensions.
+
+    Computing the tanh Jacobian as ``log(1 - tanh(z) ** 2)`` loses both
+    numerical precision and its useful gradient once ``tanh(z)`` rounds to
+    ``+/-1``.  This softplus identity is algebraically equivalent but remains
+    finite and differentiable for large pre-tanh samples.
+    """
+
+    std = torch.exp(log_std)
+    gaussian_log_probability = (
+        -0.5 * ((pretanh - mean) / std).pow(2)
+        - 0.5 * math.log(2.0 * math.pi)
+        - log_std
+    )
+    tanh_log_abs_det_jacobian = 2.0 * (
+        math.log(2.0) - pretanh - F.softplus(-2.0 * pretanh)
+    )
+    return (gaussian_log_probability - tanh_log_abs_det_jacobian).sum(dim=-1)
 
 
 def get_policy(config, env, device):
@@ -14,7 +38,10 @@ def get_policy(config, env, device):
     compile_mode = config.algorithm.compile_mode
 
     if action_space_type == ActionSpaceType.CONTINUOUS and observation_space_type == ObservationSpaceType.FLAT_VALUES:
-        policy = torch.compile(Policy(env, config.algorithm.log_std_min, config.algorithm.log_std_max, config.algorithm.nr_hidden_units, device, policy_observation_indices).to(device), mode=compile_mode)
+        policy = Policy(env, config.algorithm.log_std_min, config.algorithm.log_std_max, config.algorithm.nr_hidden_units, device, policy_observation_indices).to(device)
+        if not bool(config.algorithm.compile_policy):
+            return policy
+        policy = torch.compile(policy, mode=compile_mode)
         policy.forward = torch.compile(policy.forward, mode=compile_mode)
         policy.get_action = torch.compile(policy.get_action, mode=compile_mode)
         policy.get_deterministic_action = torch.compile(policy.get_deterministic_action, mode=compile_mode)
@@ -55,9 +82,8 @@ class Policy(nn.Module):
         action = normal.rsample()  # Reparameterization trick
         action_tanh = torch.tanh(action)
 
-        log_prob = normal.log_prob(action)
-        log_prob -= torch.log((1 - action_tanh.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
+        log_prob = squashed_gaussian_log_probability(action, mean, log_std)
+        log_prob = log_prob.unsqueeze(-1)
 
         scaled_action = self.env_as_low + (0.5 * (action_tanh + 1.0) * (self.env_as_high - self.env_as_low))
 

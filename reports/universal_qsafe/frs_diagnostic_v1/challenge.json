@@ -1,0 +1,55 @@
+{
+  "all_conditions": {
+    "stairs_up_l0": {
+      "episodes": 20,
+      "fall": 5,
+      "mean_forward_velocity": 0.13053140023794826,
+      "stable_success": 1,
+      "stuck": 10,
+      "success": 1
+    },
+    "stairs_up_l1": {
+      "episodes": 20,
+      "fall": 0,
+      "mean_forward_velocity": 0.07973040077523982,
+      "stable_success": 0,
+      "stuck": 18,
+      "success": 0
+    },
+    "stairs_up_l2": {
+      "episodes": 20,
+      "fall": 0,
+      "mean_forward_velocity": 0.07107996091101004,
+      "stable_success": 0,
+      "stuck": 20,
+      "success": 0
+    },
+    "step_4cm": {
+      "episodes": 20,
+      "fall": 2,
+      "mean_forward_velocity": 0.11799164629948018,
+      "stable_success": 2,
+      "stuck": 10,
+      "success": 2
+    }
+  },
+  "baseline": {
+    "episodes": 20,
+    "fall": 5,
+    "mean_forward_velocity": 0.13053140023794826,
+    "stable_success": 1,
+    "stuck": 10,
+    "success": 1
+  },
+  "eligible_20_to_70_percent_fall": true,
+  "environment_overrides": {
+    "playback_terrain_level": 0,
+    "playback_terrain_type": "small_stairs_up",
+    "terrain_mode": "rough",
+    "terrain_num_cols": 10,
+    "terrain_num_rows": 3,
+    "terrain_profile": "mixed"
+  },
+  "name": "stairs_up_l0",
+  "status": "PASS"
+}

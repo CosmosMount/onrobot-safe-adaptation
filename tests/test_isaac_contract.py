@@ -20,6 +20,11 @@ def test_isaac_launcher_string_defaults_are_not_none():
     assert config.terrain_num_rows == 10
     assert config.terrain_num_cols == 20
     assert config.boxes_max_adjacent_height_difference == 0.14
+    assert config.terrain_profile == "mixed"
+    assert config.step_height == 0.04
+    assert config.foot_clearance_target == 0.07
+    assert config.clearance_reward_mode == "swing_weighted"
+    assert config.phase_reward_scale == 0.0
     assert config.playback_terrain_type == "auto"
     assert config.playback_terrain_level == -1
     assert config.viewer_follow_robot is False
@@ -302,3 +307,136 @@ def test_boxes_height_setting_means_true_worst_case_adjacent_difference():
     assert boxes_height_range(0.14) == (0.0, 0.07)
     with pytest.raises(ValueError, match="between 0 and 0.30"):
         boxes_height_range(0.31)
+
+
+def test_deterministic_single_step_profile_is_one_fixed_upward_ledge():
+    from types import SimpleNamespace
+
+    from src.environments.go2_sqrl.isaac_lab.terrain_cfg import (
+        configure_terrain_profile,
+    )
+
+    class TerrainCfg(SimpleNamespace):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    terrain_gen = SimpleNamespace(
+        HfInvertedPyramidStairsTerrainCfg=TerrainCfg,
+        MeshRandomGridTerrainCfg=TerrainCfg,
+    )
+    generator = SimpleNamespace(sub_terrains={"mixed": object()})
+    curriculum = SimpleNamespace(terrain_levels=object())
+    configure_terrain_profile(
+        generator,
+        curriculum,
+        terrain_gen,
+        "single_step_up",
+        step_height=0.04,
+    )
+    assert curriculum.terrain_levels is None
+    assert list(generator.sub_terrains) == ["single_step_up"]
+    step = generator.sub_terrains["single_step_up"]
+    assert step.step_height_range == (0.04, 0.04)
+    assert step.step_width == 3.0
+    assert step.platform_width == 2.0
+    assert step.inverted is True
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [
+        ("easy", (0.20, 0.50, 0.25, 0.05)),
+        ("medium", (0.10, 0.25, 0.45, 0.20)),
+        ("hard", (0.10, 0.10, 0.30, 0.50)),
+    ],
+)
+def test_high_clearance_mix_has_flat_and_three_repeated_step_heights(
+    stage, expected
+):
+    from types import SimpleNamespace
+
+    from src.environments.go2_sqrl.isaac_lab.terrain_cfg import (
+        configure_terrain_profile,
+    )
+
+    class TerrainCfg(SimpleNamespace):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    terrain_gen = SimpleNamespace(
+        HfInvertedPyramidStairsTerrainCfg=TerrainCfg,
+        MeshPlaneTerrainCfg=TerrainCfg,
+    )
+    generator = SimpleNamespace(sub_terrains={"mixed": object()})
+    curriculum = SimpleNamespace(terrain_levels=object())
+    configure_terrain_profile(
+        generator,
+        curriculum,
+        terrain_gen,
+        "high_clearance_mix",
+        high_clearance_stage=stage,
+    )
+    terrains = list(generator.sub_terrains.values())
+    assert tuple(terrain.proportion for terrain in terrains) == expected
+    for terrain, height in zip(terrains[1:], (0.02, 0.03, 0.04)):
+        assert terrain.step_height_range == (height, height)
+        assert terrain.step_width == 1.0
+        assert terrain.platform_width == 2.0
+        assert terrain.inverted is True
+
+
+def test_torch_and_numpy_phase_reward_contracts_match():
+    torch = pytest.importorskip("torch")
+    from src.environments.go2_sqrl.common.reward import (
+        movement_reward_gate,
+        state_estimated_trot_phase_reward,
+        swing_foot_clearance_error,
+        swing_foot_clearance_overshoot_error,
+    )
+    from src.environments.go2_sqrl.isaac_lab.env import (
+        movement_reward_gate_tensor,
+        swing_clearance_and_phase_tensor,
+        swing_clearance_overshoot_tensor,
+    )
+
+    rng = np.random.default_rng(7)
+    clearance = rng.uniform(-0.01, 0.10, size=(8, 4)).astype(np.float32)
+    velocity = rng.normal(0.0, 0.4, size=(8, 4, 3)).astype(np.float32)
+    torch_clearance, torch_phase, torch_weight = swing_clearance_and_phase_tensor(
+        torch.as_tensor(clearance), torch.as_tensor(velocity)
+    )
+    torch_overshoot = swing_clearance_overshoot_tensor(
+        torch.as_tensor(clearance), torch_weight, upper_target=0.08
+    )
+    numpy_clearance = np.asarray(
+        [
+            swing_foot_clearance_error(c, np.linalg.norm(v[:, :2], axis=-1))
+            for c, v in zip(clearance, velocity)
+        ]
+    )
+    numpy_phase = state_estimated_trot_phase_reward(
+        clearance,
+        velocity[..., 2],
+        np.linalg.norm(velocity[..., :2], axis=-1),
+    )
+    numpy_overshoot = np.asarray(
+        [
+            swing_foot_clearance_overshoot_error(
+                c,
+                np.linalg.norm(v[:, :2], axis=-1),
+                upper_target=0.08,
+            )
+            for c, v in zip(clearance, velocity)
+        ]
+    )
+    forward_velocity = torch.linspace(0.0, 0.3, 8)
+    torch_gate = movement_reward_gate_tensor(
+        forward_velocity, start=0.1, full=0.2
+    )
+    numpy_gate = movement_reward_gate(
+        forward_velocity.numpy(), start=0.1, full=0.2
+    )
+    np.testing.assert_allclose(torch_clearance.numpy(), numpy_clearance, atol=1e-7)
+    np.testing.assert_allclose(torch_phase.numpy(), numpy_phase, atol=1e-6)
+    np.testing.assert_allclose(torch_overshoot.numpy(), numpy_overshoot, atol=1e-7)
+    np.testing.assert_allclose(torch_gate.numpy(), numpy_gate, atol=1e-7)

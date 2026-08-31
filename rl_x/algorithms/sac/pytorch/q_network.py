@@ -11,7 +11,10 @@ def get_q_network(config, env, device):
     compile_mode = config.algorithm.compile_mode
 
     if observation_space_type == ObservationSpaceType.FLAT_VALUES:
-        q_network = torch.compile(QNetwork(env, config.algorithm.nr_hidden_units, device, critic_observation_indices).to(device), mode=compile_mode)
+        q_network = QNetwork(env, config.algorithm.nr_hidden_units, device, critic_observation_indices).to(device)
+        if not bool(config.algorithm.compile_policy):
+            return q_network
+        q_network = torch.compile(q_network, mode=compile_mode)
         q_network.forward = torch.compile(q_network.forward, mode=compile_mode)
         return q_network
 

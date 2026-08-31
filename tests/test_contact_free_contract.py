@@ -64,6 +64,7 @@ def test_mujoco_policy_pd_defaults_match_checkpoint_contract():
     config = get_config("go2_sqrl.sdk2_mujoco")
     assert config.policy_kp == ACTION_SPEC.kp == 25.0
     assert config.policy_kd == ACTION_SPEC.kd == 0.5
+    assert config.terminal_failure_penalty == 0.0
 
 
 def test_mujoco_reset_pd_defaults_settle_before_policy_takeover():
@@ -78,13 +79,20 @@ def test_manifest_versions_sensor_free_estimator_and_shared_failure():
     assert manifest["manifest_version"] == MANIFEST_VERSION == 11
     assert (
         manifest["reward_version"]
-        == "flashsac-go2-walk-easy-command-v5-swing-clearance"
+        == "flashsac-go2-walk-easy-command-v6-state-trot-phase"
     )
     assert (
         manifest["reward_contract"]["base_height_reference"]
         == "local_terrain_clearance"
     )
     assert manifest["reward_contract"]["command"]["linear_velocity_x"] == 0.5
+    assert manifest["reward_contract"]["foot_clearance_target"] == 0.07
+    assert (
+        manifest["reward_contract"]["foot_clearance_aggregation"]
+        == "swing_weighted"
+    )
+    assert manifest["reward_contract"]["phase"]["external_clock"] is False
+    assert manifest["reward_contract"]["phase"]["policy_observation"] is False
     np.testing.assert_allclose(
         manifest["reward_contract"]["similar_to_default_joint_position"],
         [0.0, 0.8, -1.5] * 2 + [0.0, 1.0, -1.5] * 2,

@@ -1,0 +1,265 @@
+{
+  "actors": [
+    {
+      "action_size": 12,
+      "alpha": 0.00015033881936687976,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/isaac_sac_flat_action_v2_legacy_v1/models",
+      "id": "flat_seed0",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "6cc5a6b152e440c2dd62139089006ec6de4727485113b27276c01cb3d6cda778",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 10000,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 1000,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "train",
+      "task_sha256": "25ca5b62c8eafd6f3f011dbbbe8adeaa689f6a9ccd96ee3fe920da2a4fa4fc03"
+    },
+    {
+      "action_size": 12,
+      "alpha": 0.00018184563668910414,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_rough_seed0_v11/models",
+      "id": "rough_seed0",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "e233cfc6ff83d08b757b092e2787c151a3ef665623fec4487e7d1e5234db2691",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 10000,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 1000,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "train",
+      "task_sha256": "7ca9ec90efa2f040adb397ea32b551b32f947cfc6c64a27d8bdbfbc1b1ea93d4"
+    },
+    {
+      "action_size": 12,
+      "alpha": 0.00027259421767666936,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/gait_finetune/gait_h07_p03_50k_s0/models",
+      "id": "step_seed0",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "c77b3c13c479c18099c0facee0d24c55b8dcf32d5fc5b3d7b33cb39fb8a90635",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 2500,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 2500,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "train",
+      "task_sha256": "50f57f53ccc521910ff9b5653c90888920e71a4ae60ef7a6ecb85ba957b35476"
+    },
+    {
+      "action_size": 12,
+      "alpha": 0.00012570410035550594,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed1_v11/models",
+      "id": "flat_seed1",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "0b138279766d69247e5c2ea2016e9931a425d5497bda524dd8928277f981eaee",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 10000,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 1000,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "validation",
+      "task_sha256": "fa817fd2ee6fe05881cb530a0624134b977e06528fdcf21e048ce0212fb071ae"
+    },
+    {
+      "action_size": 12,
+      "alpha": 0.00017850742733571678,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_rough_seed1_v11/models",
+      "id": "rough_seed1",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "9c0399f51937d3f3e38dcda1502d88a7e34020d4b6f74d8de67789bede0c997a",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 10000,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 1000,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "validation",
+      "task_sha256": "7468ee71f6b1dcd071558edeeb16e2c3ef2d6d7fc3d140fdf5382acb4b0ddfa6"
+    },
+    {
+      "action_size": 12,
+      "alpha": 0.0002672075934242457,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/gait_finetune/gait_h07_p03_50k_s2/models",
+      "id": "step_seed1",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "a57beaddaec2ee6c2285584032c135d96039400497ca139f5256bb6a938bffa5",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 2500,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 2500,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "validation",
+      "task_sha256": "51a260fd446d8e0c54dc7ca0ab4132960481d155bdd695fcc212054742ec7e93"
+    },
+    {
+      "action_size": 12,
+      "alpha": 0.00012270496517885476,
+      "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed2_v11/models",
+      "id": "heldout_flat",
+      "manifest_version": 11,
+      "observation_size": 46,
+      "policy_sha256": "12abea784b42642c37c74e78e3a2b5f90e3e81dc550b8475726c5f4e0a923747",
+      "sac": {
+        "batch_size": 256,
+        "finetune_actor_update_interval": 1,
+        "finetune_actor_warmup_steps": 10000,
+        "gamma": 0.99,
+        "learning_rate": 0.0003,
+        "learning_starts": 1000,
+        "task_utd_ratio": 1.0,
+        "tau": 0.005
+      },
+      "split": "test",
+      "task_sha256": "b453c1637d0b5a2777e281e2b4502a1b8252a2f5e6282f22a259a72599d851c0"
+    }
+  ],
+  "shared_contract": {
+    "action": {
+      "armature": 0.0,
+      "backend_offset_semantics": "shared_default_position",
+      "control_dt": 0.02,
+      "default_position": [
+        0.0,
+        0.8999999761581421,
+        -1.7999999523162842,
+        0.0,
+        0.8999999761581421,
+        -1.7999999523162842,
+        0.0,
+        0.8999999761581421,
+        -1.7999999523162842,
+        0.0,
+        0.8999999761581421,
+        -1.7999999523162842
+      ],
+      "effort_limit": 23.5,
+      "joint_damping": 0.0,
+      "joint_friction": 0.0,
+      "joint_order": [
+        "FR_hip",
+        "FR_thigh",
+        "FR_calf",
+        "FL_hip",
+        "FL_thigh",
+        "FL_calf",
+        "RR_hip",
+        "RR_thigh",
+        "RR_calf",
+        "RL_hip",
+        "RL_thigh",
+        "RL_calf"
+      ],
+      "kd": 0.5,
+      "kp": 25.0,
+      "max_target_rate": 12.0,
+      "pipeline_version": "sdk-absolute-position-v3-per-joint-scale",
+      "scale": [
+        0.25,
+        0.3499999940395355,
+        0.44999998807907104,
+        0.25,
+        0.3499999940395355,
+        0.44999998807907104,
+        0.25,
+        0.3499999940395355,
+        0.44999998807907104,
+        0.25,
+        0.3499999940395355,
+        0.44999998807907104
+      ],
+      "size": 12,
+      "target_semantics": "absolute_joint_position",
+      "velocity_limit": 1000.0,
+      "version": "go2-action-v2-per-joint-scale"
+    },
+    "failure": {
+      "aggregation": "tilt_or_low_base",
+      "angle_threshold": 0.8,
+      "consecutive_frames": 5,
+      "external_contact_sensor": false,
+      "frame_dt": 0.002,
+      "frame_unit": "physics_frames",
+      "min_base_clearance": 0.18,
+      "signal": [
+        "imu_quaternion_roll_pitch",
+        "base_clearance_above_local_terrain"
+      ],
+      "version": "tilt-or-low-terrain-clearance-sustained-v3"
+    },
+    "observation": {
+      "body_velocity": {
+        "frame": "body",
+        "indices": [
+          27,
+          30
+        ],
+        "source": "proprioceptive_velocity_estimator"
+      },
+      "joint_order": [
+        "FR_hip",
+        "FR_thigh",
+        "FR_calf",
+        "FL_hip",
+        "FL_thigh",
+        "FL_calf",
+        "RR_hip",
+        "RR_thigh",
+        "RR_calf",
+        "RL_hip",
+        "RL_thigh",
+        "RL_calf"
+      ],
+      "quaternion_order": "WXYZ",
+      "size": 46,
+      "velocity_estimator": {
+        "external_contact_sensor": false,
+        "inputs": [
+          "joint_q",
+          "joint_dq",
+          "imu_gyro",
+          "imu_quat",
+          "imu_accelerometer"
+        ],
+        "policy_visible": true,
+        "version": "contact-free-robust-kf-v1"
+      },
+      "version": "go2-observation-v3-body-velocity"
+    }
+  },
+  "status": "PASS"
+}

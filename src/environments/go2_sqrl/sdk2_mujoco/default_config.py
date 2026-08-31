@@ -1,7 +1,7 @@
 from ml_collections import config_dict
 
 from ..common.estimation.velocity import configure_velocity_estimator
-from ..common.specs import configure_failure_detection
+from ..common.specs import DEFAULT_ACTION_PROFILE, configure_failure_detection
 
 
 def get_config(environment_name):
@@ -61,6 +61,26 @@ def get_config(environment_name):
     # The policy has no command input, so evaluation must use the fixed velocity
     # objective on which it was pre-trained.
     config.target_velocity_x = 0.5
+    config.action_profile = DEFAULT_ACTION_PROFILE
+    config.foot_clearance_target = 0.07
+    config.foot_clearance_reward_scale = -20.0
+    config.clearance_reward_mode = "swing_weighted"
+    config.phase_reference_frequency = 2.0
+    config.phase_reward_scale = 0.0
+    config.foot_clearance_upper_target = 0.0
+    config.foot_clearance_overshoot_scale = 0.0
+    config.phase_velocity_gate_start = 0.0
+    config.phase_velocity_gate_full = 0.0
+    config.stable_progress_start = 1.0
+    config.stable_progress_min_base_clearance = 0.22
+    config.stable_progress_scale = 0.0
+    config.terminal_failure_penalty = 0.0
+    # Training-only truth for deterministic MuJoCo scenes.  These values feed
+    # local-height reward/failure metrics but never actor or QSafe inputs.
+    config.terrain_profile = "flat"
+    config.step_height = 0.04
+    config.step_start_x = 1.0
+    config.step_success_distance = 2.0
 
     config.kp = 25.0
     config.kd = 0.5

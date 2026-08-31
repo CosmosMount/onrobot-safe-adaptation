@@ -8,6 +8,8 @@ from typing import Any, Mapping
 import numpy as np
 from flax import serialization
 
+from rl_x.algorithms.qsafe.common import TASK_ACTION_CONTRACT
+
 
 POLICY_ARTIFACT_FORMAT = "sac_qsafe_flax_policy"
 POLICY_ARTIFACT_VERSION = 1
@@ -144,6 +146,139 @@ def convert_torch_qsafe_params(
     _set_dense(state, "Dense_1", torch_state, "network.2")
     _set_dense(state, "Dense_2", torch_state, "network.4")
     return serialization.from_state_dict(template_params, state)
+
+
+def convert_torch_critic_params(
+    template_params,
+    q1_state: Mapping[str, Any],
+    q2_state: Mapping[str, Any],
+):
+    """Convert paired PyTorch SAC critics into the vmapped Flax critic tree."""
+
+    critics = [_normalized_state_dict(value) for value in (q1_state, q2_state)]
+    expected = {
+        "critic.0.weight",
+        "critic.0.bias",
+        "critic.2.weight",
+        "critic.2.bias",
+        "critic.4.weight",
+        "critic.4.bias",
+    }
+    for index, critic in enumerate(critics, start=1):
+        _require_exact_keys(critic, expected, f"PyTorch Q{index}")
+
+    state = serialization.to_state_dict(template_params)
+    try:
+        vmapped = state["params"]["VmapCritic_0"]
+    except KeyError as exc:
+        raise ValueError("Unexpected Flax vector-critic parameter structure") from exc
+    for dense_name, torch_name in (
+        ("Dense_0", "critic.0"),
+        ("Dense_1", "critic.2"),
+        ("Dense_2", "critic.4"),
+    ):
+        kernels = np.stack(
+            [
+                _as_numpy(critic[f"{torch_name}.weight"], dtype=np.float32).T
+                for critic in critics
+            ]
+        )
+        biases = np.stack(
+            [
+                _as_numpy(critic[f"{torch_name}.bias"], dtype=np.float32)
+                for critic in critics
+            ]
+        )
+        expected_kernel = np.asarray(vmapped[dense_name]["kernel"]).shape
+        expected_bias = np.asarray(vmapped[dense_name]["bias"]).shape
+        if kernels.shape != expected_kernel or biases.shape != expected_bias:
+            raise ValueError(
+                f"{torch_name} shape mismatch: expected kernel={expected_kernel}, "
+                f"bias={expected_bias}; got kernel={kernels.shape}, "
+                f"bias={biases.shape}"
+            )
+        vmapped[dense_name]["kernel"] = kernels
+        vmapped[dense_name]["bias"] = biases
+    return serialization.from_state_dict(template_params, state)
+
+
+def load_torch_task_artifact(
+    file_path: str | Path,
+    online_template,
+    target_template,
+) -> dict[str, Any]:
+    """Load task critics/targets and alpha while leaving optimizers fresh."""
+
+    checkpoint = _load_torch(file_path)
+    required = {
+        "task_action_contract",
+        "q1_state_dict",
+        "q2_state_dict",
+        "q1_target_state_dict",
+        "q2_target_state_dict",
+        "log_alpha",
+    }
+    missing = required.difference(checkpoint)
+    if missing:
+        raise ValueError(f"PyTorch task checkpoint is missing {sorted(missing)}")
+    if checkpoint["task_action_contract"] != TASK_ACTION_CONTRACT:
+        raise ValueError(
+            "PyTorch task checkpoint action contract mismatch: expected "
+            f"{TASK_ACTION_CONTRACT}, got {checkpoint['task_action_contract']}"
+        )
+    return {
+        "critic_params": convert_torch_critic_params(
+            online_template,
+            checkpoint["q1_state_dict"],
+            checkpoint["q2_state_dict"],
+        ),
+        "target_critic_params": convert_torch_critic_params(
+            target_template,
+            checkpoint["q1_target_state_dict"],
+            checkpoint["q2_target_state_dict"],
+        ),
+        "log_alpha": float(_as_numpy(checkpoint["log_alpha"]).reshape(())),
+    }
+
+
+def load_task_artifact(
+    file_path: str | Path,
+    online_template,
+    target_template,
+) -> dict[str, Any]:
+    """Load Torch or native-Flax task parameters without optimizer state."""
+
+    if looks_like_torch_checkpoint(file_path):
+        return load_torch_task_artifact(
+            file_path, online_template, target_template
+        )
+    with open(file_path, "rb") as model_file:
+        payload = serialization.msgpack_restore(model_file.read())
+    try:
+        if payload.get("task_action_contract") != TASK_ACTION_CONTRACT:
+            raise ValueError(
+                "Native task checkpoint action contract mismatch: expected "
+                f"{TASK_ACTION_CONTRACT}, got "
+                f"{payload.get('task_action_contract')}"
+            )
+        checkpoint = payload["checkpoint"]
+        critic = checkpoint["critic"]
+        entropy = checkpoint["entropy_coefficient"]
+        return {
+            "critic_params": serialization.from_state_dict(
+                online_template, critic["params"]
+            ),
+            "target_critic_params": serialization.from_state_dict(
+                target_template, critic["target_params"]
+            ),
+            "log_alpha": float(
+                np.asarray(entropy["params"]["params"]["log_alpha"]).reshape(())
+            ),
+        }
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"Native task checkpoint {file_path} has an invalid structure"
+        ) from exc
 
 
 def _normalizer_state_from_torch(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -284,7 +419,7 @@ def load_torch_qsafe_artifact(
     missing = required.difference(checkpoint)
     if missing:
         raise ValueError(f"PyTorch QSafe checkpoint is missing {sorted(missing)}")
-    return {
+    artifact = {
         "metadata": dict(checkpoint["metadata"]),
         "online_params": convert_torch_qsafe_params(
             online_template,
@@ -297,3 +432,22 @@ def load_torch_qsafe_artifact(
             expected_observation_indices,
         ),
     }
+    if int(checkpoint["metadata"].get("checkpoint_version", 1)) >= 2:
+        normalizer_state = checkpoint.get(
+            "safety_observation_normalizer_state_dict"
+        )
+        normalizer_metadata = checkpoint.get(
+            "safety_observation_normalizer_metadata"
+        )
+        if normalizer_state is None or normalizer_metadata is None:
+            raise ValueError(
+                "PyTorch QSafe v2 checkpoint is missing its safety normalizer"
+            )
+        artifact["normalizer_state"] = _normalizer_state_from_torch(
+            normalizer_state
+        )
+        artifact["normalizer_metadata"] = dict(normalizer_metadata)
+        artifact["calibration_report"] = dict(
+            checkpoint.get("calibration_report", {})
+        )
+    return artifact

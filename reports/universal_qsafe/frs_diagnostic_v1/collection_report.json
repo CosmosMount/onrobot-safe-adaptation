@@ -1,0 +1,433 @@
+{
+  "rounds": [
+    {
+      "cells": [
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50000,
+          "prior_fall_rate": 0.5,
+          "prior_success_rate": 0.675,
+          "split": "train",
+          "terrain": "boxes_8cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "step_seed0",
+          "map_seed": 50001,
+          "prior_fall_rate": 0.525,
+          "prior_success_rate": 0.55,
+          "split": "train",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50002,
+          "prior_fall_rate": 0.45,
+          "prior_success_rate": 0.55,
+          "split": "train",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "step_seed0",
+          "map_seed": 50003,
+          "prior_fall_rate": 0.425,
+          "prior_success_rate": 0.0,
+          "split": "train",
+          "terrain": "stairs_up_l2"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "step_seed0",
+          "map_seed": 50004,
+          "prior_fall_rate": 0.425,
+          "prior_success_rate": 0.275,
+          "split": "train",
+          "terrain": "step_6cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "flat_seed0",
+          "map_seed": 50005,
+          "prior_fall_rate": 0.4,
+          "prior_success_rate": 0.55,
+          "split": "train",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "flat_seed0",
+          "map_seed": 50006,
+          "prior_fall_rate": 0.35,
+          "prior_success_rate": 0.5,
+          "split": "train",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "flat_seed0",
+          "map_seed": 50007,
+          "prior_fall_rate": 0.325,
+          "prior_success_rate": 0.0,
+          "split": "train",
+          "terrain": "step_6cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50008,
+          "prior_fall_rate": 0.3,
+          "prior_success_rate": 0.0,
+          "split": "train",
+          "terrain": "step_6cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50009,
+          "prior_fall_rate": 0.3,
+          "prior_success_rate": 0.75,
+          "split": "train",
+          "terrain": "boxes_4cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "heldout_flat",
+          "map_seed": 50010,
+          "prior_fall_rate": 0.5,
+          "prior_success_rate": 0.45,
+          "split": "test",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50011,
+          "prior_fall_rate": 0.5,
+          "prior_success_rate": 0.35,
+          "split": "test",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.05,
+          "actor_id": "heldout_flat",
+          "map_seed": 50012,
+          "prior_fall_rate": 0.2,
+          "prior_success_rate": 0.05,
+          "split": "test",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50013,
+          "prior_fall_rate": 0.15,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50014,
+          "prior_fall_rate": 0.15,
+          "prior_success_rate": 0.2,
+          "split": "test",
+          "terrain": "step_4cm"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "heldout_flat",
+          "map_seed": 50015,
+          "prior_fall_rate": 0.15,
+          "prior_success_rate": 0.7,
+          "split": "test",
+          "terrain": "boxes_8cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "heldout_flat",
+          "map_seed": 50016,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "heldout_flat",
+          "map_seed": 50017,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "stairs_up_l1"
+        },
+        {
+          "action_noise": 0.05,
+          "actor_id": "heldout_flat",
+          "map_seed": 50018,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.25,
+          "split": "test",
+          "terrain": "step_4cm"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "heldout_flat",
+          "map_seed": 50019,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "step_6cm"
+        }
+      ],
+      "deficits_before": {
+        "test": {
+          "fall": 54,
+          "success": 0
+        },
+        "train": {
+          "fall": 195,
+          "success": 0
+        },
+        "validation": {
+          "fall": 0,
+          "success": 0
+        }
+      },
+      "round": 1
+    },
+    {
+      "cells": [
+        {
+          "action_noise": 0.0,
+          "actor_id": "step_seed0",
+          "map_seed": 50020,
+          "prior_fall_rate": 0.45,
+          "prior_success_rate": 0.5833333333333334,
+          "split": "train",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "step_seed0",
+          "map_seed": 50021,
+          "prior_fall_rate": 0.55,
+          "prior_success_rate": 0.23333333333333334,
+          "split": "train",
+          "terrain": "step_6cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50022,
+          "prior_fall_rate": 0.43333333333333335,
+          "prior_success_rate": 0.7666666666666667,
+          "split": "train",
+          "terrain": "boxes_8cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "flat_seed0",
+          "map_seed": 50023,
+          "prior_fall_rate": 0.36666666666666664,
+          "prior_success_rate": 0.5333333333333333,
+          "split": "train",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50024,
+          "prior_fall_rate": 0.36666666666666664,
+          "prior_success_rate": 0.5833333333333334,
+          "split": "train",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "flat_seed0",
+          "map_seed": 50025,
+          "prior_fall_rate": 0.35,
+          "prior_success_rate": 0.5,
+          "split": "train",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "step_seed0",
+          "map_seed": 50026,
+          "prior_fall_rate": 0.3333333333333333,
+          "prior_success_rate": 0.0,
+          "split": "train",
+          "terrain": "stairs_up_l2"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "flat_seed0",
+          "map_seed": 50027,
+          "prior_fall_rate": 0.325,
+          "prior_success_rate": 0.0,
+          "split": "train",
+          "terrain": "step_6cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50028,
+          "prior_fall_rate": 0.3,
+          "prior_success_rate": 0.0,
+          "split": "train",
+          "terrain": "step_6cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "flat_seed0",
+          "map_seed": 50029,
+          "prior_fall_rate": 0.3,
+          "prior_success_rate": 0.75,
+          "split": "train",
+          "terrain": "boxes_4cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "heldout_flat",
+          "map_seed": 50030,
+          "prior_fall_rate": 0.45,
+          "prior_success_rate": 0.5,
+          "split": "test",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50031,
+          "prior_fall_rate": 0.4,
+          "prior_success_rate": 0.375,
+          "split": "test",
+          "terrain": "mixed"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "heldout_flat",
+          "map_seed": 50032,
+          "prior_fall_rate": 0.175,
+          "prior_success_rate": 0.75,
+          "split": "test",
+          "terrain": "boxes_8cm"
+        },
+        {
+          "action_noise": 0.05,
+          "actor_id": "heldout_flat",
+          "map_seed": 50033,
+          "prior_fall_rate": 0.15,
+          "prior_success_rate": 0.375,
+          "split": "test",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50034,
+          "prior_fall_rate": 0.125,
+          "prior_success_rate": 0.25,
+          "split": "test",
+          "terrain": "step_4cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50035,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50036,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.9,
+          "split": "test",
+          "terrain": "boxes_4cm"
+        },
+        {
+          "action_noise": 0.1,
+          "actor_id": "heldout_flat",
+          "map_seed": 50037,
+          "prior_fall_rate": 0.1,
+          "prior_success_rate": 0.65,
+          "split": "test",
+          "terrain": "boxes_8cm"
+        },
+        {
+          "action_noise": 0.0,
+          "actor_id": "heldout_flat",
+          "map_seed": 50038,
+          "prior_fall_rate": 0.075,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "stairs_up_l0"
+        },
+        {
+          "action_noise": 0.2,
+          "actor_id": "heldout_flat",
+          "map_seed": 50039,
+          "prior_fall_rate": 0.075,
+          "prior_success_rate": 0.0,
+          "split": "test",
+          "terrain": "step_6cm"
+        }
+      ],
+      "deficits_before": {
+        "test": {
+          "fall": 29,
+          "success": 0
+        },
+        "train": {
+          "fall": 154,
+          "success": 0
+        },
+        "validation": {
+          "fall": 0,
+          "success": 0
+        }
+      },
+      "round": 2
+    }
+  ],
+  "statistics": {
+    "by_split": {
+      "test": {
+        "fall": 97,
+        "stuck": 482,
+        "success": 311,
+        "trajectories": 920,
+        "transitions": 435732
+      },
+      "train": {
+        "fall": 418,
+        "stuck": 518,
+        "success": 1151,
+        "trajectories": 2080,
+        "transitions": 933161
+      },
+      "validation": {
+        "fall": 291,
+        "stuck": 305,
+        "success": 984,
+        "trajectories": 1560,
+        "transitions": 712963
+      }
+    },
+    "fall": 806,
+    "stuck": 1305,
+    "success": 2446,
+    "trajectories": 4560,
+    "transitions": 2081856
+  },
+  "status": "WARN"
+}

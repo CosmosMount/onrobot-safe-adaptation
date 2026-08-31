@@ -2,16 +2,94 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
-from rl_x.algorithms.qsafe.common import VectorTrajectoryAccumulator, safety_bellman_target
+from rl_x.algorithms.qsafe.common import (
+    SafetyObservationHistory,
+    VectorTrajectoryAccumulator,
+    safety_bellman_target,
+    trajectory_with_observation_history,
+)
 from rl_x.algorithms.qsafe.replay_buffer import SafetyReplayBuffer
 from rl_x.algorithms.qsafe.pytorch.safety_critic import SafetyQNetwork
 
 
+class SafetyObservationNormalizer(nn.Module):
+    """QSafe-owned running statistics; never shared with the actor."""
+
+    def __init__(self, observation_size, enabled=True, epsilon=1e-8):
+        super().__init__()
+        self.observation_size = int(observation_size)
+        self.enabled = bool(enabled)
+        self.epsilon = float(epsilon)
+        self.register_buffer("running_mean", torch.zeros(1, observation_size))
+        self.register_buffer("running_var", torch.ones(1, observation_size))
+        self.register_buffer("count", torch.zeros((), dtype=torch.float64))
+        self.frozen = False
+
+    @property
+    def running_std(self):
+        return torch.sqrt(torch.clamp(self.running_var, min=0.0))
+
+    @torch.no_grad()
+    def update(self, observations):
+        if not self.enabled or self.frozen:
+            return
+        values = observations.detach().reshape(-1, self.observation_size).float()
+        if not values.shape[0]:
+            return
+        batch_count = float(values.shape[0])
+        batch_mean = values.mean(dim=0, keepdim=True)
+        batch_var = values.var(dim=0, unbiased=False, keepdim=True)
+        if self.count.item() == 0:
+            self.running_mean.copy_(batch_mean)
+            self.running_var.copy_(batch_var)
+            self.count.fill_(batch_count)
+            return
+        old_count = self.count.to(dtype=values.dtype)
+        new_count = old_count + batch_count
+        delta = batch_mean - self.running_mean
+        mean = self.running_mean + delta * batch_count / new_count
+        m2 = (
+            self.running_var * old_count
+            + batch_var * batch_count
+            + delta.square() * old_count * batch_count / new_count
+        )
+        self.running_mean.copy_(mean)
+        self.running_var.copy_(m2 / new_count)
+        self.count.fill_(float(new_count.item()))
+
+    def normalize(self, observations, update=False):
+        if update:
+            self.update(observations)
+        values = observations.float()
+        if not self.enabled:
+            return values
+        return (values - self.running_mean) / (self.running_std + self.epsilon)
+
+    def freeze(self):
+        self.frozen = True
+        self.eval()
+
+    def metadata(self):
+        return {
+            "observation_size": self.observation_size,
+            "enabled": self.enabled,
+            "epsilon": self.epsilon,
+            "count": int(self.count.item()),
+        }
+
+    def validate_metadata(self, metadata):
+        for key in ("observation_size", "enabled", "epsilon"):
+            if metadata.get(key) != self.metadata()[key]:
+                raise ValueError(
+                    f"Incompatible safety normalizer {key}: expected "
+                    f"{self.metadata()[key]}, got {metadata.get(key)}"
+                )
+
+
 class QSafe:
     """Reusable SQRL safety critic and action-projection layer."""
-
-    CHECKPOINT_VERSION = 1
 
     def __init__(
         self,
@@ -26,6 +104,10 @@ class QSafe:
         self.phase = phase or config.algorithm.phase
         self.device = device
         self.rng = rng
+        self.version = int(getattr(self.config, "version", 1))
+        if self.version not in (1, 2):
+            raise ValueError("algorithm.qsafe.version must be 1 or 2.")
+        self.checkpoint_version = self.version
         self.epsilon = float(self.config.epsilon)
         self.gamma = float(self.config.gamma)
         self.tau = float(self.config.tau)
@@ -33,28 +115,68 @@ class QSafe:
         self.candidate_actions = int(self.config.candidate_actions)
         if self.candidate_actions < 1:
             raise ValueError("algorithm.qsafe.candidate_actions must be at least 1.")
-        self.observation_shape = tuple(env.single_observation_space.shape)
-        self.action_shape = tuple(env.single_action_space.shape)
-        self.observation_indices = np.asarray(
-            getattr(
-                env,
-                "safety_critic_observation_indices",
-                np.arange(self.observation_shape[0]),
-            ),
-            dtype=np.int64,
+        self.base_observation_shape = tuple(env.single_observation_space.shape)
+        if len(self.base_observation_shape) != 1:
+            raise ValueError("QSafe expects a flat policy observation.")
+        self.history_length = (
+            int(getattr(self.config, "history_length", 1))
+            if self.version == 2
+            else 1
         )
+        self.control_dt = float(getattr(self.config, "control_dt", 0.02))
+        if self.control_dt <= 0.0:
+            raise ValueError("algorithm.qsafe.control_dt must be positive.")
+        self.observation_shape = (
+            self.base_observation_shape[0] * self.history_length,
+        )
+        self.action_shape = tuple(env.single_action_space.shape)
+        if self.version == 1:
+            self.observation_indices = np.asarray(
+                getattr(
+                    env,
+                    "safety_critic_observation_indices",
+                    np.arange(self.observation_shape[0]),
+                ),
+                dtype=np.int64,
+            )
+        else:
+            self.observation_indices = np.arange(
+                self.observation_shape[0], dtype=np.int64
+            )
+        self.output_activation = "sigmoid" if self.version == 2 else "tanh"
+        self.observation_normalizer = SafetyObservationNormalizer(
+            self.observation_shape[0],
+            enabled=(
+                bool(getattr(self.config, "enable_observation_normalization", True))
+                if self.version == 2
+                else False
+            ),
+            epsilon=float(getattr(self.config, "normalizer_epsilon", 1e-8)),
+        ).to(device)
+        self._rollout_histories = {}
+        self.environment_contract = None
+        if hasattr(env, "checkpoint_manifest"):
+            manifest = env.checkpoint_manifest(None)
+            self.environment_contract = {
+                "observation": manifest.get("observation"),
+                "action": manifest.get("action"),
+                "failure": manifest.get("failure"),
+            }
+        self.calibration_report = {}
         hidden_units = int(self.config.nr_hidden_units)
         self.online = SafetyQNetwork(
             self.observation_shape,
             self.action_shape,
             self.observation_indices,
             hidden_units,
+            self.output_activation,
         ).to(device)
         self.target = SafetyQNetwork(
             self.observation_shape,
             self.action_shape,
             self.observation_indices,
             hidden_units,
+            self.output_activation,
         ).to(device)
         self.target.load_state_dict(self.online.state_dict())
         self.optimizer = None
@@ -97,10 +219,29 @@ class QSafe:
                 truncations,
             )
             for trajectory in completed:
-                self.replay_buffer.add_trajectory(trajectory)
+                self.add_trajectory(trajectory)
 
     def add_trajectory(self, trajectory):
         if not self.frozen:
+            if self.version == 2:
+                trajectory = trajectory_with_observation_history(
+                    trajectory,
+                    self.base_observation_shape[0],
+                    self.history_length,
+                )
+                states = torch.as_tensor(
+                    np.stack([item[0] for item in trajectory]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                next_states = torch.as_tensor(
+                    np.stack([item[1] for item in trajectory]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.observation_normalizer.update(
+                    torch.cat([states, next_states], dim=0)
+                )
             self.replay_buffer.add_trajectory(trajectory)
 
     def ready_to_update(self, global_step=None):
@@ -117,13 +258,31 @@ class QSafe:
             for value in arrays
         ]
         raw_next_states = next_states
-        if state_transform is not None:
-            states = state_transform(states)
-            next_states = state_transform(next_states)
+        if self.version == 2:
+            states = self.observation_normalizer.normalize(states, update=False)
+            next_states = self.observation_normalizer.normalize(
+                next_states, update=False
+            )
+            policy_next_states = raw_next_states[
+                ..., -self.base_observation_shape[0] :
+            ]
+            if state_transform is not None:
+                policy_next_states = state_transform(policy_next_states)
+        else:
+            policy_next_states = next_states
+            if state_transform is not None:
+                states = state_transform(states)
+                next_states = state_transform(next_states)
+                policy_next_states = next_states
         with torch.no_grad():
-            next_actions = policy_sampler(next_states)
+            next_actions = policy_sampler(policy_next_states)
             if action_transform is not None:
-                next_actions = action_transform(raw_next_states, next_actions)
+                action_raw_states = (
+                    raw_next_states[..., -self.base_observation_shape[0] :]
+                    if self.version == 2
+                    else raw_next_states
+                )
+                next_actions = action_transform(action_raw_states, next_actions)
             next_q = self.target(next_states, next_actions)
             failures = failures.reshape(-1, 1)
             target = safety_bellman_target(
@@ -154,12 +313,21 @@ class QSafe:
             "qsafe/target": target.detach().mean().item(),
         }
 
-    def values(self, states, actions):
+    def normalize_observations(self, states):
+        if self.version == 2:
+            return self.observation_normalizer.normalize(states, update=False)
+        return states
+
+    def values(self, states, actions, normalized=False):
+        if self.version == 2 and not normalized:
+            states = self.normalize_observations(states)
         return self.online(states, actions)
 
     def select_safe_action(self, states, candidate_actions, candidate_log_probs, phase=None):
         """Project sampled actions; candidate tensors are [env, candidate, ...]."""
         phase = phase or self.phase
+        if self.version == 2:
+            states = self.normalize_observations(states)
         nr_envs, nr_candidates = candidate_actions.shape[:2]
         repeated_states = states[:, None, :].expand(-1, nr_candidates, -1)
         with torch.no_grad():
@@ -216,10 +384,31 @@ class QSafe:
         for parameter in self.target.parameters():
             parameter.requires_grad_(False)
         self.optimizer = None
+        self.observation_normalizer.freeze()
+
+    def rollout_observations(self, observations, reset_mask=None, stream="task"):
+        """Append one raw 46D frame and return the QSafe input for a stream."""
+
+        if self.version == 1:
+            return np.asarray(observations, dtype=np.float32)
+        values = np.asarray(observations, dtype=np.float32)
+        history = self._rollout_histories.get(stream)
+        if history is None or history.nr_envs != values.shape[0]:
+            history = SafetyObservationHistory(
+                values.shape[0], self.base_observation_shape[0], self.history_length
+            )
+            self._rollout_histories[stream] = history
+        return history.append(values, reset_mask=reset_mask)
+
+    def clear_rollout_history(self, stream=None):
+        if stream is None:
+            self._rollout_histories.clear()
+        else:
+            self._rollout_histories.pop(stream, None)
 
     def metadata(self):
-        return {
-            "checkpoint_version": self.CHECKPOINT_VERSION,
+        legacy = {
+            "checkpoint_version": self.checkpoint_version,
             "observation_shape": self.observation_shape,
             "action_shape": self.action_shape,
             "observation_indices": self.observation_indices.tolist(),
@@ -228,6 +417,31 @@ class QSafe:
             "epsilon": self.epsilon,
             "max_trajectories": int(self.config.max_trajectories),
         }
+        if self.version == 1:
+            return legacy
+        return {
+            **legacy,
+            "qsafe_version": self.version,
+            "base_observation_shape": self.base_observation_shape,
+            "history_length": self.history_length,
+            "control_dt": self.control_dt,
+            "history_duration": self.history_length * self.control_dt,
+            "output_range": [0.0, 1.0] if self.version == 2 else [-1.0, 1.0],
+            "safety_observation_contract": {
+                "source": "raw_policy_observation",
+                "frame_size": self.base_observation_shape[0],
+                "layout": "oldest_to_newest_flattened",
+                "reset_fill": "repeat_first_frame",
+            },
+            "safety_action_contract": {
+                "source": "projected_executed_policy_action",
+                "shape": list(self.action_shape),
+                "range": [-1.0, 1.0],
+                "semantics": "normalized_joint_position_target_after_rate_and_joint_limits",
+            },
+            "environment_contract": self.environment_contract,
+            "normalizer": self.observation_normalizer.metadata(),
+        }
 
     def state_dict(self, include_optimizer=True):
         state = {
@@ -235,6 +449,13 @@ class QSafe:
             "config": self.config.to_dict(),
             "online_state_dict": self.online.state_dict(),
             "target_state_dict": self.target.state_dict(),
+            "safety_observation_normalizer_state_dict": (
+                self.observation_normalizer.state_dict()
+            ),
+            "safety_observation_normalizer_metadata": (
+                self.observation_normalizer.metadata()
+            ),
+            "calibration_report": dict(self.calibration_report),
         }
         if include_optimizer and self.optimizer is not None:
             state["optimizer_state_dict"] = self.optimizer.state_dict()
@@ -242,7 +463,7 @@ class QSafe:
 
     def _validate_metadata(self, metadata):
         expected = self.metadata()
-        for key in (
+        keys = [
             "checkpoint_version",
             "observation_shape",
             "action_shape",
@@ -251,7 +472,19 @@ class QSafe:
             "gamma",
             "epsilon",
             "max_trajectories",
-        ):
+        ]
+        if self.version == 2:
+            keys.extend(
+                [
+                    "qsafe_version",
+                    "base_observation_shape",
+                    "history_length",
+                    "control_dt",
+                    "output_range",
+                    "environment_contract",
+                ]
+            )
+        for key in keys:
             checkpoint_value = metadata[key]
             expected_value = expected[key]
             if isinstance(checkpoint_value, list):
@@ -268,6 +501,20 @@ class QSafe:
         self._validate_metadata(state["metadata"])
         self.online.load_state_dict(state["online_state_dict"])
         self.target.load_state_dict(state["target_state_dict"])
+        if self.version == 2:
+            normalizer_state = state.get(
+                "safety_observation_normalizer_state_dict"
+            )
+            normalizer_metadata = state.get(
+                "safety_observation_normalizer_metadata"
+            )
+            if normalizer_state is None or normalizer_metadata is None:
+                raise ValueError(
+                    "QSafe v2 checkpoint is missing its independent normalizer."
+                )
+            self.observation_normalizer.validate_metadata(normalizer_metadata)
+            self.observation_normalizer.load_state_dict(normalizer_state)
+            self.calibration_report = dict(state.get("calibration_report", {}))
         if load_optimizer and self.optimizer is not None and "optimizer_state_dict" in state:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
 

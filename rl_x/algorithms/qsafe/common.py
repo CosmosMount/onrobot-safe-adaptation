@@ -1,6 +1,219 @@
 import numpy as np
 
 
+# The task MDP is defined by the action that actually reaches the actuator
+# after joint/rate projection.  Actor log-probabilities are still computed in
+# the original pre-tanh distribution; only critic/replay action semantics use
+# this marker.
+TASK_ACTION_CONTRACT = "applied_rate_limited_v1"
+
+
+class SafetyObservationHistory:
+    """Per-environment fixed-length history of raw policy observations.
+
+    A newly reset environment is initialized by repeating its first frame, so
+    neither the actor observation nor the environment API needs to change.
+    """
+
+    def __init__(self, nr_envs, observation_size, history_length=5):
+        self.nr_envs = int(nr_envs)
+        self.observation_size = int(observation_size)
+        self.history_length = int(history_length)
+        if self.nr_envs < 1 or self.observation_size < 1:
+            raise ValueError("Safety history dimensions must be positive.")
+        if self.history_length < 1:
+            raise ValueError("QSafe history_length must be at least 1.")
+        self.frames = np.zeros(
+            (self.nr_envs, self.history_length, self.observation_size),
+            dtype=np.float32,
+        )
+        self.initialized = np.zeros(self.nr_envs, dtype=bool)
+
+    @property
+    def flattened_size(self):
+        return self.history_length * self.observation_size
+
+    def clear(self):
+        self.frames.fill(0.0)
+        self.initialized.fill(False)
+
+    def append(self, observations, reset_mask=None):
+        observations = np.asarray(observations, dtype=np.float32)
+        expected = (self.nr_envs, self.observation_size)
+        if observations.shape != expected:
+            raise ValueError(
+                f"Safety observations must have shape {expected}, got "
+                f"{observations.shape}."
+            )
+        if not np.all(np.isfinite(observations)):
+            raise ValueError("Safety observations contain NaN or infinity.")
+        reset = np.zeros(self.nr_envs, dtype=bool)
+        if reset_mask is not None:
+            reset = np.asarray(reset_mask, dtype=bool).reshape(-1)
+            if reset.shape != (self.nr_envs,):
+                raise ValueError(
+                    f"reset_mask must have shape ({self.nr_envs},), got "
+                    f"{reset.shape}."
+                )
+        initialize = reset | ~self.initialized
+        continuing = ~initialize
+        if np.any(continuing):
+            self.frames[continuing, :-1] = self.frames[continuing, 1:]
+            self.frames[continuing, -1] = observations[continuing]
+        if np.any(initialize):
+            self.frames[initialize] = observations[initialize, None, :]
+        self.initialized[:] = True
+        return self.frames.reshape(self.nr_envs, self.flattened_size).copy()
+
+
+def trajectory_with_observation_history(
+    trajectory, observation_size, history_length=5
+):
+    """Replace raw states in one complete trajectory with flattened history."""
+
+    if not trajectory:
+        raise ValueError("Cannot build history for an empty trajectory.")
+    history = SafetyObservationHistory(1, observation_size, history_length)
+    converted = []
+    for transition_index, transition in enumerate(trajectory):
+        if len(transition) != 6:
+            raise ValueError("A safety transition must contain exactly six fields.")
+        state, next_state, action, failure, termination, truncation = transition
+        state = np.asarray(state, dtype=np.float32).reshape(observation_size)
+        next_state = np.asarray(next_state, dtype=np.float32).reshape(observation_size)
+        state_history = history.append(
+            state[None, :], reset_mask=np.asarray([transition_index == 0])
+        )[0]
+        # Derive s' from the same pre-transition history without advancing the
+        # persistent sequence twice.  The next loop appends the actual s frame.
+        next_frames = history.frames.copy()
+        next_frames[:, :-1] = next_frames[:, 1:]
+        next_frames[:, -1] = next_state
+        next_history = next_frames.reshape(-1).copy()
+        converted.append(
+            (
+                state_history,
+                next_history,
+                np.asarray(action, dtype=np.float32),
+                failure,
+                termination,
+                truncation,
+            )
+        )
+    return converted
+
+
+class GaitEvaluationMetrics:
+    """Aggregate environment-independent locomotion benchmark diagnostics."""
+
+    _MEAN_KEYS = (
+        "mean_foot_clearance",
+        "swing_weighted_foot_clearance",
+        "swing_clearance/fr",
+        "swing_clearance/fl",
+        "swing_clearance/rr",
+        "swing_clearance/rl",
+        "action_saturation_ratio",
+        "torque_saturation_ratio",
+        "swing_ratio/fr",
+        "swing_ratio/fl",
+        "swing_ratio/rr",
+        "swing_ratio/rl",
+    )
+
+    def __init__(self):
+        self.values = {key: [] for key in self._MEAN_KEYS}
+        self.max_clearance = []
+        self.success = False
+        self.stuck = False
+
+    def update(self, info):
+        for key in self._MEAN_KEYS:
+            if key in info:
+                values = np.asarray(info[key], dtype=np.float64)
+                finite_values = values[np.isfinite(values)]
+                if finite_values.size:
+                    self.values[key].append(float(np.mean(finite_values)))
+        if "max_foot_clearance" in info:
+            value = float(np.nanmax(np.asarray(info["max_foot_clearance"])))
+            if np.isfinite(value):
+                self.max_clearance.append(value)
+        if "terrain/success" in info:
+            self.success = self.success or bool(np.any(info["terrain/success"]))
+        if "terrain/stuck" in info:
+            self.stuck = bool(np.any(info["terrain/stuck"]))
+
+    def result(self, falls):
+        result = {
+            "fall": bool(falls),
+            "success": bool(self.success),
+            "stable_success": bool(
+                self.success and not falls and not self.stuck
+            ),
+            "stuck": bool(self.stuck and not falls),
+            "max_foot_clearance": (
+                float(max(self.max_clearance)) if self.max_clearance else float("nan")
+            ),
+        }
+        result.update(
+            {
+                key: float(np.mean(values)) if values else float("nan")
+                for key, values in self.values.items()
+            }
+        )
+        swing_clearance = np.asarray(
+            self.values["swing_weighted_foot_clearance"], dtype=np.float64
+        )
+        swing_clearance = swing_clearance[np.isfinite(swing_clearance)]
+        result["p95_swing_clearance"] = (
+            float(np.percentile(swing_clearance, 95.0))
+            if swing_clearance.size
+            else float("nan")
+        )
+        return result
+
+    @staticmethod
+    def format_suite(results):
+        count = len(results)
+        if not count:
+            return "Gait benchmark: no episodes"
+        falls = sum(item["fall"] for item in results)
+        successes = sum(item["success"] for item in results)
+        stable_successes = sum(item["stable_success"] for item in results)
+        stuck = sum(item["stuck"] for item in results)
+
+        def finite_mean(key):
+            values = np.asarray([item[key] for item in results], dtype=np.float64)
+            values = values[np.isfinite(values)]
+            return float(np.mean(values)) if values.size else float("nan")
+
+        swing = "/".join(
+            f"{finite_mean(f'swing_ratio/{leg}'):.3f}"
+            for leg in ("fr", "fl", "rr", "rl")
+        )
+        swing_clearance = "/".join(
+            f"{finite_mean(f'swing_clearance/{leg}'):.4f}"
+            for leg in ("fr", "fl", "rr", "rl")
+        )
+        return (
+            f"Gait benchmark ({count} episodes) - Falls: {falls} ({falls/count:.1%}), "
+            f"Successes: {successes} ({successes/count:.1%}), "
+            f"Stable successes: {stable_successes} "
+            f"({stable_successes/count:.1%}), "
+            f"Stuck: {stuck} ({stuck/count:.1%}), Mean/max foot clearance: "
+            f"{finite_mean('mean_foot_clearance'):.4f}/"
+            f"{finite_mean('max_foot_clearance'):.4f} m, Swing clearance "
+            f"mean/P95: {finite_mean('swing_weighted_foot_clearance'):.4f}/"
+            f"{finite_mean('p95_swing_clearance'):.4f} m, Swing clearance "
+            f"FR/FL/RR/RL: "
+            f"{swing_clearance}, "
+            f"Swing ratio FR/FL/RR/RL: "
+            f"{swing}, Action/torque saturation: "
+            f"{finite_mean('action_saturation_ratio'):.3f}/"
+            f"{finite_mean('torque_saturation_ratio'):.3f}"
+        )
+
+
 def finetune_constraints_enabled(phase, qsafe_enabled):
     """Use one gate for both target-task action masking and Eq. 4."""
 

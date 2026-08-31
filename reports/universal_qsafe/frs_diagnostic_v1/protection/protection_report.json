@@ -1,0 +1,180 @@
+{
+  "actor": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed2_v11/models",
+  "arms": {
+    "with_qsafe": {
+      "command": [
+        "/home/xyz/micromamba/envs/osa/bin/python3.11",
+        "-m",
+        "src.run",
+        "isaac-finetune",
+        "--checkpoint",
+        "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed2_v11/models",
+        "--qsafe-checkpoint",
+        "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/qsafe_offline/frs_diagnostic_v1/qsafe_flat_rough_step_v1_candidate.model",
+        "--seed",
+        "0",
+        "--runner.mode=test",
+        "--runner.save_model=false",
+        "--runner.nr_test_episodes=100",
+        "--runner.run_name=frs_protection_with_qsafe_s0",
+        "--environment.nr_envs=20",
+        "--environment.nr_task_envs=20",
+        "--environment.nr_safety_envs=0",
+        "--environment.domain_randomization=false",
+        "--environment.foot_clearance_target=0.07",
+        "--environment.clearance_reward_mode=swing_weighted",
+        "--environment.phase_reward_scale=0.3",
+        "--algorithm.compile_policy=false",
+        "--algorithm.qsafe.enabled=true",
+        "--algorithm.eval_policy=safe",
+        "--algorithm.qsafe.gamma=0.97",
+        "--algorithm.qsafe.epsilon=0.05",
+        "--algorithm.qsafe.paired_candidate_evaluation=true",
+        "--algorithm.qsafe.eval_candidate_seed=100000",
+        "--algorithm.evaluation_results_path=/home/xyz/code/works/onrobot-safe-adaptation/reports/universal_qsafe/frs_diagnostic_v1/protection/with_qsafe.json",
+        "--environment.playback_terrain_level=0",
+        "--environment.playback_terrain_type=small_stairs_up",
+        "--environment.terrain_mode=rough",
+        "--environment.terrain_num_cols=10",
+        "--environment.terrain_num_rows=3",
+        "--environment.terrain_profile=mixed"
+      ],
+      "log": "/home/xyz/code/works/onrobot-safe-adaptation/reports/universal_qsafe/frs_diagnostic_v1/protection/with_qsafe.log",
+      "metrics": {
+        "action_saturation": 0.04519176773992962,
+        "episodes": 100,
+        "fall": 8,
+        "fallback_rate": 0.012000000195205212,
+        "last_100_velocity": 0.049687911781881124,
+        "mean_forward_velocity": 0.09970594103124217,
+        "reject_rate": 0.01574640044250991,
+        "stable_success": 0,
+        "stuck": 71
+      },
+      "result": "/home/xyz/code/works/onrobot-safe-adaptation/reports/universal_qsafe/frs_diagnostic_v1/protection/with_qsafe.json"
+    },
+    "without_qsafe": {
+      "command": [
+        "/home/xyz/micromamba/envs/osa/bin/python3.11",
+        "-m",
+        "src.run",
+        "isaac-finetune",
+        "--checkpoint",
+        "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed2_v11/models",
+        "--qsafe-checkpoint",
+        "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/qsafe_offline/frs_diagnostic_v1/qsafe_flat_rough_step_v1_candidate.model",
+        "--seed",
+        "0",
+        "--runner.mode=test",
+        "--runner.save_model=false",
+        "--runner.nr_test_episodes=100",
+        "--runner.run_name=frs_protection_without_qsafe_s0",
+        "--environment.nr_envs=20",
+        "--environment.nr_task_envs=20",
+        "--environment.nr_safety_envs=0",
+        "--environment.domain_randomization=false",
+        "--environment.foot_clearance_target=0.07",
+        "--environment.clearance_reward_mode=swing_weighted",
+        "--environment.phase_reward_scale=0.3",
+        "--algorithm.compile_policy=false",
+        "--algorithm.qsafe.enabled=false",
+        "--algorithm.eval_policy=task",
+        "--algorithm.qsafe.gamma=0.97",
+        "--algorithm.qsafe.epsilon=0.05",
+        "--algorithm.qsafe.paired_candidate_evaluation=true",
+        "--algorithm.qsafe.eval_candidate_seed=100000",
+        "--algorithm.evaluation_results_path=/home/xyz/code/works/onrobot-safe-adaptation/reports/universal_qsafe/frs_diagnostic_v1/protection/without_qsafe.json",
+        "--environment.playback_terrain_level=0",
+        "--environment.playback_terrain_type=small_stairs_up",
+        "--environment.terrain_mode=rough",
+        "--environment.terrain_num_cols=10",
+        "--environment.terrain_num_rows=3",
+        "--environment.terrain_profile=mixed"
+      ],
+      "log": "/home/xyz/code/works/onrobot-safe-adaptation/reports/universal_qsafe/frs_diagnostic_v1/protection/without_qsafe.log",
+      "metrics": {
+        "action_saturation": 0.041290194429072585,
+        "episodes": 100,
+        "fall": 5,
+        "fallback_rate": NaN,
+        "last_100_velocity": 0.036093726049090946,
+        "mean_forward_velocity": 0.09189951457168508,
+        "reject_rate": NaN,
+        "stable_success": 0,
+        "stuck": 82
+      },
+      "result": "/home/xyz/code/works/onrobot-safe-adaptation/reports/universal_qsafe/frs_diagnostic_v1/protection/without_qsafe.json"
+    }
+  },
+  "calibrated": false,
+  "challenge": {
+    "all_conditions": {
+      "stairs_up_l0": {
+        "episodes": 20,
+        "fall": 5,
+        "mean_forward_velocity": 0.13053140023794826,
+        "stable_success": 1,
+        "stuck": 10,
+        "success": 1
+      },
+      "stairs_up_l1": {
+        "episodes": 20,
+        "fall": 0,
+        "mean_forward_velocity": 0.07973040077523982,
+        "stable_success": 0,
+        "stuck": 18,
+        "success": 0
+      },
+      "stairs_up_l2": {
+        "episodes": 20,
+        "fall": 0,
+        "mean_forward_velocity": 0.07107996091101004,
+        "stable_success": 0,
+        "stuck": 20,
+        "success": 0
+      },
+      "step_4cm": {
+        "episodes": 20,
+        "fall": 2,
+        "mean_forward_velocity": 0.11799164629948018,
+        "stable_success": 2,
+        "stuck": 10,
+        "success": 2
+      }
+    },
+    "baseline": {
+      "episodes": 20,
+      "fall": 5,
+      "mean_forward_velocity": 0.13053140023794826,
+      "stable_success": 1,
+      "stuck": 10,
+      "success": 1
+    },
+    "eligible_20_to_70_percent_fall": true,
+    "environment_overrides": {
+      "playback_terrain_level": 0,
+      "playback_terrain_type": "small_stairs_up",
+      "terrain_mode": "rough",
+      "terrain_num_cols": 10,
+      "terrain_num_rows": 3,
+      "terrain_profile": "mixed"
+    },
+    "name": "stairs_up_l0",
+    "status": "PASS"
+  },
+  "comparison": {
+    "diagnostic_status": "WARN",
+    "fall_reduction": -0.6,
+    "reference_pass": false,
+    "stable_success_delta": 0.0,
+    "stuck_rate": 0.71,
+    "velocity_retention": 1.0849452415057947
+  },
+  "created_utc": "2026-08-30T11:15:34.813028+00:00",
+  "paired_candidate_protocol": {
+    "baseline": "candidate_0",
+    "candidate_seed": 100000,
+    "protected": "SQRL_Eq3_with_min_risk_fallback"
+  },
+  "qsafe": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/qsafe_offline/frs_diagnostic_v1/qsafe_flat_rough_step_v1_candidate.model"
+}

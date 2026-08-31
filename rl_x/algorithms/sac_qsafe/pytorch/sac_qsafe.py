@@ -1,7 +1,9 @@
+import json
 import os
 import logging
 import time
 from collections import deque
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,15 +27,39 @@ from rl_x.algorithms.sac.pytorch.entropy_coefficient import get_entropy_coeffici
 from rl_x.algorithms.sac.pytorch.replay_buffer import ReplayBuffer
 from rl_x.algorithms.qsafe.common import (
     CompletedTrajectoryCollector,
+    GaitEvaluationMetrics,
+    actor_updates_enabled,
     extract_failure_signal,
     finetune_constraints_enabled,
     restore_algorithm_config,
     validate_safety_rollout_environment,
 )
 from rl_x.algorithms.qsafe.pytorch import QSafe
+from rl_x.algorithms.qsafe.dataset import SafetyTrajectoryDatasetWriter
 from rl_x.environments.safety_rollout import InvalidTransitionError
 
 rlx_logger = logging.getLogger("rl_x")
+
+
+def _load_compatible_module_state(module, state_dict):
+    """Load checkpoints across compiled and eager module wrappers."""
+
+    source_keys = tuple(state_dict)
+    target_keys = tuple(module.state_dict())
+    source_compiled = bool(source_keys) and all(
+        key.startswith("_orig_mod.") for key in source_keys
+    )
+    target_compiled = bool(target_keys) and all(
+        key.startswith("_orig_mod.") for key in target_keys
+    )
+    if source_compiled and not target_compiled:
+        state_dict = {
+            key.removeprefix("_orig_mod."): value
+            for key, value in state_dict.items()
+        }
+    elif target_compiled and not source_compiled:
+        state_dict = {f"_orig_mod.{key}": value for key, value in state_dict.items()}
+    module.load_state_dict(state_dict)
 
 
 class SAC_QSafe:
@@ -56,6 +82,23 @@ class SAC_QSafe:
         self.total_timesteps = config.algorithm.total_timesteps
         self.nr_envs = config.environment.nr_envs
         validate_safety_rollout_environment(train_env, eval_env, self.nr_envs)
+        episode_steps = int(getattr(config.environment, "episode_steps", 0))
+        vector_steps = int(np.ceil(self.total_timesteps / self.nr_envs))
+        if (
+            config.algorithm.phase == "finetune"
+            and getattr(config.environment, "terrain_profile", "")
+            == "single_step_up"
+            and episode_steps > 0
+            and vector_steps < episode_steps
+        ):
+            rlx_logger.warning(
+                "The fine-tune budget provides only %d control steps per "
+                "environment, less than one %d-step ledge episode. Increase "
+                "total_timesteps or reduce environment.nr_envs; otherwise the "
+                "actor may never reach the step during reward screening.",
+                vector_steps,
+                episode_steps,
+            )
         self.learning_rate = config.algorithm.learning_rate
         self.anneal_learning_rate = config.algorithm.anneal_learning_rate
         self.buffer_size = config.algorithm.buffer_size
@@ -81,6 +124,12 @@ class SAC_QSafe:
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
         self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
+        self.finetune_actor_warmup_steps = int(
+            config.algorithm.finetune_actor_warmup_steps
+        )
+        self.finetune_actor_update_interval = int(
+            config.algorithm.finetune_actor_update_interval
+        )
         self.finetune_constraints_enabled = finetune_constraints_enabled(
             self.phase, self.qsafe_enabled
         )
@@ -145,6 +194,8 @@ class SAC_QSafe:
             if self.qsafe_enabled
             else None
         )
+        self._qsafe_reset_masks = {}
+        self._last_qsafe_observations = {}
 
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
@@ -231,7 +282,7 @@ class SAC_QSafe:
             policy_state_dict = checkpoint["state_dict"]
         else:
             policy_state_dict = checkpoint
-        self.policy.load_state_dict(policy_state_dict)
+        _load_compatible_module_state(self.policy, policy_state_dict)
 
         normalizer_state = checkpoint.get("observation_normalizer_state_dict")
         if normalizer_state is None:
@@ -301,48 +352,97 @@ class SAC_QSafe:
         normalized_states = self._normalize_states(
             raw_states, update=update_normalizer
         )
-        actions, _, _ = self.policy.get_action(normalized_states)
-        actions = self._project_actions(raw_states, actions)
-        return actions, self._process_normalized_actions(actions)
+        raw_actions, _, _ = self.policy.get_action(normalized_states)
+        applied_actions = self._project_actions(raw_states, raw_actions)
+        return applied_actions, self._process_normalized_actions(applied_actions)
 
-    def _sample_policy_candidates(
-        self, states, phase=None, update_normalizer=False
+    def _sample_candidate_pool(
+        self, raw_states, normalized_states, nr_candidates, sample_seed=None
     ):
-        raw_states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
-        states = self._normalize_states(raw_states, update=update_normalizer)
-        nr_envs = states.shape[0]
-        nr_candidates = self.qsafe.candidate_actions
-        candidate_states = states[:, None, :].expand(-1, nr_candidates, -1)
+        """Draw one ordered candidate pool without perturbing global RNG state."""
+
+        nr_envs = normalized_states.shape[0]
+        candidate_states = normalized_states[:, None, :].expand(
+            -1, nr_candidates, -1
+        )
         flat_states = candidate_states.reshape(nr_envs * nr_candidates, -1)
-        candidate_actions, _, candidate_log_probs = self.policy.get_action(flat_states)
-        candidate_actions = candidate_actions.reshape(
+        devices = []
+        if self.device.type == "cuda":
+            devices = [self.device.index if self.device.index is not None else 0]
+        if sample_seed is None:
+            raw_candidate_actions, _, candidate_log_probs = self.policy.get_action(
+                flat_states
+            )
+        else:
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(int(sample_seed))
+                if self.device.type == "cuda":
+                    torch.cuda.manual_seed_all(int(sample_seed))
+                raw_candidate_actions, _, candidate_log_probs = self.policy.get_action(
+                    flat_states
+                )
+        raw_candidate_actions = raw_candidate_actions.reshape(
             nr_envs, nr_candidates, *self.train_env.single_action_space.shape
         )
         candidate_raw_states = raw_states[:, None, :].expand(
             -1, nr_candidates, -1
         )
-        candidate_actions = self._project_actions(
-            candidate_raw_states, candidate_actions
-        )
-        candidate_processed_actions = self._process_normalized_actions(
-            candidate_actions
+        applied_candidate_actions = self._project_actions(
+            candidate_raw_states, raw_candidate_actions
         )
         candidate_log_probs = candidate_log_probs.reshape(nr_envs, nr_candidates)
-        selected_actions, selected_indices, metrics = self.qsafe.select_safe_action(
-            states, candidate_actions, candidate_log_probs, phase or self.phase
+        return raw_candidate_actions, applied_candidate_actions, candidate_log_probs
+
+    def _sample_policy_candidates(
+        self,
+        states,
+        phase=None,
+        update_normalizer=False,
+        stream="task",
+        candidate_seed=None,
+    ):
+        raw_states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        states = self._normalize_states(raw_states, update=update_normalizer)
+        nr_envs = states.shape[0]
+        nr_candidates = self.qsafe.candidate_actions
+        (
+            raw_candidate_actions,
+            applied_candidate_actions,
+            candidate_log_probs,
+        ) = self._sample_candidate_pool(
+            raw_states, states, nr_candidates, sample_seed=candidate_seed
         )
-        absolute_z = states.abs()
+        if self.qsafe.version == 2:
+            safety_observations = self.qsafe.rollout_observations(
+                raw_states.detach().cpu().numpy(),
+                reset_mask=self._qsafe_reset_masks.pop(stream, None),
+                stream=stream,
+            )
+            safety_observations = torch.as_tensor(
+                safety_observations, dtype=torch.float32, device=self.device
+            )
+        else:
+            safety_observations = states
+        self._last_qsafe_observations[stream] = safety_observations.detach()
+        selected_applied_actions, selected_indices, metrics = (
+            self.qsafe.select_safe_action(
+            safety_observations,
+            applied_candidate_actions,
+            candidate_log_probs,
+            phase or self.phase,
+            )
+        )
+        absolute_z = self.qsafe.normalize_observations(safety_observations).abs()
         metrics["qsafe/observation_abs_z_p95"] = torch.quantile(
             absolute_z.reshape(-1), 0.95
         ).item()
         metrics["qsafe/observation_ood_fraction"] = (
             absolute_z > 5.0
         ).float().mean().item()
-        batch_indices = torch.arange(nr_envs, device=self.device)
-        selected_processed_actions = candidate_processed_actions[
-            batch_indices, selected_indices
-        ]
-        return selected_actions, selected_processed_actions, metrics
+        selected_processed_actions = self._process_normalized_actions(
+            selected_applied_actions
+        )
+        return selected_applied_actions, selected_processed_actions, metrics
 
     
     def train(self):
@@ -350,11 +450,18 @@ class SAC_QSafe:
             return self._train_partitioned()
 
         @torch.compile(mode=self.compile_mode)
-        def policy_and_entropy_loss_fn(batch_states, raw_batch_states):
+        def policy_and_entropy_loss_fn(
+            batch_states,
+            raw_batch_states,
+            safety_batch_states,
+            actor_update_enabled,
+        ):
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
-                current_actions, _, current_log_probs = self.policy.get_action(batch_states)
+                current_raw_actions, _, current_log_probs = self.policy.get_action(
+                    batch_states
+                )
                 current_actions = self._project_actions(
-                    raw_batch_states, current_actions
+                    raw_batch_states, current_raw_actions
                 )
 
                 q1 = self.critic.q1(batch_states, current_actions)
@@ -369,35 +476,46 @@ class SAC_QSafe:
                 if self.finetune_constraints_enabled:
                     # QSafe parameters are frozen, but this forward pass intentionally
                     # remains differentiable with respect to the sampled action.
-                    safety_q = self.qsafe.values(batch_states, current_actions)
+                    qsafe_states = (
+                        safety_batch_states
+                        if self.qsafe.version == 2
+                        else batch_states
+                    )
+                    safety_q = self.qsafe.values(
+                        qsafe_states, current_actions
+                    )
                     policy_loss = policy_loss + self.nu.detach() * (
                         safety_q - self.qsafe.epsilon
                     ).mean()
 
-            self.policy_optimizer.zero_grad()
-            policy_loss.backward()
+            policy_grad_norm = torch.zeros((), device=self.device)
+            if actor_update_enabled:
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
 
-            policy_grad_norm = 0.0
-            for param in self.policy.parameters():
-                policy_grad_norm += param.grad.detach().data.norm(2) ** 2
-            policy_grad_norm = policy_grad_norm ** 0.5
+                for param in self.policy.parameters():
+                    policy_grad_norm += param.grad.detach().data.norm(2) ** 2
+                policy_grad_norm = policy_grad_norm ** 0.5
 
-            self.policy_optimizer.step()
+                self.policy_optimizer.step()
 
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
                 entropy_detach = -current_log_probs.detach()
                 entropy_detach_mean = entropy_detach.mean()
                 entropy_loss = self.entropy_coefficient.loss(entropy_detach).mean()
 
-            self.entropy_optimizer.zero_grad()
-            entropy_loss.backward()
-
-            entropy_grad_norm = self.entropy_coefficient.log_alpha.grad.detach().data.norm(2) ** 2
-            
-            self.entropy_optimizer.step()
+            entropy_grad_norm = torch.zeros((), device=self.device)
+            if actor_update_enabled:
+                self.entropy_optimizer.zero_grad()
+                entropy_loss.backward()
+                entropy_grad_norm = (
+                    self.entropy_coefficient.log_alpha.grad.detach().data.norm(2)
+                    ** 2
+                )
+                self.entropy_optimizer.step()
 
             dual_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-            if self.finetune_constraints_enabled:
+            if self.finetune_constraints_enabled and actor_update_enabled:
                 dual_loss = self.nu * (self.qsafe.epsilon - safety_q.detach()).mean()
                 self.dual_optimizer.zero_grad()
                 dual_loss.backward()
@@ -421,16 +539,22 @@ class SAC_QSafe:
 
         @torch.compile(mode=self.compile_mode)
         def critic_loss_fn(
-            states, next_states, actions, rewards, dones, raw_next_states
+            states, raw_next_states, next_states, actions, rewards, dones
         ):
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
                 with torch.no_grad():
-                    next_actions, _, next_log_probs = self.policy.get_action(next_states)
-                    next_actions = self._project_actions(
-                        raw_next_states, next_actions
+                    next_raw_actions, _, next_log_probs = self.policy.get_action(
+                        next_states
                     )
-                    next_q1_target = self.critic.q1_target(next_states, next_actions)
-                    next_q2_target = self.critic.q2_target(next_states, next_actions)
+                    next_actions = self._project_actions(
+                        raw_next_states, next_raw_actions
+                    )
+                    next_q1_target = self.critic.q1_target(
+                        next_states, next_actions
+                    )
+                    next_q2_target = self.critic.q2_target(
+                        next_states, next_actions
+                    )
                     min_next_q_target = torch.minimum(next_q1_target, next_q2_target)
                     alpha = self.entropy_coefficient().detach()
                     y = rewards.reshape(-1, 1) + self.gamma * (1 - dones.reshape(-1, 1)) * (min_next_q_target - alpha * next_log_probs)
@@ -459,14 +583,32 @@ class SAC_QSafe:
 
         self.set_train_mode()
 
-        offline_replay_buffer = ReplayBuffer(int(self.buffer_size), self.nr_envs, self.train_env.single_observation_space.shape, self.train_env.single_action_space.shape, self.rng, self.device)
+        offline_replay_buffer = ReplayBuffer(
+            int(self.buffer_size),
+            self.nr_envs,
+            self.train_env.single_observation_space.shape,
+            self.train_env.single_action_space.shape,
+            self.rng,
+            self.device,
+            auxiliary_state_shape=(
+                self.qsafe.observation_shape
+                if self.finetune_constraints_enabled
+                and self.qsafe.version == 2
+                else None
+            ),
+        )
 
         saving_return_buffer = deque(maxlen=100 * self.nr_envs)
 
         state, _ = self.train_env.reset()
+        if self.qsafe_enabled:
+            self.qsafe.clear_rollout_history()
+            self._qsafe_reset_masks.clear()
         safety_state = None
         global_step = 0
         nr_updates = 0
+        nr_actor_updates = 0
+        nr_alpha_updates = 0
         nr_episodes = 0
         nr_failures = 0
         nr_safe_env_steps = 0
@@ -488,7 +630,8 @@ class SAC_QSafe:
             self.phase == "pretrain" and self.qsafe_enabled and pretrain_stage == "safe"
         ):
             start_time = time.time()
-            torch.compiler.cudagraph_mark_step_begin()
+            if bool(self.config.algorithm.compile_policy):
+                torch.compiler.cudagraph_mark_step_begin()
             if logging_time_prev:
                 time_metrics_collection.setdefault("time/logging_time_prev", []).append(logging_time_prev)
 
@@ -502,6 +645,8 @@ class SAC_QSafe:
             )
             if is_safety_step and safety_state is None:
                 safety_state, _ = self.eval_env.reset()
+                self.qsafe.clear_rollout_history("safety")
+                self._qsafe_reset_masks.pop("safety", None)
             acting_state = safety_state if is_safety_step else state
             interaction_env = self.eval_env if is_safety_step else self.train_env
             completed_safety_block = False
@@ -509,11 +654,11 @@ class SAC_QSafe:
             with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
                 if is_safety_step:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
-                        acting_state, phase="pretrain"
+                        acting_state, phase="pretrain", stream="safety"
                     )
                 elif self.finetune_constraints_enabled:
                     action, processed_action, action_safety_metrics = self._sample_policy_candidates(
-                        acting_state, phase="finetune"
+                        acting_state, phase="finetune", stream="task"
                     )
                 else:
                     action, processed_action = self._sample_unconstrained_action(
@@ -537,6 +682,8 @@ class SAC_QSafe:
                 recovered_state, _ = interaction_env.reset()
                 if is_safety_step:
                     safety_state = recovered_state
+                    self.qsafe.clear_rollout_history("safety")
+                    self._qsafe_reset_masks.pop("safety", None)
                     safety_collector = CompletedTrajectoryCollector(
                         self.nr_envs, self.n_safe
                     )
@@ -548,6 +695,10 @@ class SAC_QSafe:
                 info.get("applied_action", action), dtype=np.float32
             ).reshape(action.shape)
             done = terminated | truncated
+            if self.qsafe_enabled:
+                self._qsafe_reset_masks[
+                    "safety" if is_safety_step else "task"
+                ] = np.asarray(done, dtype=bool)
             actual_next_state = next_state.copy()
             for i, single_done in enumerate(done):
                 if single_done:
@@ -604,6 +755,12 @@ class SAC_QSafe:
                     applied_action,
                     reward,
                     terminated,
+                    auxiliary_states=(
+                        self._last_qsafe_observations["task"].cpu().numpy()
+                        if self.finetune_constraints_enabled
+                        and self.qsafe.version == 2
+                        else None
+                    ),
                 )
                 global_step += self.nr_envs
                 nr_episodes += dones_this_rollout
@@ -652,7 +809,17 @@ class SAC_QSafe:
             
             # Optimizing - Prepare batches
             if should_optimize:
-                batch_states, batch_next_states, batch_actions, batch_rewards, batch_terminations = offline_replay_buffer.sample(self.batch_size)
+                replay_sample = offline_replay_buffer.sample(self.batch_size)
+                (
+                    batch_states,
+                    batch_next_states,
+                    batch_actions,
+                    batch_rewards,
+                    batch_terminations,
+                ) = replay_sample[:5]
+                safety_batch_states = (
+                    replay_sample[5] if len(replay_sample) == 6 else batch_states
+                )
                 normalized_batch_states = self._normalize_states(
                     batch_states, update=False
                 )
@@ -663,14 +830,20 @@ class SAC_QSafe:
 
             # Optimizing - Q-functions, policy and entropy coefficient
             if should_optimize:
+                update_actor = actor_updates_enabled(
+                    self.phase,
+                    global_step,
+                    self.finetune_actor_warmup_steps,
+                    self.finetune_actor_update_interval,
+                )
                 # Critic loss
                 q_loss, critic_grad_norm = critic_loss_fn(
                     normalized_batch_states,
+                    batch_next_states,
                     normalized_batch_next_states,
                     batch_actions,
                     batch_rewards,
                     batch_terminations,
-                    batch_next_states,
                 )
 
                 # Update critic targets
@@ -693,7 +866,10 @@ class SAC_QSafe:
                     dual_loss,
                     nu,
                 ) = policy_and_entropy_loss_fn(
-                    normalized_batch_states, batch_states
+                    normalized_batch_states,
+                    batch_states,
+                    safety_batch_states,
+                    update_actor,
                 )
 
                 # Create metrics
@@ -711,16 +887,29 @@ class SAC_QSafe:
                     "qsafe/actor_value": safety_q.item(),
                     "qsafe/nu": nu.item(),
                     "loss/qsafe_dual_loss": dual_loss.item(),
+                    "updates/actor_enabled": float(update_actor),
+                    "updates/alpha_enabled": float(update_actor),
+                    "finetune/actor_frozen": float(
+                        self.phase == "finetune"
+                        and global_step < self.finetune_actor_warmup_steps
+                    ),
+                    "finetune/alpha_anti_windup": float(
+                        self.phase == "finetune"
+                        and global_step < self.finetune_actor_warmup_steps
+                    ),
                 }
 
                 for key, value in optimization_metrics.items():
                     optimization_metrics_collection.setdefault(key, []).append(value)
                 nr_updates += 1
+                nr_actor_updates += int(update_actor)
+                nr_alpha_updates += int(update_actor)
             
                 if self.anneal_learning_rate:
                     self.q_scheduler.step()
-                    self.policy_scheduler.step()
-                    self.entropy_scheduler.step()
+                    if update_actor:
+                        self.entropy_scheduler.step()
+                        self.policy_scheduler.step()
 
             if completed_safety_block and self.qsafe.ready_to_update():
                 def sample_unconstrained_action(next_states):
@@ -747,13 +936,16 @@ class SAC_QSafe:
             if should_evaluate:
                 self.set_eval_mode()
                 eval_state, _ = self.eval_env.reset()
+                if self.qsafe_enabled:
+                    self.qsafe.clear_rollout_history("eval")
+                    self._qsafe_reset_masks.pop("eval", None)
                 eval_nr_episodes = 0
                 while True:
                     torch.compiler.cudagraph_mark_step_begin()
                     with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
                         if self.qsafe_enabled:
                             _, eval_processed_action, _ = self._sample_policy_candidates(
-                                eval_state
+                                eval_state, stream="eval"
                             )
                         else:
                             raw_eval_state = torch.as_tensor(
@@ -779,6 +971,10 @@ class SAC_QSafe:
                         "eval/failure_rate", []
                     ).extend(eval_failure.tolist())
                     eval_done = eval_terminated | eval_truncated
+                    if self.qsafe_enabled:
+                        self._qsafe_reset_masks["eval"] = np.asarray(
+                            eval_done, dtype=bool
+                        )
                     for i, single_done in enumerate(eval_done):
                         if single_done:
                             eval_nr_episodes += 1
@@ -817,6 +1013,8 @@ class SAC_QSafe:
                 steps_metrics["steps/nr_safe_env_steps"] = nr_safe_env_steps
                 steps_metrics["steps/nr_safe_rollouts"] = nr_safe_rollouts
                 steps_metrics["steps/nr_updates"] = nr_updates
+                steps_metrics["steps/nr_actor_updates"] = nr_actor_updates
+                steps_metrics["steps/nr_alpha_updates"] = nr_alpha_updates
                 steps_metrics["steps/nr_episodes"] = nr_episodes
                 steps_metrics["steps/nr_failures"] = nr_failures
                 steps_metrics["steps/nr_safe_failures"] = nr_safe_failures
@@ -856,11 +1054,11 @@ class SAC_QSafe:
         if self.save_model:
             self.save("final.model")
 
-    def _partitioned_task_update(self, replay_buffer):
+    def _partitioned_task_update(self, replay_buffer, global_step):
         torch.compiler.cudagraph_mark_step_begin()
-        raw_states, raw_next_states, actions, rewards, terminations = replay_buffer.sample(
-            self.batch_size
-        )
+        replay_sample = replay_buffer.sample(self.batch_size)
+        raw_states, raw_next_states, actions, rewards, terminations = replay_sample[:5]
+        safety_histories = replay_sample[5] if len(replay_sample) == 6 else None
         states = self._normalize_states(raw_states, update=False)
         next_states = self._normalize_states(raw_next_states, update=False)
 
@@ -870,9 +1068,11 @@ class SAC_QSafe:
             enabled=self.bf16_mixed_precision_training,
         ):
             with torch.no_grad():
-                next_actions, _, next_log_probs = self.policy.get_action(next_states)
+                next_raw_actions, _, next_log_probs = self.policy.get_action(
+                    next_states
+                )
                 next_actions = self._project_actions(
-                    raw_next_states, next_actions
+                    raw_next_states, next_raw_actions
                 )
                 next_q = torch.minimum(
                     self.critic.q1_target(next_states, next_actions),
@@ -903,32 +1103,80 @@ class SAC_QSafe:
                         parameter.data, alpha=self.tau
                     )
 
+        update_actor = actor_updates_enabled(
+            self.phase,
+            global_step,
+            self.finetune_actor_warmup_steps,
+            self.finetune_actor_update_interval,
+        )
+        policy_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        entropy_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        safety_q = torch.zeros((), dtype=torch.float32, device=self.device)
+        dual_loss = torch.zeros((), dtype=torch.float32, device=self.device)
         with autocast(
             device_type="cuda",
             dtype=torch.bfloat16,
             enabled=self.bf16_mixed_precision_training,
         ):
-            current_actions, _, log_probs = self.policy.get_action(states)
-            current_actions = self._project_actions(raw_states, current_actions)
-            task_q = torch.minimum(
-                self.critic.q1(states, current_actions),
-                self.critic.q2(states, current_actions),
+            current_raw_actions, _, log_probs = self.policy.get_action(states)
+            current_actions = self._project_actions(
+                raw_states, current_raw_actions
             )
-            policy_loss = (
-                self.entropy_coefficient().detach() * log_probs - task_q
+            alpha = self.entropy_coefficient().detach()
+            entropy_loss = self.entropy_coefficient.loss(
+                -log_probs.detach()
             ).mean()
-        self.policy_optimizer.zero_grad()
-        policy_loss.backward()
-        self.policy_optimizer.step()
 
-        entropy_loss = self.entropy_coefficient.loss(-log_probs.detach()).mean()
-        self.entropy_optimizer.zero_grad()
-        entropy_loss.backward()
-        self.entropy_optimizer.step()
+        # Actor and temperature form one coupled policy update.  Holding both
+        # fixed prevents alpha from winding up against a policy that is not yet
+        # allowed to react to the fresh task critic.
+        entropy_grad_norm = torch.zeros((), dtype=torch.float32, device=self.device)
+        if update_actor:
+            self.entropy_optimizer.zero_grad()
+            entropy_loss.backward()
+            entropy_grad_norm = (
+                self.entropy_coefficient.log_alpha.grad.detach().norm(2)
+            )
+            self.entropy_optimizer.step()
+
+        if update_actor:
+            with autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=self.bf16_mixed_precision_training,
+            ):
+                task_q = torch.minimum(
+                    self.critic.q1(states, current_actions),
+                    self.critic.q2(states, current_actions),
+                )
+                policy_loss = (alpha * log_probs - task_q).mean()
+                if self.finetune_constraints_enabled:
+                    qsafe_states = (
+                        safety_histories
+                        if self.qsafe.version == 2
+                        else states
+                    )
+                    safety_q = self.qsafe.values(
+                        qsafe_states, current_actions
+                    ).mean()
+                    policy_loss = policy_loss + self.nu.detach() * (
+                        safety_q - self.qsafe.epsilon
+                    )
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            self.policy_optimizer.step()
+            if self.finetune_constraints_enabled:
+                dual_loss = self.nu * (self.qsafe.epsilon - safety_q.detach())
+                self.dual_optimizer.zero_grad()
+                dual_loss.backward()
+                self.dual_optimizer.step()
+                with torch.no_grad():
+                    self.nu.clamp_(min=0.0)
         if self.anneal_learning_rate:
             self.q_scheduler.step()
-            self.policy_scheduler.step()
-            self.entropy_scheduler.step()
+            if update_actor:
+                self.entropy_scheduler.step()
+                self.policy_scheduler.step()
         return {
             # Keep optimizer metrics on-device. The partitioned loop aggregates
             # them and performs one host synchronization per logging interval,
@@ -936,10 +1184,27 @@ class SAC_QSafe:
             "loss/q_loss": q_loss.detach(),
             "loss/policy_loss": policy_loss.detach(),
             "loss/entropy_loss": entropy_loss.detach(),
+            "loss/qsafe_dual_loss": dual_loss.detach(),
+            "qsafe/actor_value": safety_q.detach(),
+            "qsafe/nu": self.nu.detach(),
+            "updates/actor_enabled": float(update_actor),
+            "updates/alpha_enabled": float(update_actor),
+            "finetune/alpha_anti_windup": float(
+                self.phase == "finetune"
+                and global_step < self.finetune_actor_warmup_steps
+            ),
+            "finetune/actor_frozen": float(
+                self.phase == "finetune"
+                and global_step < self.finetune_actor_warmup_steps
+            ),
             # Read from the parameter instead of the compiled forward output;
             # CUDA Graph outputs are reused and cannot be retained by the
             # interval accumulator across optimizer calls.
             "entropy/alpha": self.entropy_coefficient.log_alpha.detach().exp(),
+            "entropy/entropy": -log_probs.detach().mean(),
+            "gradients/entropy_grad_norm": entropy_grad_norm,
+            "policy/raw_action_abs_mean": current_raw_actions.detach().abs().mean(),
+            "policy/applied_action_abs_mean": current_actions.detach().abs().mean(),
             "lr/learning_rate": (
                 self.learning_rate
                 if not self.anneal_learning_rate
@@ -950,8 +1215,6 @@ class SAC_QSafe:
     def _train_partitioned(self):
         from rl_x.algorithms.qsafe.common import VectorTrajectoryAccumulator
 
-        if self.phase != "pretrain":
-            raise ValueError("partitioned rollout mode is only valid for pretraining")
         if not hasattr(self.train_env, "step_partitions"):
             raise ValueError(
                 "partitioned rollout mode requires an environment implementing "
@@ -959,11 +1222,17 @@ class SAC_QSafe:
             )
         nr_task_envs = int(self.train_env.nr_task_envs)
         nr_safety_envs = int(self.train_env.nr_safety_envs)
-        if self.qsafe_enabled and nr_safety_envs < 1:
+        if self.phase == "pretrain" and self.qsafe_enabled and nr_safety_envs < 1:
             raise ValueError("SQRL partitioned pretraining requires safety environments")
-        if not self.qsafe_enabled and nr_safety_envs != 0:
+        if self.phase == "pretrain" and not self.qsafe_enabled and nr_safety_envs != 0:
             raise ValueError("Standard SAC pretraining requires nr_safety_envs=0")
+        if self.phase == "finetune" and nr_safety_envs != 0:
+            raise ValueError("Target fine-tuning uses only task environments")
+        collect_safety = self.phase == "pretrain" and self.qsafe_enabled
         task_state, safety_state = self.train_env.reset_partitions()
+        if self.qsafe_enabled:
+            self.qsafe.clear_rollout_history()
+            self._qsafe_reset_masks.clear()
         task_replay = ReplayBuffer(
             int(self.buffer_size),
             nr_task_envs,
@@ -971,6 +1240,12 @@ class SAC_QSafe:
             self.train_env.single_action_space.shape,
             self.rng,
             self.device,
+            auxiliary_state_shape=(
+                self.qsafe.observation_shape
+                if self.finetune_constraints_enabled
+                and self.qsafe.version == 2
+                else None
+            ),
         )
         safety_trajectories = VectorTrajectoryAccumulator(nr_safety_envs)
         global_step = 0
@@ -980,6 +1255,10 @@ class SAC_QSafe:
         safety_episode_count = 0
         task_failure_count = 0
         safety_failure_count = 0
+        task_stable_success_count = 0
+        task_stuck_count = 0
+        projection_metric_sums = {}
+        projection_metric_count = 0
         training_start_time = time.perf_counter()
         interval_start_time = training_start_time
         previous_log_step = 0
@@ -988,7 +1267,7 @@ class SAC_QSafe:
         task_update_budget = TransitionUpdateBudget(self.task_utd_ratio)
         qsafe_update_budget = (
             AtomicTrajectoryUpdateBudget(self.qsafe_updates_per_iteration)
-            if self.qsafe_enabled
+            if collect_safety
             else None
         )
         interval_metric_sums = {}
@@ -1005,6 +1284,28 @@ class SAC_QSafe:
                 else:
                     interval_metric_sums[name] = value
                 interval_metric_counts[name] = interval_metric_counts.get(name, 0) + 1
+
+        def write_training_metrics(stem):
+            destination = Path(self.save_path) / f"{stem}.metrics.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "global_step": int(global_step),
+                "task_episodes": int(task_episode_count),
+                "task_failures": int(task_failure_count),
+                "task_stable_successes": int(task_stable_success_count),
+                "task_stuck": int(task_stuck_count),
+                "task_updates": int(task_update_budget.updates),
+                "elapsed_seconds": float(time.perf_counter() - training_start_time),
+                "qsafe": {
+                    key: float(value / max(projection_metric_count, 1))
+                    for key, value in projection_metric_sums.items()
+                },
+            }
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            temporary.replace(destination)
         logging_frequency = int(self.logging_frequency)
         if logging_frequency < 1:
             raise ValueError("algorithm.logging_frequency must be at least 1")
@@ -1020,18 +1321,28 @@ class SAC_QSafe:
                 dtype=torch.bfloat16,
                 enabled=self.bf16_mixed_precision_training,
             ):
-                task_action, task_processed = self._sample_unconstrained_action(
-                    task_state, update_normalizer=True
-                )
+                if self.finetune_constraints_enabled:
+                    task_action, task_processed, projection_metrics = (
+                        self._sample_policy_candidates(
+                            task_state, phase="finetune", stream="task"
+                        )
+                    )
+                else:
+                    task_action, task_processed = self._sample_unconstrained_action(
+                        task_state, update_normalizer=True
+                    )
+                    projection_metrics = {}
                 # The safety call replays the same compiled policy and may
                 # overwrite its CUDA Graph output buffers.  Keep task outputs
                 # in independent storage until both partitions are stepped.
                 task_action, task_processed = preserve_policy_outputs(
                     task_action, task_processed
                 )
-                if self.qsafe_enabled:
+                if collect_safety:
                     safety_action, safety_processed, projection_metrics = (
-                        self._sample_policy_candidates(safety_state, phase="pretrain")
+                        self._sample_policy_candidates(
+                            safety_state, phase="pretrain", stream="safety"
+                        )
                     )
                 else:
                     action_shape = tuple(self.train_env.single_action_space.shape)
@@ -1039,7 +1350,6 @@ class SAC_QSafe:
                         (0,) + action_shape, dtype=torch.float32, device=self.device
                     )
                     safety_processed = safety_action
-                    projection_metrics = {}
             task_action = task_action.cpu().numpy()
             safety_action = safety_action.cpu().numpy()
             try:
@@ -1051,6 +1361,9 @@ class SAC_QSafe:
                     "Discarding invalid partitioned transition: %s", exc
                 )
                 task_state, safety_state = self.train_env.reset_partitions()
+                if self.qsafe_enabled:
+                    self.qsafe.clear_rollout_history()
+                    self._qsafe_reset_masks.clear()
                 safety_trajectories = VectorTrajectoryAccumulator(nr_safety_envs)
                 continue
 
@@ -1073,11 +1386,12 @@ class SAC_QSafe:
                 if final is not None:
                     safety_next[index] = final
 
-            task_applied = np.asarray(
-                task_step.info.get("applied_action", task_action), dtype=np.float32
-            )
             safety_applied = np.asarray(
                 safety_step.info.get("applied_action", safety_action),
+                dtype=np.float32,
+            )
+            task_applied = np.asarray(
+                task_step.info.get("applied_action", task_action),
                 dtype=np.float32,
             )
             task_replay.add(
@@ -1086,9 +1400,15 @@ class SAC_QSafe:
                 task_applied,
                 task_step.reward,
                 task_step.terminated,
+                auxiliary_states=(
+                    self._last_qsafe_observations["task"].cpu().numpy()
+                    if self.finetune_constraints_enabled
+                    and self.qsafe.version == 2
+                    else None
+                ),
             )
             completed = []
-            if self.qsafe_enabled:
+            if collect_safety:
                 completed = safety_trajectories.add_step(
                     safety_state,
                     safety_next,
@@ -1108,13 +1428,19 @@ class SAC_QSafe:
             safety_episode_count += len(completed)
             task_failure_count += int(np.sum(task_failure))
             safety_failure_count += int(np.sum(safety_failure))
+            if projection_metrics:
+                for key, value in projection_metrics.items():
+                    projection_metric_sums[key] = (
+                        projection_metric_sums.get(key, 0.0) + float(value)
+                    )
+                projection_metric_count += 1
             record_interval_metrics(
                 {
                     "rollout/task_step_reward": np.mean(task_step.reward),
                     "failures/task_rate": np.mean(task_failure),
                 }
             )
-            if self.qsafe_enabled:
+            if collect_safety:
                 record_interval_metrics(
                     {
                         "rollout/safety_step_reward": np.mean(safety_step.reward),
@@ -1122,7 +1448,7 @@ class SAC_QSafe:
                     }
                 )
             rollout_pools = [("task", task_step)]
-            if self.qsafe_enabled:
+            if collect_safety:
                 rollout_pools.append(("safety", safety_step))
             for pool_name, rollout_step in rollout_pools:
                 for metric_name, values in self.train_env.get_logging_info_dict(
@@ -1138,16 +1464,31 @@ class SAC_QSafe:
             for index in np.flatnonzero(task_done):
                 final_info = task_step.info["final_info"][index]
                 if final_info is not None:
-                    record_interval_metrics(
-                        {
-                            "rollout/task_episode_return": final_info[
-                                "episode_return"
-                            ],
-                            "rollout/task_episode_length": final_info[
-                                "episode_length"
-                            ],
-                        }
+                    task_stable_success_count += int(
+                        bool(final_info.get("stable_success", False))
                     )
+                    task_stuck_count += int(bool(final_info.get("stuck", False)))
+                    episode_metrics = {
+                        "rollout/task_episode_return": final_info[
+                            "episode_return"
+                        ],
+                        "rollout/task_episode_length": final_info[
+                            "episode_length"
+                        ],
+                    }
+                    for metric in (
+                        "fall",
+                        "success",
+                        "stable_success",
+                        "stuck",
+                        "forward_progress",
+                        "last_100_velocity",
+                    ):
+                        if metric in final_info:
+                            episode_metrics[f"rollout/task_{metric}"] = final_info[
+                                metric
+                            ]
+                    record_interval_metrics(episode_metrics)
             for index in np.flatnonzero(safety_done):
                 final_info = safety_step.info["final_info"][index]
                 if final_info is not None:
@@ -1166,17 +1507,25 @@ class SAC_QSafe:
             )
             eligible_after = max(0, global_step - int(self.learning_starts))
             task_update_budget.add_transitions(eligible_after - eligible_before)
-            if self.qsafe_enabled:
+            if collect_safety:
                 qsafe_update_budget.add_completed(completed)
             task_state = task_step.observation
             safety_state = safety_step.observation
+            if self.qsafe_enabled:
+                self._qsafe_reset_masks["task"] = np.asarray(task_done, dtype=bool)
+                if collect_safety:
+                    self._qsafe_reset_masks["safety"] = np.asarray(
+                        safety_done, dtype=bool
+                    )
 
             if task_replay.size > 0:
                 for _ in range(task_update_budget.consume_ready_updates()):
-                    task_metrics = self._partitioned_task_update(task_replay)
+                    task_metrics = self._partitioned_task_update(
+                        task_replay, global_step
+                    )
                     record_interval_metrics(task_metrics)
 
-            if self.qsafe_enabled and self.qsafe.ready_to_update():
+            if collect_safety and self.qsafe.ready_to_update():
                 def sample_unconstrained_action(normalized_states):
                     with torch.no_grad():
                         return self.policy.get_action(normalized_states)[0]
@@ -1207,7 +1556,7 @@ class SAC_QSafe:
                 self.log(
                     "steps/nr_task_updates", task_update_budget.updates, global_step
                 )
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "steps/nr_qsafe_updates",
                         qsafe_update_budget.updates,
@@ -1230,7 +1579,7 @@ class SAC_QSafe:
                     task_replay.size * nr_task_envs,
                     global_step,
                 )
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "replay/qsafe_transitions",
                         self.qsafe.replay_buffer.nr_transitions,
@@ -1241,14 +1590,14 @@ class SAC_QSafe:
                         self.qsafe.replay_buffer.nr_trajectories,
                         global_step,
                     )
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "replay/qsafe_committed_transitions",
                         qsafe_update_budget.transitions,
                         global_step,
                     )
                 self.log("utd/task_configured", self.task_utd_ratio, global_step)
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "utd/qsafe_updates_per_trajectory_configured",
                         self.qsafe_updates_per_iteration,
@@ -1259,14 +1608,14 @@ class SAC_QSafe:
                     task_update_budget.effective_ratio,
                     global_step,
                 )
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "utd/qsafe_updates_per_trajectory_effective",
                         qsafe_update_budget.effective_ratio,
                         global_step,
                     )
                 self.log("utd/task_credit", task_update_budget.credit, global_step)
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "utd/qsafe_credit", qsafe_update_budget.credit, global_step
                     )
@@ -1281,7 +1630,7 @@ class SAC_QSafe:
                     / interval_seconds,
                     global_step,
                 )
-                if self.qsafe_enabled:
+                if collect_safety:
                     self.log(
                         "time/qsafe_updates_per_second",
                         (qsafe_update_budget.updates - previous_log_qsafe_updates)
@@ -1302,7 +1651,7 @@ class SAC_QSafe:
                 interval_start_time = now
                 previous_log_step = global_step
                 previous_log_task_updates = task_update_budget.updates
-                if self.qsafe_enabled:
+                if collect_safety:
                     previous_log_qsafe_updates = qsafe_update_budget.updates
                 while next_log_step <= global_step:
                     next_log_step += logging_frequency
@@ -1312,11 +1661,13 @@ class SAC_QSafe:
                 and global_step >= next_checkpoint
             ):
                 self.save(f"step_{global_step:09d}.model")
+                write_training_metrics(f"step_{global_step:09d}")
                 while next_checkpoint <= global_step:
                     next_checkpoint += checkpoint_frequency
 
         if self.save_model:
             self.save("final.model")
+            write_training_metrics("final")
 
 
     def log(self, name, value, step):
@@ -1382,6 +1733,10 @@ class SAC_QSafe:
         torch.save(
             {
                 "policy_state_dict": self.policy.state_dict(),
+                # Kept for artifact introspection and legacy evaluation only.
+                # Formal target fine-tuning transfers the actor/normalizer but
+                # initializes and calibrates a fresh target-task temperature.
+                "log_alpha": self.entropy_coefficient.log_alpha.detach().cpu(),
                 "observation_normalizer_state_dict": self.observation_normalizer.state_dict(),
                 "observation_normalizer_metadata": self.observation_normalizer.metadata(),
                 "environment_manifest": environment_manifest,
@@ -1410,11 +1765,15 @@ class SAC_QSafe:
         model = SAC_QSafe(
             config, train_env, eval_env, run_path, writer, _defer_transfer_load=True
         )
-        model.policy.load_state_dict(checkpoint["policy_state_dict"])
-        model.critic.q1.load_state_dict(checkpoint["q1_state_dict"])
-        model.critic.q2.load_state_dict(checkpoint["q2_state_dict"])
-        model.critic.q1_target.load_state_dict(checkpoint["q1_target_state_dict"])
-        model.critic.q2_target.load_state_dict(checkpoint["q2_target_state_dict"])
+        _load_compatible_module_state(model.policy, checkpoint["policy_state_dict"])
+        _load_compatible_module_state(model.critic.q1, checkpoint["q1_state_dict"])
+        _load_compatible_module_state(model.critic.q2, checkpoint["q2_state_dict"])
+        _load_compatible_module_state(
+            model.critic.q1_target, checkpoint["q1_target_state_dict"]
+        )
+        _load_compatible_module_state(
+            model.critic.q2_target, checkpoint["q2_target_state_dict"]
+        )
         # Preserve the Parameter object already referenced by entropy_optimizer.
         # Replacing it would leave the optimizer updating a stale parameter and,
         # because the checkpoint is initially mapped to CPU, can also introduce
@@ -1448,7 +1807,8 @@ class SAC_QSafe:
                 checkpoint["qsafe_state_dict"], load_optimizer=model.phase == "pretrain"
             )
         if model.phase == "finetune":
-            model.qsafe.freeze()
+            if model.qsafe_enabled:
+                model.qsafe.freeze()
             model.observation_normalizer.freeze()
         model.nu.data.copy_(checkpoint["nu"].to(model.device))
         if model.dual_optimizer is not None and "dual_optimizer_state_dict" in checkpoint:
@@ -1463,100 +1823,353 @@ class SAC_QSafe:
             raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
         if eval_policy == "safe" and not self.qsafe_enabled:
             raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
-        for i in range(episodes):
-            done = False
-            episode_return = 0
-            episode_steps = 0
-            episode_failures = 0
-            forward_velocity_sum = 0.0
-            forward_velocity_samples = []
-            estimated_forward_velocity_sum = 0.0
-            velocity_estimation_error_sum = 0.0
-            target_velocity_error_sum = 0.0
-            state, _ = self.eval_env.reset()
-            while not done:
+        nr_envs = int(self.nr_envs)
+        dataset_config = self.config.algorithm.qsafe.dataset
+        collect_dataset = bool(dataset_config.enabled)
+        dataset_writer = None
+        dataset_pending = None
+        dataset_candidates = None
+        dataset_next_actions = None
+        action_noise = float(dataset_config.action_noise)
+        paired_candidates = bool(
+            self.config.algorithm.qsafe.paired_candidate_evaluation
+        )
+        if paired_candidates and collect_dataset:
+            raise ValueError(
+                "Paired candidate evaluation and dataset collection are separate modes."
+            )
+        if collect_dataset:
+            if eval_policy != "task":
+                raise ValueError(
+                    "Universal QSafe behavior data must be collected with "
+                    "algorithm.eval_policy=task; QSafe-protected collection "
+                    "would censor the unsafe examples it must learn."
+                )
+            if int(self.config.algorithm.qsafe.version) != 2:
+                raise ValueError("Universal QSafe datasets require qsafe.version=2.")
+            if not str(dataset_config.directory) or not str(dataset_config.actor_id):
+                raise ValueError(
+                    "Dataset collection requires qsafe.dataset.directory and actor_id."
+                )
+            if action_noise < 0.0:
+                raise ValueError("qsafe.dataset.action_noise must be non-negative.")
+            environment_manifest = self.eval_env.checkpoint_manifest(None)
+            dataset_writer = SafetyTrajectoryDatasetWriter(
+                str(dataset_config.directory),
+                {
+                    "dataset_version": 2,
+                    "base_observation_shape": list(
+                        self.eval_env.single_observation_space.shape
+                    ),
+                    "safety_observation_shape": [
+                        int(np.prod(self.eval_env.single_observation_space.shape))
+                        * int(self.config.algorithm.qsafe.history_length)
+                    ],
+                    "action_shape": list(self.eval_env.single_action_space.shape),
+                    "history_length": int(self.config.algorithm.qsafe.history_length),
+                    "control_dt": float(self.config.algorithm.qsafe.control_dt),
+                    "observation": environment_manifest.get("observation"),
+                    "action": environment_manifest.get("action"),
+                    "failure": environment_manifest.get("failure"),
+                },
+            )
+            dataset_pending = [[] for _ in range(nr_envs)]
+            dataset_candidates = [[] for _ in range(nr_envs)]
+            dataset_next_actions = [[] for _ in range(nr_envs)]
+            rlx_logger.info(
+                "Collecting complete universal-QSafe trajectories in "
+                f"{dataset_config.directory} (actor={dataset_config.actor_id}, "
+                f"split={dataset_config.split}, terrain={dataset_config.terrain}, "
+                f"noise={action_noise:.2f})"
+            )
+
+        def empty_record():
+            return {
+                "return": 0.0,
+                "steps": 0,
+                "failures": 0,
+                "forward": [],
+                "estimated": 0.0,
+                "estimation_error": 0.0,
+                "target_error": 0.0,
+                "gait": GaitEvaluationMetrics(),
+            }
+
+        records = [empty_record() for _ in range(nr_envs)]
+        gait_results = []
+        qsafe_metric_sums = {}
+        qsafe_metric_count = 0
+        evaluation_vector_step = 0
+        completed = 0
+        state, _ = self.eval_env.reset()
+        if self.qsafe_enabled:
+            self.qsafe.clear_rollout_history("eval")
+            self._qsafe_reset_masks.pop("eval", None)
+        while completed < episodes:
+            previous_state = np.asarray(state, dtype=np.float32).copy()
+            candidate_actions_for_dataset = None
+            if bool(self.config.algorithm.compile_policy):
                 torch.compiler.cudagraph_mark_step_begin()
-                with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training):
-                    if eval_policy == "task":
-                        raw_state = torch.as_tensor(
-                            state, dtype=torch.float32, device=self.device
+            with torch.no_grad(), autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=self.bf16_mixed_precision_training,
+            ):
+                if eval_policy == "task":
+                    raw_state = torch.as_tensor(
+                        state, dtype=torch.float32, device=self.device
+                    )
+                    normalized_state = self._normalize_states(
+                        raw_state, update=False
+                    )
+                    if paired_candidates:
+                        raw_candidates, _, _ = self._sample_candidate_pool(
+                            raw_state,
+                            normalized_state,
+                            int(self.config.algorithm.qsafe.candidate_actions),
+                            sample_seed=(
+                                int(self.config.algorithm.qsafe.eval_candidate_seed)
+                                + evaluation_vector_step
+                            ),
                         )
-                        normalized_state = self._normalize_states(
-                            raw_state, update=False
-                        )
+                        action = raw_candidates[:, 0]
+                    else:
                         action = self.policy.get_deterministic_action(
                             normalized_state
                         )
-                        action = self._project_actions(raw_state, action)
-                        processed_action = self._process_normalized_actions(action)
-                    else:
-                        _, processed_action, _ = self._sample_policy_candidates(
-                            state
+                    if collect_dataset and bool(dataset_config.store_candidates):
+                        nr_candidates = int(
+                            self.config.algorithm.qsafe.candidate_actions
                         )
-                state, reward, terminated, truncated, info = self.eval_env.step(processed_action.cpu().numpy())
-                failures = extract_failure_signal(info, terminated, self.nr_envs)
-                done = terminated | truncated
-                episode_return += reward
-                episode_steps += 1
-                episode_failures += int(np.sum(failures))
-                if "forward_velocity" in info:
-                    forward_velocity = float(
-                        np.mean(np.asarray(info["forward_velocity"]))
+                        repeated = normalized_state[:, None, :].expand(
+                            -1, nr_candidates, -1
+                        )
+                        sampled, _, _ = self.policy.get_action(
+                            repeated.reshape(nr_envs * nr_candidates, -1)
+                        )
+                        sampled = sampled.reshape(
+                            nr_envs,
+                            nr_candidates,
+                            *self.eval_env.single_action_space.shape,
+                        )
+                        repeated_raw = raw_state[:, None, :].expand(
+                            -1, nr_candidates, -1
+                        )
+                        sampled = self._project_actions(repeated_raw, sampled)
+                        candidate_actions_for_dataset = (
+                            sampled.detach().cpu().numpy().astype(np.float32)
+                        )
+                    if action_noise:
+                        action = action + action_noise * torch.randn_like(action)
+                    action = self._project_actions(raw_state, action)
+                    processed_action = self._process_normalized_actions(action)
+                else:
+                    _, processed_action, selection_metrics = (
+                        self._sample_policy_candidates(
+                            state,
+                            stream="eval",
+                            candidate_seed=(
+                                int(self.config.algorithm.qsafe.eval_candidate_seed)
+                                + evaluation_vector_step
+                                if paired_candidates
+                                else None
+                            ),
+                        )
                     )
-                    forward_velocity_sum += forward_velocity
-                    forward_velocity_samples.append(forward_velocity)
+                    for key, value in selection_metrics.items():
+                        qsafe_metric_sums[key] = (
+                            qsafe_metric_sums.get(key, 0.0) + float(value)
+                        )
+                    qsafe_metric_count += 1
+            state, reward, terminated, truncated, info = self.eval_env.step(
+                processed_action.cpu().numpy()
+            )
+            failures = extract_failure_signal(info, terminated, nr_envs)
+            done = np.asarray(terminated) | np.asarray(truncated)
+            actual_next_state = np.asarray(state, dtype=np.float32).copy()
+            for env_index in np.flatnonzero(done):
+                final = info["final_observation"][env_index]
+                if final is not None:
+                    actual_next_state[env_index] = np.asarray(
+                        final, dtype=np.float32
+                    )
+            applied_action = np.asarray(
+                info.get("applied_action", processed_action.cpu().numpy()),
+                dtype=np.float32,
+            )
+            if collect_dataset:
+                with torch.no_grad():
+                    next_raw = torch.as_tensor(
+                        actual_next_state, dtype=torch.float32, device=self.device
+                    )
+                    next_normalized = self._normalize_states(next_raw, update=False)
+                    sampled_next_action = self.policy.get_deterministic_action(
+                        next_normalized
+                    )
+                    if action_noise:
+                        sampled_next_action = sampled_next_action + (
+                            action_noise * torch.randn_like(sampled_next_action)
+                        )
+                    sampled_next_action = self._project_actions(
+                        next_raw, sampled_next_action
+                    ).detach().cpu().numpy().astype(np.float32)
+                for env_index in range(nr_envs):
+                    dataset_pending[env_index].append(
+                        (
+                            previous_state[env_index].copy(),
+                            actual_next_state[env_index].copy(),
+                            applied_action[env_index].copy(),
+                            float(failures[env_index]),
+                            float(np.asarray(terminated)[env_index]),
+                            float(np.asarray(truncated)[env_index]),
+                        )
+                    )
+                    if candidate_actions_for_dataset is not None:
+                        dataset_candidates[env_index].append(
+                            candidate_actions_for_dataset[env_index].copy()
+                        )
+                    dataset_next_actions[env_index].append(
+                        sampled_next_action[env_index].copy()
+                    )
+            if self.qsafe_enabled:
+                self._qsafe_reset_masks["eval"] = np.asarray(done, dtype=bool)
+            evaluation_vector_step += 1
+            reward = np.asarray(reward).reshape(nr_envs)
+            for env_index, record in enumerate(records):
+                record["return"] += float(reward[env_index])
+                record["steps"] += 1
+                record["failures"] += int(failures[env_index])
+                single_info = {
+                    key: (
+                        [value[env_index]]
+                        if isinstance(value, list)
+                        else np.asarray(value)[env_index : env_index + 1]
+                    )
+                    for key, value in info.items()
+                }
+                record["gait"].update(single_info)
+                if "forward_velocity" in info:
+                    record["forward"].append(
+                        float(np.asarray(info["forward_velocity"])[env_index])
+                    )
                 if "estimated_forward_velocity" in info:
-                    estimated_forward_velocity_sum += float(
-                        np.mean(np.asarray(info["estimated_forward_velocity"]))
+                    record["estimated"] += float(
+                        np.asarray(info["estimated_forward_velocity"])[env_index]
                     )
                 if "velocity_estimation_error" in info:
-                    velocity_estimation_error_sum += float(
-                        np.mean(np.asarray(info["velocity_estimation_error"]))
+                    record["estimation_error"] += float(
+                        np.asarray(info["velocity_estimation_error"])[env_index]
                     )
                 if "target_velocity_error" in info:
-                    target_velocity_error_sum += float(
-                        np.mean(np.asarray(info["target_velocity_error"]))
+                    record["target_error"] += float(
+                        np.asarray(info["target_velocity_error"])[env_index]
                     )
-            summary = (
-                f"Episode {i + 1} - Return: {float(np.mean(episode_return)):.6f}, "
-                f"Length: {episode_steps}, Failures: {episode_failures}"
+                if not done[env_index]:
+                    continue
+                if completed < episodes:
+                    episode_result = record["gait"].result(record["failures"])
+                    if record["forward"]:
+                        episode_result["mean_forward_velocity"] = float(
+                            np.mean(record["forward"])
+                        )
+                        episode_result["last_100_velocity"] = float(
+                            np.mean(record["forward"][-100:])
+                        )
+                    completed += 1
+                    steps = record["steps"]
+                    summary = (
+                        f"Episode {completed} - Return: {record['return']:.6f}, "
+                        f"Length: {steps}, Failures: {record['failures']}"
+                    )
+                    if record["forward"]:
+                        samples = record["forward"]
+                        window_size = min(100, len(samples))
+                        window_means = [
+                            float(np.mean(samples[start : start + window_size]))
+                            for start in range(
+                                0,
+                                len(samples) - window_size + 1,
+                                window_size,
+                            )
+                        ]
+                        summary += (
+                            f", Mean simulator forward velocity: "
+                            f"{np.mean(samples):.6f}, Last {window_size}-step "
+                            f"simulator velocity: {window_means[-1]:.6f}, "
+                            f"Min {window_size}-step simulator velocity: "
+                            f"{min(window_means):.6f}"
+                        )
+                    if "estimated_forward_velocity" in info:
+                        summary += (
+                            f", Mean estimated forward velocity: "
+                            f"{record['estimated'] / steps:.6f}"
+                        )
+                    if "velocity_estimation_error" in info:
+                        summary += (
+                            f", Mean 3D velocity estimation error: "
+                            f"{record['estimation_error'] / steps:.6f}"
+                        )
+                    if "target_velocity_error" in info:
+                        summary += (
+                            f", Mean absolute forward target error: "
+                            f"{record['target_error'] / steps:.6f}"
+                        )
+                    rlx_logger.info(summary)
+                    gait_results.append(episode_result)
+                    if collect_dataset:
+                        dataset_writer.append(
+                            dataset_pending[env_index],
+                            actor_id=str(dataset_config.actor_id),
+                            map_seed=int(dataset_config.map_seed),
+                            episode_id=(
+                                int(dataset_config.episode_offset) + completed - 1
+                            ),
+                            split=str(dataset_config.split),
+                            terrain=(
+                                str(dataset_config.terrain)
+                                or str(self.config.environment.terrain_profile)
+                            ),
+                            action_noise=action_noise,
+                            success=episode_result["success"],
+                            stuck=episode_result["stuck"],
+                            candidate_actions=(
+                                np.stack(dataset_candidates[env_index])
+                                if candidate_actions_for_dataset is not None
+                                else None
+                            ),
+                            next_actions=np.stack(
+                                dataset_next_actions[env_index]
+                            ),
+                        )
+                if collect_dataset:
+                    dataset_pending[env_index] = []
+                    dataset_candidates[env_index] = []
+                    dataset_next_actions[env_index] = []
+                records[env_index] = empty_record()
+        suite = GaitEvaluationMetrics.format_suite(gait_results)
+        rlx_logger.info(suite)
+        results_path = str(self.config.algorithm.evaluation_results_path)
+        if results_path:
+            qsafe_means = {
+                key: value / max(qsafe_metric_count, 1)
+                for key, value in qsafe_metric_sums.items()
+            }
+            payload = {
+                "episodes": gait_results,
+                "summary_text": suite,
+                "paired_candidate_evaluation": paired_candidates,
+                "candidate_seed": int(
+                    self.config.algorithm.qsafe.eval_candidate_seed
+                ),
+                "qsafe": qsafe_means,
+            }
+            destination = Path(results_path).expanduser().resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
             )
-            if episode_steps and "forward_velocity" in info:
-                summary += (
-                    f", Mean simulator forward velocity: "
-                    f"{forward_velocity_sum / episode_steps:.6f}"
-                )
-                window_size = min(100, len(forward_velocity_samples))
-                window_means = [
-                    float(np.mean(forward_velocity_samples[start:start + window_size]))
-                    for start in range(
-                        0,
-                        len(forward_velocity_samples) - window_size + 1,
-                        window_size,
-                    )
-                ]
-                summary += (
-                    f", Last {window_size}-step simulator velocity: "
-                    f"{window_means[-1]:.6f}, "
-                    f"Min {window_size}-step simulator velocity: "
-                    f"{min(window_means):.6f}"
-                )
-            if episode_steps and "estimated_forward_velocity" in info:
-                summary += (
-                    f", Mean estimated forward velocity: "
-                    f"{estimated_forward_velocity_sum / episode_steps:.6f}"
-                )
-            if episode_steps and "velocity_estimation_error" in info:
-                summary += (
-                    f", Mean 3D velocity estimation error: "
-                    f"{velocity_estimation_error_sum / episode_steps:.6f}"
-                )
-            if episode_steps and "target_velocity_error" in info:
-                summary += (
-                    f", Mean absolute forward target error: "
-                    f"{target_velocity_error_sum / episode_steps:.6f}"
-                )
-            rlx_logger.info(summary)
+            temporary.replace(destination)
 
 
     def set_train_mode(self):

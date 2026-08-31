@@ -1,0 +1,37 @@
+[
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/isaac_sac_flat_action_v2_legacy_v1/models",
+    "id": "flat_seed0",
+    "split": "train"
+  },
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_rough_seed0_v11/models",
+    "id": "rough_seed0",
+    "split": "train"
+  },
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/gait_finetune/gait_h07_p03_50k_s0/models",
+    "id": "step_seed0",
+    "split": "train"
+  },
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed1_v11/models",
+    "id": "flat_seed1",
+    "split": "validation"
+  },
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_rough_seed1_v11/models",
+    "id": "rough_seed1",
+    "split": "validation"
+  },
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/gait_finetune/gait_h07_p03_50k_s2/models",
+    "id": "step_seed1",
+    "split": "validation"
+  },
+  {
+    "checkpoint": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/universal_flat_seed2_v11/models",
+    "id": "heldout_flat",
+    "split": "test"
+  }
+]

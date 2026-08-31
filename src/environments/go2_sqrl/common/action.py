@@ -15,8 +15,18 @@ from .types import ActionResult
 
 
 class ActionMapper:
-    def __init__(self, max_target_rate: float = ACTION_SPEC.max_target_rate):
+    def __init__(
+        self,
+        max_target_rate: float = ACTION_SPEC.max_target_rate,
+        action_scale=None,
+    ):
         self.max_target_rate = float(max_target_rate)
+        self.action_scale = np.asarray(
+            ACTION_SPEC.scale if action_scale is None else action_scale,
+            dtype=np.float32,
+        )
+        if self.action_scale.shape != (ACTION_SPEC.size,):
+            raise ValueError("action_scale must contain exactly 12 values")
         self.previous_q_target = DEFAULT_JOINT_POSITION.copy()
 
     def reset(self, previous_q_target: np.ndarray | None = None) -> None:
@@ -33,6 +43,7 @@ class ActionMapper:
             self.previous_q_target,
             raw,
             max_target_rate=self.max_target_rate,
+            action_scale=self.action_scale,
         )
         self.previous_q_target = q_target.copy()
         return ActionResult(raw.copy(), applied, q_target)
@@ -61,6 +72,7 @@ def project_action_targets(
     actions,
     *,
     max_target_rate: float = ACTION_SPEC.max_target_rate,
+    action_scale=None,
     array_namespace=None,
 ):
     """Project normalized actions without mutating environment state.
@@ -88,7 +100,10 @@ def project_action_targets(
     default = xp.asarray(DEFAULT_JOINT_POSITION, dtype=dtype)
     lower = xp.asarray(JOINT_LOWER_LIMIT, dtype=dtype)
     upper = xp.asarray(JOINT_UPPER_LIMIT, dtype=dtype)
-    scale = xp.asarray(ACTION_SPEC.scale, dtype=dtype)
+    scale = xp.asarray(
+        ACTION_SPEC.scale if action_scale is None else action_scale,
+        dtype=dtype,
+    )
     clipped = xp.clip(action_array, -1.0, 1.0)
     q_target = xp.clip(default + scale * clipped, lower, upper)
     max_delta = float(max_target_rate) * ACTION_SPEC.control_dt
@@ -106,6 +121,7 @@ def project_actions_from_observation(
     actions,
     *,
     max_target_rate: float = ACTION_SPEC.max_target_rate,
+    action_scale=None,
 ):
     """Return applied normalized actions using the observation's prior target."""
 
@@ -120,14 +136,20 @@ def project_actions_from_observation(
         observation_array[..., OBSERVATION_SPEC.previous_action_q_target],
         actions,
         max_target_rate=max_target_rate,
+        action_scale=action_scale,
         array_namespace=xp,
     )
     return applied
 
 
-def normalized_action_from_target(q_target: np.ndarray) -> np.ndarray:
+def normalized_action_from_target(
+    q_target: np.ndarray, *, action_scale=None
+) -> np.ndarray:
     q_target = np.asarray(q_target, dtype=np.float32)
-    scale = np.asarray(ACTION_SPEC.scale, dtype=np.float32)
+    scale = np.asarray(
+        ACTION_SPEC.scale if action_scale is None else action_scale,
+        dtype=np.float32,
+    )
     return np.clip(
         (q_target - DEFAULT_JOINT_POSITION) / scale, -1.0, 1.0
     ).astype(np.float32)

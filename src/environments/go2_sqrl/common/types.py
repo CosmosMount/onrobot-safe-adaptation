@@ -43,6 +43,9 @@ class RewardTerms:
     lin_vel_z: float
     base_height: float
     foot_clearance: float
+    foot_clearance_overshoot: float
+    phase: float
+    stable_progress: float
     action_rate: float
     similar_to_default: float
     total: float
@@ -55,6 +58,9 @@ class RewardTerms:
             "reward/lin_vel_z": self.lin_vel_z,
             "reward/base_height": self.base_height,
             "reward/foot_clearance": self.foot_clearance,
+            "reward/foot_clearance_overshoot": self.foot_clearance_overshoot,
+            "reward/phase": self.phase,
+            "reward/stable_progress": self.stable_progress,
             "reward/action_rate": self.action_rate,
             "reward/similar_to_default": self.similar_to_default,
             "reward/total": self.total,

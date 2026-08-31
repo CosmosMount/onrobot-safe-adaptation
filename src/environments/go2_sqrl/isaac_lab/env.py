@@ -29,12 +29,15 @@ from ..common.manifest import (
 from ..common.reward import (
     BASE_HEIGHT_TARGET,
     FOOT_CLEARANCE_TARGET,
+    PHASE_EPSILON,
+    PHASE_REFERENCE_FREQUENCY,
     REWARD_DT,
     REWARD_DEFAULT_JOINT_POSITION,
     REWARD_SCALES,
     SWING_SPEED_FULL,
     SWING_SPEED_START,
     TRACKING_SIGMA,
+    add_terminal_failure_penalty,
     local_base_clearance,
 )
 from ..common.estimation import (
@@ -114,6 +117,76 @@ def project_action_targets_tensor(previous_q_target, actions):
     )
     applied = ((target - default) / scale).clamp(-1, 1)
     return applied, target
+
+
+def swing_clearance_and_phase_tensor(
+    foot_clearance,
+    foot_velocity,
+    *,
+    clearance_target=FOOT_CLEARANCE_TARGET,
+    reference_frequency=PHASE_REFERENCE_FREQUENCY,
+    clearance_aggregation="swing_weighted",
+):
+    """Torch counterpart of the common contact-free gait reward terms."""
+
+    horizontal_speed = torch.linalg.vector_norm(foot_velocity[..., :2], dim=-1)
+    swing_weight = (
+        (horizontal_speed - SWING_SPEED_START)
+        / (SWING_SPEED_FULL - SWING_SPEED_START)
+    ).clamp(0.0, 1.0)
+    deficit = (float(clearance_target) - foot_clearance).clamp_min(0.0)
+    if clearance_aggregation == "legacy_mean":
+        clearance_error = (swing_weight * deficit.square()).mean(dim=-1)
+    elif clearance_aggregation == "swing_weighted":
+        clearance_error = (swing_weight * deficit.square()).sum(dim=-1) / (
+            swing_weight.sum(dim=-1).clamp_min(1.0)
+        )
+    else:
+        raise ValueError(
+            "clearance_reward_mode must be 'legacy_mean' or 'swing_weighted'"
+        )
+
+    x = (
+        foot_clearance.clamp(0.0, float(clearance_target))
+        - 0.5 * float(clearance_target)
+    ) / (0.5 * float(clearance_target))
+    y = foot_velocity[..., 2] / (
+        torch.pi * float(reference_frequency) * float(clearance_target)
+    )
+    phase = torch.stack((x, y), dim=-1)
+    phase = phase / torch.linalg.vector_norm(
+        phase, dim=-1, keepdim=True
+    ).clamp_min(PHASE_EPSILON)
+    # Shared SDK order is FR, FL, RR, RL.
+    fr, fl, rr, rl = phase.unbind(dim=-2)
+    phase_score = 0.25 * (
+        0.5 * (1.0 + (fr * rl).sum(dim=-1))
+        + 0.5 * (1.0 + (fl * rr).sum(dim=-1))
+        + 0.5 * (1.0 - (fr * fl).sum(dim=-1))
+        + 0.5 * (1.0 - (rl * rr).sum(dim=-1))
+    )
+    swing_activity = (swing_weight.sum(dim=-1) / 2.0).clamp(0.0, 1.0)
+    return clearance_error, swing_activity * phase_score, swing_weight
+
+
+def swing_clearance_overshoot_tensor(
+    foot_clearance,
+    swing_weight,
+    *,
+    upper_target,
+):
+    overshoot = (foot_clearance - float(upper_target)).clamp_min(0.0)
+    return (swing_weight * overshoot.square()).sum(dim=-1) / (
+        swing_weight.sum(dim=-1).clamp_min(1.0)
+    )
+
+
+def movement_reward_gate_tensor(forward_velocity, *, start, full):
+    start = float(start)
+    full = float(full)
+    if full <= start:
+        return torch.ones_like(forward_velocity)
+    return ((forward_velocity - start) / (full - start)).clamp(0.0, 1.0)
 
 
 class TorchFallDetector:
@@ -253,11 +326,14 @@ class Go2IsaacEnv:
             self.backend.action_manager.get_term("joint_pos")
         )
         self._joint_indices = sdk_joint_indices(robot.joint_names, robot.device)
-        foot_indices, foot_names = robot.find_bodies(".*_foot")
-        if len(foot_indices) != 4:
+        foot_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
+        try:
+            foot_indices = [robot.body_names.index(name) for name in foot_names]
+        except ValueError as error:
             raise RuntimeError(
-                f"Expected four Go2 foot bodies, got {foot_names}"
-            )
+                f"Expected Go2 SDK-order foot bodies {foot_names}, got "
+                f"{robot.body_names}"
+            ) from error
         self._foot_body_indices = torch.as_tensor(
             foot_indices, dtype=torch.long, device=robot.device
         )
@@ -288,6 +364,15 @@ class Go2IsaacEnv:
         self._episode_length = torch.zeros(
             self.nr_envs, device=robot.device, dtype=torch.long
         )
+        self._episode_start_x = robot.data.root_pos_w[:, 0].clone()
+        self._episode_max_progress = torch.zeros(self.nr_envs, device=robot.device)
+        self._velocity_history = torch.zeros(
+            (self.nr_envs, 100), device=robot.device
+        )
+        self._velocity_history_count = torch.zeros(
+            self.nr_envs, dtype=torch.long, device=robot.device
+        )
+        self._velocity_history_cursor = 0
         print(
             format_policy_io_contract(self.config.target_velocity_x),
             flush=True,
@@ -425,6 +510,11 @@ class Go2IsaacEnv:
         self._fall_detector.reset()
         self._episode_return.zero_()
         self._episode_length.zero_()
+        self._episode_start_x.copy_(self._robot.data.root_pos_w[:, 0])
+        self._episode_max_progress.zero_()
+        self._velocity_history.zero_()
+        self._velocity_history_count.zero_()
+        self._velocity_history_cursor = 0
         return self._observation().detach().cpu().numpy(), {}
 
     def _reset_failed_backend_envs(self, failure, already_reset):
@@ -509,17 +599,27 @@ class Go2IsaacEnv:
             terrain_hits[..., 2], 1, foot_hit_indices
         )
         foot_clearance = foot_position[..., 2] - foot_ground_height
-        foot_horizontal_speed = torch.linalg.vector_norm(
-            foot_velocity[..., :2], dim=-1
+        foot_clearance_error, phase_reward, swing_weight = (
+            swing_clearance_and_phase_tensor(
+                foot_clearance,
+                foot_velocity,
+                clearance_target=float(self.config.foot_clearance_target),
+                reference_frequency=float(
+                    self.config.phase_reference_frequency
+                ),
+                clearance_aggregation=str(self.config.clearance_reward_mode),
+            )
         )
-        swing_weight = (
-            (foot_horizontal_speed - SWING_SPEED_START)
-            / (SWING_SPEED_FULL - SWING_SPEED_START)
-        ).clamp(0.0, 1.0)
-        foot_clearance_error = (
-            swing_weight
-            * (FOOT_CLEARANCE_TARGET - foot_clearance).clamp_min(0.0).square()
-        ).mean(dim=-1)
+        foot_clearance_overshoot_error = swing_clearance_overshoot_tensor(
+            foot_clearance,
+            swing_weight,
+            upper_target=float(self.config.foot_clearance_upper_target),
+        )
+        movement_gate = movement_reward_gate_tensor(
+            body_velocity[:, 0],
+            start=float(self.config.phase_velocity_gate_start),
+            full=float(self.config.phase_velocity_gate_full),
+        )
         action_rate = (
             reward_action - self._previous_reward_action
         ).square().sum(dim=-1)
@@ -530,6 +630,26 @@ class Go2IsaacEnv:
             device=joint_q.device,
         )
         similar_to_default = torch.abs(joint_q - default_joint_q).sum(dim=-1)
+        failure = self._fall_detector.update(
+            self.backend.scene["imu"].data.quat_w,
+            base_clearance,
+        )
+        failure = failure.clone()
+        tilt_failure = self._fall_detector.last_tilt_failure.clone()
+        height_failure = self._fall_detector.last_height_failure.clone()
+        terminated = backend_terminated | failure
+        progress = robot.data.root_pos_w[:, 0] - self._episode_start_x
+        self._episode_max_progress = torch.maximum(
+            self._episode_max_progress, progress
+        )
+        stable_progress_reward = (
+            (progress >= float(self.config.stable_progress_start))
+            & (
+                base_clearance
+                >= float(self.config.stable_progress_min_base_clearance)
+            )
+            & ~failure
+        ).float() * movement_gate
         reward_terms = {
             "tracking_lin_vel": REWARD_DT
             * REWARD_SCALES["tracking_lin_vel"]
@@ -547,6 +667,16 @@ class Go2IsaacEnv:
             "foot_clearance": REWARD_DT
             * REWARD_SCALES["foot_clearance"]
             * foot_clearance_error,
+            "foot_clearance_overshoot": REWARD_DT
+            * float(self.config.foot_clearance_overshoot_scale)
+            * foot_clearance_overshoot_error,
+            "phase": REWARD_DT
+            * float(self.config.phase_reward_scale)
+            * movement_gate
+            * phase_reward,
+            "stable_progress": REWARD_DT
+            * float(self.config.stable_progress_scale)
+            * stable_progress_reward,
             "action_rate": REWARD_DT
             * REWARD_SCALES["action_rate"]
             * action_rate,
@@ -555,15 +685,35 @@ class Go2IsaacEnv:
             * similar_to_default,
         }
         reward = torch.stack(tuple(reward_terms.values()), dim=0).sum(dim=0)
-        self._previous_reward_action.copy_(reward_action)
-        failure = self._fall_detector.update(
-            self.backend.scene["imu"].data.quat_w,
-            base_clearance,
+        failure_reward = failure.float() * float(
+            self.config.terminal_failure_penalty
         )
-        failure = failure.clone()
-        tilt_failure = self._fall_detector.last_tilt_failure.clone()
-        height_failure = self._fall_detector.last_height_failure.clone()
-        terminated = backend_terminated | failure
+        reward = add_terminal_failure_penalty(
+            reward,
+            failure.float(),
+            float(self.config.terminal_failure_penalty),
+        )
+        self._previous_reward_action.copy_(reward_action)
+        self._velocity_history[:, self._velocity_history_cursor] = body_velocity[:, 0]
+        self._velocity_history_cursor = (self._velocity_history_cursor + 1) % 100
+        self._velocity_history_count = (self._velocity_history_count + 1).clamp_max(100)
+        last_velocity = self._velocity_history.sum(dim=-1) / (
+            self._velocity_history_count.clamp_min(1)
+        )
+        crossing_success = self._episode_max_progress >= float(
+            self.config.step_success_distance
+        )
+        stuck = (~failure) & (last_velocity < 0.1)
+        stable_success = crossing_success & ~failure & (last_velocity >= 0.1)
+        swing_weight_sum = swing_weight.sum(dim=-1)
+        swing_clearance = (swing_weight * foot_clearance).sum(dim=-1) / (
+            swing_weight_sum.clamp_min(1.0)
+        )
+        swing_clearance = torch.where(
+            swing_weight_sum > 0.0,
+            swing_clearance,
+            torch.full_like(swing_clearance, torch.nan),
+        )
         already_reset = backend_terminated | truncated
         self._reset_failed_backend_envs(failure, already_reset)
         done = terminated | truncated
@@ -589,6 +739,24 @@ class Go2IsaacEnv:
             "local_terrain_height": terrain_height.detach().cpu().numpy(),
             "mean_foot_clearance": foot_clearance.mean(dim=-1).detach().cpu().numpy(),
             "max_foot_clearance": foot_clearance.max(dim=-1).values.detach().cpu().numpy(),
+            "swing_weighted_foot_clearance": swing_clearance.detach().cpu().numpy(),
+            **{
+                f"swing_clearance/{leg}": torch.where(
+                    swing_weight[:, index] > 0.0,
+                    foot_clearance[:, index],
+                    torch.full_like(foot_clearance[:, index], torch.nan),
+                ).detach().cpu().numpy()
+                for index, leg in enumerate(("fr", "fl", "rr", "rl"))
+            },
+            "swing_ratio/fr": swing_weight[:, 0].detach().cpu().numpy(),
+            "swing_ratio/fl": swing_weight[:, 1].detach().cpu().numpy(),
+            "swing_ratio/rr": swing_weight[:, 2].detach().cpu().numpy(),
+            "swing_ratio/rl": swing_weight[:, 3].detach().cpu().numpy(),
+            "terrain/forward_progress": self._episode_max_progress.detach().cpu().numpy(),
+            "terrain/success": crossing_success.float().detach().cpu().numpy(),
+            "terrain/stable_success": stable_success.float().detach().cpu().numpy(),
+            "terrain/stuck": stuck.float().detach().cpu().numpy(),
+            "terrain/last_100_velocity": last_velocity.detach().cpu().numpy(),
             "action_saturation_ratio": (
                 reward_action.abs() > 0.98
             ).float().mean(dim=-1).detach().cpu().numpy(),
@@ -603,6 +771,7 @@ class Go2IsaacEnv:
                 f"reward/{name}": value.detach().cpu().numpy()
                 for name, value in reward_terms.items()
             },
+            "reward/failure": failure_reward.detach().cpu().numpy(),
             "reward/total": reward.detach().cpu().numpy(),
             "final_observation": [None] * self.nr_envs,
             "final_info": [None] * self.nr_envs,
@@ -612,9 +781,19 @@ class Go2IsaacEnv:
             info["final_info"][index] = {
                 "episode_return": float(self._episode_return[index]),
                 "episode_length": int(self._episode_length[index]),
+                "fall": bool(failure[index]),
+                "success": bool(crossing_success[index]),
+                "stable_success": bool(stable_success[index]),
+                "stuck": bool(stuck[index]),
+                "forward_progress": float(self._episode_max_progress[index]),
+                "last_100_velocity": float(last_velocity[index]),
             }
             self._episode_return[index] = 0
             self._episode_length[index] = 0
+            self._episode_start_x[index] = self._robot.data.root_pos_w[index, 0]
+            self._episode_max_progress[index] = 0.0
+            self._velocity_history[index] = 0.0
+            self._velocity_history_count[index] = 0
         return (
             observation.detach().cpu().numpy(),
             reward.detach().cpu().numpy(),
@@ -686,6 +865,32 @@ class Go2IsaacEnv:
             fall_min_base_clearance=float(self.config.fall_min_base_clearance),
             fall_consecutive_frames=int(self.config.fall_consecutive_frames),
             target_velocity_x=float(self.config.target_velocity_x),
+            foot_clearance_target=float(self.config.foot_clearance_target),
+            phase_reference_frequency=float(
+                self.config.phase_reference_frequency
+            ),
+            phase_reward_scale=float(self.config.phase_reward_scale),
+            clearance_reward_mode=str(self.config.clearance_reward_mode),
+            foot_clearance_upper_target=float(
+                self.config.foot_clearance_upper_target
+            ),
+            foot_clearance_overshoot_scale=float(
+                self.config.foot_clearance_overshoot_scale
+            ),
+            phase_velocity_gate_start=float(
+                self.config.phase_velocity_gate_start
+            ),
+            phase_velocity_gate_full=float(
+                self.config.phase_velocity_gate_full
+            ),
+            stable_progress_start=float(self.config.stable_progress_start),
+            stable_progress_min_base_clearance=float(
+                self.config.stable_progress_min_base_clearance
+            ),
+            stable_progress_scale=float(self.config.stable_progress_scale),
+            terminal_failure_penalty=float(
+                self.config.terminal_failure_penalty
+            ),
         )
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
