@@ -1,0 +1,350 @@
+diff --git a/simulate/src/main.cc b/simulate/src/main.cc
+index db38cb2..36ddb58 100755
+--- a/simulate/src/main.cc
++++ b/simulate/src/main.cc
+@@ -98,6 +98,7 @@ namespace
+   // model and data
+   mjModel *m = nullptr;
+   mjData *d = nullptr;
++  OrsaStrictLockstepContext orsa_lockstep;
+ 
+   // control noise variables
+   mjtNum *ctrlnoise = nullptr;
+@@ -336,6 +337,12 @@ namespace
+     // run until asked to exit
+     while (!sim.exitrequest.load())
+     {
++      if (orsa_lockstep.enabled &&
++          (sim.droploadrequest.load() || sim.uiloadrequest.load()))
++      {
++        std::cerr << "ORSA strict lockstep forbids model hot-loading" << std::endl;
++        std::abort();
++      }
+       if (sim.droploadrequest.load())
+       {
+         sim.LoadMessage(sim.dropfilename);
+@@ -415,6 +422,15 @@ namespace
+         // run only if model is present
+         if (m)
+         {
++          if (orsa_lockstep.enabled)
++          {
++            // The bridge owns every integration step. Keeping the stock loop
++            // paused makes learner/update time exactly zero simulation time.
++            sim.run = 0;
++            mj_forward(m, d);
++            sim.speed_changed = true;
++            continue;
++          }
+           // running
+           if (sim.run)
+           {
+@@ -572,6 +588,7 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
+ 
+ void *UnitreeSdk2BridgeThread(void *arg)
+ {
++  auto *lockstep = static_cast<OrsaStrictLockstepContext *>(arg);
+   // Wait for mujoco data
+   while (true)
+   {
+@@ -603,10 +620,10 @@ void *UnitreeSdk2BridgeThread(void *arg)
+ 
+   if (idl_type == param::IDL_HG) {
+     std::cout << "Using unitree_hg DDS IDL for robot " << param::config.robot << std::endl;
+-    interface = std::make_unique<G1Bridge>(m, d);
++    interface = std::make_unique<G1Bridge>(m, d, lockstep);
+   } else {
+     std::cout << "Using unitree_go DDS IDL for robot " << param::config.robot << std::endl;
+-    interface = std::make_unique<Go2Bridge>(m, d);
++    interface = std::make_unique<Go2Bridge>(m, d, lockstep);
+   }
+   interface->start();
+   
+@@ -641,6 +658,11 @@ void user_key_cb(GLFWwindow* window, int key, int scancode, int act, int mods) {
+       }
+     }
+     if(key==GLFW_KEY_BACKSPACE) {
++      std::unique_lock<std::recursive_mutex> lock;
++      if (orsa_lockstep.enabled && orsa_lockstep.simulation_mutex) {
++        lock = std::unique_lock<std::recursive_mutex>(
++          *orsa_lockstep.simulation_mutex);
++      }
+       mj_resetData(m, d);
+       mj_forward(m, d);
+     }
+@@ -692,7 +714,21 @@ int main(int argc, char **argv)
+     std::make_unique<mj::GlfwAdapter>(),
+     &cam, &opt, &pert, /* is_passive = */ false);
+ 
+-  std::thread unitree_thread(UnitreeSdk2BridgeThread, nullptr);
++  const char *strict_value = std::getenv("ORSA_STRICT_LOCKSTEP");
++  orsa_lockstep.enabled = strict_value && std::string(strict_value) == "1";
++  orsa_lockstep.simulation_mutex = &sim->mtx;
++  if (orsa_lockstep.enabled) {
++    if (param::config.enable_elastic_band != 0) {
++      std::cerr << "ORSA strict lockstep requires enable_elastic_band: 0"
++                << std::endl;
++      return 2;
++    }
++    sim->run = 0;
++    sim->ctrl_noise_std = 0;
++    std::cout << "ORSA strict 10-frame command lockstep enabled" << std::endl;
++  }
++
++  std::thread unitree_thread(UnitreeSdk2BridgeThread, &orsa_lockstep);
+ 
+   // start physics thread
+   std::thread physicsthreadhandle(&PhysicsThread, sim.get(), param::config.robot_scene.c_str());
+diff --git a/simulate/src/unitree_sdk2_bridge.h b/simulate/src/unitree_sdk2_bridge.h
+index 7c13289..99c6d84 100644
+--- a/simulate/src/unitree_sdk2_bridge.h
++++ b/simulate/src/unitree_sdk2_bridge.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <mutex>
++
+ #include <mujoco/mujoco.h>
+ 
+ #include <unitree/robot/channel/channel_publisher.hpp>
+@@ -15,12 +20,42 @@
+ #include "physics_joystick.h"
+ 
+ #define MOTOR_SENSOR_NUM 3
++#define ORSA_POLICY_PHYSICS_STEPS 10
++
++struct OrsaStrictLockstepContext
++{
++    bool enabled = false;
++    std::recursive_mutex *simulation_mutex = nullptr;
++};
++
++inline uint32_t orsa_command_sequence(const unitree_go::msg::dds_::LowCmd_ &message)
++{
++    return message.reserve();
++}
++
++inline uint32_t orsa_command_sequence(const unitree_hg::msg::dds_::LowCmd_ &message)
++{
++    return message.reserve()[0];
++}
++
++inline void orsa_set_applied_sequence(
++    unitree_go::msg::dds_::LowState_ &message, uint32_t sequence)
++{
++    message.reserve() = sequence;
++}
++
++inline void orsa_set_applied_sequence(
++    unitree_hg::msg::dds_::LowState_ &message, uint32_t sequence)
++{
++    message.reserve()[0] = sequence;
++}
+ 
+ class UnitreeSDK2BridgeBase
+ {
+ public:
+-    UnitreeSDK2BridgeBase(mjModel *model, mjData *data)
+-    : mj_model_(model), mj_data_(data)
++    UnitreeSDK2BridgeBase(
++        mjModel *model, mjData *data, OrsaStrictLockstepContext *lockstep)
++    : mj_model_(model), mj_data_(data), lockstep_(lockstep)
+     {
+         _check_sensor();
+         if(param::config.print_scene_information == 1) {
+@@ -76,6 +111,7 @@ protected:
+ 
+     mjData *mj_data_;
+     mjModel *mj_model_;
++    OrsaStrictLockstepContext *lockstep_;
+ 
+     // Sensor data indices
+     int imu_quat_adr_ = -1;
+@@ -155,7 +191,9 @@ using HighState_t = unitree::robot::go2::publisher::SportModeState;
+ using WirelessController_t = unitree::robot::go2::publisher::WirelessController;
+ 
+ public:
+-    RobotBridge(mjModel *model, mjData *data) : UnitreeSDK2BridgeBase(model, data)
++    RobotBridge(
++        mjModel *model, mjData *data, OrsaStrictLockstepContext *lockstep)
++    : UnitreeSDK2BridgeBase(model, data, lockstep)
+     {
+         lowcmd = std::make_shared<LowCmd_t>("rt/lowcmd");
+         lowstate = std::make_unique<LowState_t>();
+@@ -175,25 +213,44 @@ public:
+     {
+         if(!mj_data_) return;
+         if(lowstate->joystick) { lowstate->joystick->update(); }
+-        // lowcmd
+-        {
+-            std::lock_guard<std::mutex> lock(lowcmd->mutex_);
+-            for(int i(0); i<num_motor_; i++) {
+-                auto & m = lowcmd->msg_.motor_cmd()[i];
+-                mj_data_->ctrl[i] = m.tau() +
+-                                    m.kp() * (m.q() - mj_data_->sensordata[i]) +
+-                                    m.kd() * (m.dq() - mj_data_->sensordata[i + num_motor_]);
+-            }
++        if(lockstep_ && lockstep_->enabled) {
++            run_strict_lockstep();
++        } else {
++            run_realtime();
++        }
++        // wireless_controller
++        if(wireless_controller->joystick) {
++            wireless_controller->unlockAndPublish();
++        }
++    }
++
++    std::unique_ptr<HighState_t> highstate;
++    std::unique_ptr<WirelessController_t> wireless_controller;
++    std::shared_ptr<LowCmd_t> lowcmd;
++    std::unique_ptr<LowState_t> lowstate;
++
++private:
++    void apply_current_command()
++    {
++        for(int i(0); i<num_motor_; i++) {
++            auto & m = lowcmd->msg_.motor_cmd()[i];
++            mj_data_->ctrl[i] = m.tau() +
++                                m.kp() * (m.q() - mj_data_->sensordata[i]) +
++                                m.kd() * (m.dq() - mj_data_->sensordata[i + num_motor_]);
+         }
++    }
+ 
+-        // lowstate
++    void publish_state(uint32_t applied_sequence)
++    {
++        // A nonzero reserve value is an ORSA post-step acknowledgement: this
++        // snapshot was produced by a completed mj_step under that LowCmd.
+         if(lowstate->trylock()) {
+             for(int i(0); i<num_motor_; i++) {
+                 lowstate->msg_.motor_state()[i].q() = mj_data_->sensordata[i];
+                 lowstate->msg_.motor_state()[i].dq() = mj_data_->sensordata[i + num_motor_];
+                 lowstate->msg_.motor_state()[i].tau_est() = mj_data_->sensordata[i + 2 * num_motor_];
+             }
+-            
++
+             if(imu_quat_adr_ >= 0) {
+                 lowstate->msg_.imu_state().quaternion()[0] = mj_data_->sensordata[imu_quat_adr_ + 0];
+                 lowstate->msg_.imu_state().quaternion()[1] = mj_data_->sensordata[imu_quat_adr_ + 1];
+@@ -209,7 +266,7 @@ public:
+                 lowstate->msg_.imu_state().rpy()[1] = asin(2 * (w * y - z * x));
+                 lowstate->msg_.imu_state().rpy()[2] = atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+             }
+-            
++
+             if(imu_gyro_adr_ >= 0) {
+                 lowstate->msg_.imu_state().gyroscope()[0] = mj_data_->sensordata[imu_gyro_adr_ + 0];
+                 lowstate->msg_.imu_state().gyroscope()[1] = mj_data_->sensordata[imu_gyro_adr_ + 1];
+@@ -221,12 +278,22 @@ public:
+                 lowstate->msg_.imu_state().accelerometer()[1] = mj_data_->sensordata[imu_acc_adr_ + 1];
+                 lowstate->msg_.imu_state().accelerometer()[2] = mj_data_->sensordata[imu_acc_adr_ + 2];
+             }
+-            
+-            lowstate->msg_.tick() = std::round(mj_data_->time / 1e-3);
++
++            lowstate->msg_.tick() = std::llround(mj_data_->time / 1e-3);
++            orsa_set_applied_sequence(lowstate->msg_, applied_sequence);
+             lowstate->unlockAndPublish();
+         }
+-        // highstate
++
+         if(highstate->trylock()) {
++            // Tag root truth with the identical simulation clock used by
++            // LowState.tick() and command sequence, allowing Python to reject
++            // delayed HighState samples from an earlier reset generation.
++            highstate->msg_.error_code() = applied_sequence;
++            const int64_t sim_time_ns = std::llround(mj_data_->time * 1e9);
++            highstate->msg_.stamp().sec() = static_cast<int32_t>(
++                sim_time_ns / 1000000000LL);
++            highstate->msg_.stamp().nanosec() = static_cast<uint32_t>(
++                sim_time_ns % 1000000000LL);
+             if(frame_pos_adr_ >= 0) {
+                 highstate->msg_.position()[0] = mj_data_->sensordata[frame_pos_adr_ + 0];
+                 highstate->msg_.position()[1] = mj_data_->sensordata[frame_pos_adr_ + 1];
+@@ -239,19 +306,62 @@ public:
+             }
+             highstate->unlockAndPublish();
+         }
+-        // wireless_controller
+-        if(wireless_controller->joystick) {
+-            wireless_controller->unlockAndPublish();
++    }
++
++    void run_realtime()
++    {
++        {
++            std::lock_guard<std::mutex> lock(lowcmd->mutex_);
++            apply_current_command();
+         }
++        // Sequence zero deliberately identifies a non-lockstep snapshot. The
++        // strict Python adapter will reject it rather than silently train.
++        publish_state(0);
++    }
++
++    void run_strict_lockstep()
++    {
++        if(!lockstep_->simulation_mutex) {
++            std::cerr << "ORSA strict lockstep has no simulation mutex" << std::endl;
++            std::abort();
++        }
++
++        std::lock_guard<std::mutex> command_lock(lowcmd->mutex_);
++        const uint32_t sequence = orsa_command_sequence(lowcmd->msg_);
++        const uint32_t expected = last_completed_sequence_ == UINT32_MAX
++            ? 1U : last_completed_sequence_ + 1U;
++
++        std::lock_guard<std::recursive_mutex> simulation_lock(
++            *lockstep_->simulation_mutex);
++        if(sequence == last_completed_sequence_) {
++            // Startup/reset snapshots keep DDS state available without
++            // advancing physics. Duplicate ticks are intentionally harmless.
++            publish_state(last_completed_sequence_);
++            return;
++        }
++        if(sequence == 0U || sequence != expected) {
++            if(sequence != last_rejected_sequence_) {
++                std::cerr << "ORSA strict lockstep rejected LowCmd sequence "
++                          << sequence << "; expected " << expected << std::endl;
++                last_rejected_sequence_ = sequence;
++            }
++            return;
++        }
++
++        for(int frame = 0; frame < ORSA_POLICY_PHYSICS_STEPS; ++frame) {
++            // Recompute PD torque from the current state before every 2 ms
++            // integration step while the full LowCmd remains frozen.
++            apply_current_command();
++            mj_step(mj_model_, mj_data_);
++            publish_state(sequence);
++        }
++        last_completed_sequence_ = sequence;
++        last_rejected_sequence_ = 0U;
+     }
+ 
+-    std::unique_ptr<HighState_t> highstate;
+-    std::unique_ptr<WirelessController_t> wireless_controller;
+-    std::shared_ptr<LowCmd_t> lowcmd;
+-    std::unique_ptr<LowState_t> lowstate;
+-    
+-private:
+     unitree::common::RecurrentThreadPtr thread_;
++    uint32_t last_completed_sequence_ = 0U;
++    uint32_t last_rejected_sequence_ = 0U;
+ };
+ 
+ using Go2Bridge = RobotBridge<unitree::robot::go2::subscription::LowCmd, unitree::robot::go2::publisher::LowState>;
+@@ -259,7 +367,9 @@ using Go2Bridge = RobotBridge<unitree::robot::go2::subscription::LowCmd, unitree
+ class G1Bridge : public RobotBridge<unitree::robot::g1::subscription::LowCmd, unitree::robot::g1::publisher::LowState>
+ {
+ public:
+-    G1Bridge(mjModel *model, mjData *data) : RobotBridge(model, data)
++    G1Bridge(
++        mjModel *model, mjData *data, OrsaStrictLockstepContext *lockstep)
++    : RobotBridge(model, data, lockstep)
+     {
+         if (param::config.robot.find("g1") != std::string::npos) {
+             auto* g1_lowstate = dynamic_cast<unitree::robot::g1::publisher::LowState*>(lowstate.get());

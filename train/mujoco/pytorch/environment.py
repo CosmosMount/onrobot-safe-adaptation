@@ -5,118 +5,32 @@ import logging
 import time
 
 import numpy as np
-from ml_collections import config_dict
 
 from sqrl.sac.environment import InvalidTransitionError
-from train.common.base import (
+from train.core.base import (
     ACTION_SIZE, ACTION_SPEC, CONTROL_DT, DEFAULT_JOINT_POSITION,
     Go2Environment, PHYSICS_DT,
     PHYSICS_STEPS_PER_ACTION, ActionMapper,
-    configure_environment_contract, format_policy_io_contract,
+    format_policy_io_contract,
     validate_environment_contract,
 )
-from train.common.estimation import (
-    VelocityEstimator, configure_velocity_estimator,
+from train.core.estimation import (
+    VelocityEstimator,
     foot_position_velocity_body, quaternion_rotation_matrix_wxyz,
     velocity_estimator_config_from,
 )
-from .sdk import MujocoResetController, SDKClient, StateBufferError, StateTimeout
-from train.common.task import (
-    EpisodeTracker, ObservationBuilder, compute_reward, local_base_clearance,
-    quaternion_to_rpy_wxyz,
+from train.core.task import (
+    EpisodeTracker, ObservationBuilder, build_observation, compute_reward,
+    local_base_clearance,
 )
 
-def get_config(environment_name):
-    config = config_dict.ConfigDict()
-    config.name = environment_name
-    config.seed = 0
-    config.nr_envs = 1
-    config.domain_id = 1
-    config.interface = "lo"
-    configure_velocity_estimator(config)
-    configure_environment_contract(config)
-    config.state_timeout = 1.0
-    config.manual_reset_timeout = -1.0
-    config.auto_reset_on_start = True
-    config.auto_reset_after_fall = True
-    config.fall_auto_reset_delay_seconds = 1.0
-    config.auto_reset_timeout_seconds = 10.0
-    # X11 synthetic key events can occasionally be dropped by the visible
-    # simulator window. Re-arm tick rollback detection and retry the shortcut
-    # instead of terminating a long online run on one missed event.
-    config.auto_reset_attempts = 3
-    config.mujoco_window_title = "MuJoCo"
-    # Two-stage linear stand-up copied from the proven Go2 controller in the
-    # reference repository: current pose -> folded/crouched keyframe -> home.
-    config.standup_pose_1 = [
-        0.0, 1.36, -2.65,
-        0.0, 1.36, -2.65,
-        -0.2, 1.36, -2.65,
-        0.2, 1.36, -2.65,
-    ]
-    config.standup_phase_1_seconds = 1.0
-    config.standup_phase_2_seconds = 1.0
-    config.standup_hold_seconds = 2.0
-    config.reset_sync_timeout_seconds = 3.0
-    config.reset_kp = 60.0
-    # Kd=5 drives the torque-clipped SDK bridge into a persistent limit cycle
-    # on this 2 ms MuJoCo model.  Kd=1 settles the same stand-up trajectory
-    # before policy takeover while keeping enough damping for foot impacts.
-    config.reset_kd = 1.0
-    # Stand-up completes before the first policy step, so no second blend is
-    # applied to the policy action.
-    config.policy_blend_seconds = 0.0
-    config.reset_joint_tolerance = 0.20
-    # Position alone can look ready while the legs are still oscillating.
-    config.reset_max_joint_velocity = 0.5
-    config.reset_min_base_height = 0.20
-    return config
+from .config import get_config
+from .client import SDKClient
+from .fall import FallDetector
+from .mjcf import validate_go2_mjcf_contract
+from .reset import MujocoResetController
+from .state import SIMULATOR_TICK_SECONDS, StateBufferError, StateTimeout
 
-class FallDetector:
-    def __init__(
-        self,
-        angle_threshold: float = 0.8,
-        consecutive_frames: int = 5,
-        min_base_clearance: float = 0.18,
-    ):
-        self.angle_threshold = float(angle_threshold)
-        self.consecutive_frames = int(consecutive_frames)
-        self.min_base_clearance = float(min_base_clearance)
-        self._count = 0
-        self._low_height_count = 0
-        self.last_tilt_failure = False
-        self.last_height_failure = False
-
-    def reset(self) -> None:
-        self._count = 0
-        self._low_height_count = 0
-        self.last_tilt_failure = False
-        self.last_height_failure = False
-
-    def update(self, quaternion) -> bool:
-        roll, pitch, _ = quaternion_to_rpy_wxyz(quaternion)
-        fallen = abs(roll) > self.angle_threshold or abs(pitch) > self.angle_threshold
-        self._count = self._count + 1 if fallen else 0
-        self.last_tilt_failure = self._count >= self.consecutive_frames
-        return self.last_tilt_failure
-
-    def update_base_clearance(self, clearance: float | None) -> bool:
-        if clearance is None or not np.isfinite(clearance):
-            self._low_height_count = 0
-            self.last_height_failure = False
-            return False
-        if float(clearance) < self.min_base_clearance:
-            self._low_height_count += 1
-        else:
-            self._low_height_count = 0
-        self.last_height_failure = (
-            self._low_height_count >= self.consecutive_frames
-        )
-        return self.last_height_failure
-
-    def is_stable(self, quaternion) -> bool:
-        roll, pitch, _ = quaternion_to_rpy_wxyz(quaternion)
-        return abs(roll) < 0.25 and abs(pitch) < 0.25
 
 logger = logging.getLogger("go2_sdk2_mujoco")
 
@@ -137,6 +51,12 @@ class Go2MujocoEnv(Go2Environment):
     ):
         environment = config.environment
         validate_environment_contract(environment)
+        if int(environment.nr_envs) != 1:
+            raise ValueError(
+                "The SDK2/MuJoCo bridge exposes exactly one robot; "
+                f"environment.nr_envs must be 1, got {environment.nr_envs}"
+            )
+        validate_go2_mjcf_contract()
         if int(environment.policy_frames) != PHYSICS_STEPS_PER_ACTION:
             raise ValueError(
                 "MuJoCo control windows must contain exactly "
@@ -153,9 +73,6 @@ class Go2MujocoEnv(Go2Environment):
             )
         super().__init__(config, 1)
         self.role = role
-        runner = getattr(config, "runner", None)
-        runner_mode = str(getattr(runner, "mode", "train"))
-        self._startup_reset_role = "eval" if runner_mode == "test" else "train"
         self.client = client or SDKClient(environment.domain_id, environment.interface)
         if reset_controller is None and isinstance(self.client, SDKClient):
             reset_controller = MujocoResetController(
@@ -179,13 +96,18 @@ class Go2MujocoEnv(Go2Environment):
         self._generation = 0
         self._last_observation: np.ndarray | None = None
         self._policy_blend_elapsed = 0.0
-        self._initial_simulator_reset_done = False
         logger.info(
             "\n" + format_policy_io_contract(environment.target_velocity_x)
         )
 
-    def _wait_window(self, count: int | None = None):
+    def _wait_window(
+        self,
+        count: int | None = None,
+        *,
+        expected_command_sequence: int | None = None,
+    ):
         count = int(count or self.config.policy_frames)
+        previous_tick = self._last_tick
         try:
             frames = self.client.state_buffer.wait_for_frames(
                 count=count,
@@ -195,8 +117,104 @@ class Go2MujocoEnv(Go2Environment):
             )
         except StateBufferError as exc:
             raise InvalidTransitionError(str(exc)) from exc
+        expected_tick_stride = int(round(PHYSICS_DT / SIMULATOR_TICK_SECONDS))
+        ticks = np.asarray([int(frame.tick) for frame in frames], dtype=np.int64)
+        if (
+            previous_tick is not None
+            and ticks.size > 0
+            and int(ticks[0]) != int(previous_tick) + expected_tick_stride
+        ):
+            raise InvalidTransitionError(
+                "MuJoCo LowState window is missing its first 2 ms physics frame: "
+                f"expected tick {int(previous_tick) + expected_tick_stride}, "
+                f"received {int(ticks[0])}"
+            )
+        if ticks.size > 1 and not np.all(np.diff(ticks) == expected_tick_stride):
+            raise InvalidTransitionError(
+                "MuJoCo LowState window is missing a 2 ms physics frame: "
+                f"received ticks {ticks.tolist()}"
+            )
+        if expected_command_sequence is not None:
+            sequences = [
+                getattr(frame, "command_sequence", None) for frame in frames
+            ]
+            if any(
+                sequence is None
+                or int(sequence) != int(expected_command_sequence)
+                for sequence in sequences
+            ):
+                raise InvalidTransitionError(
+                    "MuJoCo LowState window is not an acknowledged post-step "
+                    "window for the published LowCmd: expected sequence "
+                    f"{int(expected_command_sequence)}, received {sequences}. "
+                    "Run the bridge with ORSA_STRICT_LOCKSTEP=1 after applying "
+                    "assets/robots/go2/unitree_mujoco_bridge_lockstep.patch."
+                )
         self._last_tick = int(frames[-1].tick)
         return frames
+
+    def _assert_lockstep_boundary(self) -> None:
+        """Reject state evolution that the replay transition cannot represent."""
+
+        latest_tick = self.client.state_buffer.last_tick
+        if (
+            self._last_tick is not None
+            and latest_tick is not None
+            and int(latest_tick) != int(self._last_tick)
+        ):
+            raise InvalidTransitionError(
+                "MuJoCo advanced while the policy/learner was outside env.step: "
+                f"the policy observed tick {int(self._last_tick)}, but the "
+                f"bridge reached tick {int(latest_tick)} before LowCmd publish. "
+                "Strict replay semantics require the patched command-driven "
+                "bridge with ORSA_STRICT_LOCKSTEP=1."
+            )
+
+    def _training_states_for_frames(self, frames):
+        provider = getattr(self.client, "training_states_for_ticks", None)
+        if not callable(provider):
+            raise InvalidTransitionError(
+                "MuJoCo client cannot provide timestamp-synchronized base/root truth"
+            )
+        ticks = tuple(int(frame.tick) for frame in frames)
+        sequences = tuple(int(frame.command_sequence) for frame in frames)
+        try:
+            truth_frames = provider(
+                ticks,
+                command_sequences=sequences,
+                generation=self._generation,
+                timeout=float(self.config.state_timeout),
+            )
+        except StateBufferError as exc:
+            raise InvalidTransitionError(str(exc)) from exc
+        if len(truth_frames) != len(frames):
+            raise InvalidTransitionError(
+                "MuJoCo root truth count does not match the LowState window"
+            )
+        for tick, sequence, truth in zip(ticks, sequences, truth_frames):
+            if int(getattr(truth, "tick", -1)) != tick:
+                raise InvalidTransitionError(
+                    f"MuJoCo root truth tick {getattr(truth, 'tick', None)} "
+                    f"does not match LowState tick {tick}"
+                )
+            if int(getattr(truth, "command_sequence", -1)) != sequence:
+                raise InvalidTransitionError(
+                    "MuJoCo root truth command sequence "
+                    f"{getattr(truth, 'command_sequence', None)} does not match "
+                    f"LowState sequence {sequence} at tick {tick}"
+                )
+            position = np.asarray(truth.base_position, dtype=np.float64)
+            velocity = np.asarray(truth.world_velocity, dtype=np.float64)
+            if (
+                position.shape != (3,)
+                or velocity.shape != (3,)
+                or not np.all(np.isfinite(position))
+                or not np.all(np.isfinite(velocity))
+            ):
+                raise InvalidTransitionError(
+                    f"MuJoCo root truth at tick {tick} is incomplete or non-finite"
+                )
+        return truth_frames
 
     def _reset_pose_ready(self, state) -> bool:
         joint_error = np.max(
@@ -208,26 +226,54 @@ class Go2MujocoEnv(Go2Environment):
         max_joint_velocity = np.max(
             np.abs(np.asarray(state.joint_dq, dtype=np.float32))
         )
-        orientation_ready = self.fall_detector.is_stable(state.imu_quat)
+        reset_quaternion = np.asarray(state.imu_quat, dtype=np.float64)
+        reset_quaternion_norm = float(np.linalg.norm(reset_quaternion))
+        orientation_ready = False
+        if np.isfinite(reset_quaternion_norm) and reset_quaternion_norm > 1.0e-8:
+            identity_angle = 2.0 * np.arccos(
+                np.clip(
+                    abs(float(reset_quaternion[0])) / reset_quaternion_norm,
+                    0.0,
+                    1.0,
+                )
+            )
+            orientation_ready = identity_angle <= float(
+                self.config.reset_angle_tolerance
+            )
         joints_ready = joint_error <= float(self.config.reset_joint_tolerance)
         joints_still = max_joint_velocity <= float(
             self.config.reset_max_joint_velocity
         )
 
-        # Roll and pitch alone cannot distinguish a standing robot from one
-        # lying flat on its belly.  The simulator-only high-state topic exposes
-        # base height without leaking it into the policy observation.
-        height_ready = True
-        latest_training_state = getattr(self.client, "latest_training_state", None)
-        truth = latest_training_state() if callable(latest_training_state) else None
-        if truth is not None and truth.base_position is not None:
-            position = np.asarray(truth.base_position, dtype=np.float32)
-            height_ready = (
-                position.size >= 3
-                and np.isfinite(position[2])
-                and float(position[2]) >= float(self.config.reset_min_base_height)
+        truth = self._training_states_for_frames([state])[0]
+        position = np.asarray(truth.base_position, dtype=np.float32)
+        height_ready = abs(
+            float(position[2]) - float(self.config.reset_base_height)
+        ) <= float(self.config.reset_base_height_tolerance)
+        rotation = quaternion_rotation_matrix_wxyz(state.imu_quat)
+        foot_position_body, _ = foot_position_velocity_body(
+            state.joint_q, state.joint_dq
+        )
+        foot_position_world = (
+            position.astype(np.float64, copy=False)[None, :]
+            + (rotation @ foot_position_body.T).T
+        )
+        foot_surface_height = (
+            foot_position_world[:, 2] - float(self.config.foot_collision_radius)
+        )
+        feet_on_ground = bool(
+            np.all(
+                np.abs(foot_surface_height)
+                <= float(self.config.reset_foot_surface_tolerance)
             )
-        return orientation_ready and joints_ready and joints_still and height_ready
+        )
+        return (
+            orientation_ready
+            and joints_ready
+            and joints_still
+            and height_ready
+            and feet_on_ground
+        )
 
     def _duration_steps(self, seconds: float) -> int:
         period = float(self.config.policy_period_seconds)
@@ -236,17 +282,22 @@ class Go2MujocoEnv(Go2Environment):
         return max(0, int(np.ceil(float(seconds) / period)))
 
     def _publish_and_wait(self, target: np.ndarray):
-        self._last_tick = self.client.state_buffer.last_tick
+        self._assert_lockstep_boundary()
         target = np.asarray(target, dtype=np.float32)
         if isinstance(self.client, SDKClient):
-            self.client.publish_joint_target(
+            command_sequence = self.client.publish_joint_target(
                 target,
                 kp=float(self.config.reset_kp),
                 kd=float(self.config.reset_kd),
             )
         else:
             self.client.publish_joint_target(target)
-        return self._wait_window()[-1]
+            command_sequence = None
+        if command_sequence is None:
+            return self._wait_window()[-1]
+        return self._wait_window(
+            expected_command_sequence=command_sequence
+        )[-1]
 
     def _wait_for_simulator_restart(self, reason: str) -> None:
         logger.warning(
@@ -254,13 +305,21 @@ class Go2MujocoEnv(Go2Environment):
         )
         timeout = float(self.config.manual_reset_timeout)
         timeout = None if timeout < 0 else timeout
-        self.client.state_buffer.arm_restart()
+        arm_restart = getattr(self.client, "arm_simulator_restart", None)
+        if callable(arm_restart):
+            arm_restart()
+        else:
+            self.client.state_buffer.arm_restart()
         try:
             self._generation = self.client.state_buffer.wait_for_restart(
                 self._generation, timeout=timeout
             )
         except Exception:
-            self.client.state_buffer.cancel_restart()
+            cancel_restart = getattr(self.client, "cancel_simulator_restart", None)
+            if callable(cancel_restart):
+                cancel_restart()
+            else:
+                self.client.state_buffer.cancel_restart()
             raise
         self._last_tick = None
         self.fall_detector.reset()
@@ -277,14 +336,16 @@ class Go2MujocoEnv(Go2Environment):
         else:
             logger.info(f"{reason} Automatically resetting MuJoCo.")
 
-        # Arm the SDK bridge before resetting physics.  LowCmd is retained by
-        # unitree_mujoco while mjData is reset, so the very first post-reset
-        # step already holds the same home pose as the MJCF keyframe.
+        # Arm the SDK bridge before resetting physics. LowCmd is retained by
+        # unitree_mujoco while mjData is reset. The bundled MJCF makes ordinary
+        # qpos0 identical to the canonical home pose, so named-key reset support
+        # is neither assumed nor required.
         if isinstance(self.client, SDKClient):
-            self.client.publish_joint_target(
+            # Complete and acknowledge the final command transaction before
+            # arming rollback detection. Otherwise reset could race the DDS
+            # subscriber and make sequence N integrate after mj_resetData.
+            self._publish_and_wait(
                 DEFAULT_JOINT_POSITION,
-                kp=float(self.config.reset_kp),
-                kd=float(self.config.reset_kd),
             )
         else:
             self.client.publish_joint_target(DEFAULT_JOINT_POSITION)
@@ -293,7 +354,11 @@ class Go2MujocoEnv(Go2Environment):
         last_timeout = None
         for attempt in range(1, attempts + 1):
             generation = self.client.state_buffer.generation
-            self.client.state_buffer.arm_restart()
+            arm_restart = getattr(self.client, "arm_simulator_restart", None)
+            if callable(arm_restart):
+                arm_restart()
+            else:
+                self.client.state_buffer.arm_restart()
             self.reset_controller.reset()
             try:
                 self._generation = self.client.state_buffer.wait_for_restart(
@@ -303,7 +368,13 @@ class Go2MujocoEnv(Go2Environment):
                 break
             except StateTimeout as exc:
                 last_timeout = exc
-                self.client.state_buffer.cancel_restart()
+                cancel_restart = getattr(
+                    self.client, "cancel_simulator_restart", None
+                )
+                if callable(cancel_restart):
+                    cancel_restart()
+                else:
+                    self.client.state_buffer.cancel_restart()
                 if attempt < attempts:
                     logger.warning(
                         "MuJoCo automatic reset attempt %d/%d produced no tick "
@@ -329,31 +400,21 @@ class Go2MujocoEnv(Go2Environment):
         return state
 
     def _hold_reset_pose(self, initial_state):
-        """Hold an exact home reset, with interpolation as a recovery fallback."""
+        """Verify an exact ordinary reset, with interpolation only as fallback."""
 
         state = initial_state
-        # A patched unitree_mujoco reset loads the named home keyframe.  Keep
-        # commanding it while DDS settles.  Once home is observed, retain the
-        # normal hold period so gravity/foot-contact transients finish before
-        # the first policy observation is built.
-        home_ready = False
+        # A normal reset now loads canonical qpos0. Return the first verified
+        # feedback frame so reset observations have the same instantaneous
+        # semantics as Isaac rather than a state evolved through a 2 s hold.
         for _ in range(
             max(1, self._duration_steps(self.config.reset_sync_timeout_seconds))
         ):
             if self._reset_pose_ready(state):
-                home_ready = True
-                break
-            state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
-        if self._reset_pose_ready(state):
-            home_ready = True
-        if home_ready:
-            for _ in range(self._duration_steps(self.config.standup_hold_seconds)):
-                state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
-            if self._reset_pose_ready(state):
                 return state
+            state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
 
-        # Compatibility fallback for a simulator reset that did not load the
-        # home keyframe (or for recovery from a genuinely fallen state).
+        # Recovery fallback for an external simulator that was not reset or a
+        # genuinely fallen state. Readiness is measured, never assumed.
         while True:
             pose_1 = np.asarray(self.config.standup_pose_1, dtype=np.float32)
             state = self._interpolate_reset_pose(
@@ -368,9 +429,6 @@ class Go2MujocoEnv(Go2Environment):
                 DEFAULT_JOINT_POSITION,
                 self.config.standup_phase_2_seconds,
             )
-            for _ in range(self._duration_steps(self.config.standup_hold_seconds)):
-                state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
-
             for _ in range(
                 self._duration_steps(self.config.reset_sync_timeout_seconds)
             ):
@@ -387,23 +445,7 @@ class Go2MujocoEnv(Go2Environment):
             if state is None:
                 state = self._wait_window(count=1)[-1]
 
-    def reset(self, *, seed=None, options=None):
-        del seed, options
-        self.client.start()
-        self._generation = self.client.state_buffer.generation
-        if (
-            self.role == self._startup_reset_role
-            and bool(self.config.auto_reset_on_start)
-            and self.reset_controller is not None
-            and not self._initial_simulator_reset_done
-        ):
-            # Observe a pre-reset tick first so StateBuffer can recognize the
-            # simulator tick rollback caused by Backspace.
-            self._last_tick = self.client.state_buffer.last_tick
-            if self._last_tick is None:
-                self._wait_window(count=1)
-            self._auto_reset_simulator("Initial policy startup.")
-            self._initial_simulator_reset_done = True
+    def _finish_physical_reset(self):
         self.action_mapper.reset()
         self.observation_builder.reset()
         self.fall_detector.reset()
@@ -418,28 +460,61 @@ class Go2MujocoEnv(Go2Environment):
         else:
             self._last_tick = int(state.tick)
         state = self._hold_reset_pose(state)
-        observation, _ = self.observation_builder.build(state)
+        # Reset observations use the estimator prior, exactly as Isaac: the
+        # first feedback sample establishes quaternion continuity but does not
+        # integrate a backend-specific extra 2 ms acceleration update.
+        observation, quaternion = build_observation(
+            state,
+            np.zeros(3, dtype=np.float32),
+            self.observation_builder.previous_q_target,
+        )
+        self.observation_builder.previous_quaternion = quaternion
         self._last_observation = observation
         return observation[None, :], {}
 
-    def _manual_failure_reset(self):
-        if bool(self.config.auto_reset_after_fall):
+    def _physical_episode_reset(
+        self,
+        reason: str,
+        delay_seconds: float = 0.0,
+        *,
+        automatic: bool = True,
+    ):
+        if automatic and self.reset_controller is not None:
             self._auto_reset_simulator(
-                "Go2 fall detected.",
-                delay_seconds=float(self.config.fall_auto_reset_delay_seconds),
+                reason,
+                delay_seconds=delay_seconds,
             )
         else:
-            self._wait_for_simulator_restart("Go2 fall detected.")
-        return self.reset()[0][0]
+            self._wait_for_simulator_restart(reason)
+        return self._finish_physical_reset()[0][0]
 
-    def _logical_reset(self, observation):
-        """Reset accounting without integrating the final physics frame twice."""
+    def reset(self, *, seed=None, options=None):
+        del seed, options
+        self.client.start()
+        self._generation = self.client.state_buffer.generation
+        # Observe a pre-reset tick so StateBuffer can recognize the rollback
+        # caused by ordinary MuJoCo reset. This is done for train and eval alike.
+        self._last_tick = self.client.state_buffer.last_tick
+        if self._last_tick is None:
+            self._wait_window(count=1)
+        if bool(self.config.auto_reset_on_start) and self.reset_controller is not None:
+            self._auto_reset_simulator("Policy environment reset.")
+        else:
+            self._wait_for_simulator_restart("Policy environment reset requested.")
+        return self._finish_physical_reset()
 
-        self.episode.reset()
-        return np.asarray(observation, dtype=np.float32).copy()
+    def _manual_failure_reset(self):
+        automatic = bool(self.config.auto_reset_after_fall)
+        delay = float(self.config.fall_auto_reset_delay_seconds) if automatic else 0.0
+        return self._physical_episode_reset(
+            "Go2 fall detected.",
+            delay,
+            automatic=automatic,
+        )
 
     def step(self, actions):
         action = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_SIZE)[0]
+        self._assert_lockstep_boundary()
         blend_seconds = float(self.config.policy_blend_seconds)
         if blend_seconds <= 0.0:
             alpha = 1.0
@@ -458,37 +533,49 @@ class Go2MujocoEnv(Go2Environment):
             dtype=np.float32,
         )
         mapped = self.action_mapper.apply(blended_action)
-        # Learner updates can take longer than one control interval while the C++
-        # simulator continues publishing LowState.  Discard that backlog by
-        # anchoring the next ten-frame window at the latest pre-command tick.
-        self._last_tick = self.client.state_buffer.last_tick
         if isinstance(self.client, SDKClient):
-            self.client.publish_joint_target(
+            command_sequence = self.client.publish_joint_target(
                 mapped.q_target,
                 kp=float(self.config.policy_kp),
                 kd=float(self.config.policy_kd),
             )
         else:
             self.client.publish_joint_target(mapped.q_target)
+            command_sequence = None
+        if command_sequence is None:
+            frames = self._wait_window()
+        else:
+            frames = self._wait_window(
+                expected_command_sequence=command_sequence
+            )
+        # Only an acknowledged complete action window may become the previous
+        # target exposed in the next observation.
         self.observation_builder.set_previous_q_target(mapped.q_target)
-        frames = self._wait_window()
+        truth_frames = self._training_states_for_frames(frames)
 
         failure = False
         tilt_failure = False
-        for frame in frames:
+        height_failure = False
+        for frame, frame_truth in zip(frames, truth_frames):
+            frame_clearance = float(
+                local_base_clearance(
+                    np.asarray(frame_truth.base_position, dtype=np.float64)[2],
+                    0.0,
+                )
+            )
             frame_tilt_failure = self.fall_detector.update(frame.imu_quat)
+            frame_height_failure = self.fall_detector.update_base_clearance(
+                frame_clearance
+            )
             tilt_failure = frame_tilt_failure or tilt_failure
-            failure = frame_tilt_failure or failure
+            height_failure = frame_height_failure or height_failure
+            failure = frame_tilt_failure or frame_height_failure or failure
         final_state = frames[-1]
+        truth = truth_frames[-1]
         observation, estimated_body_velocity = self.observation_builder.build_many(
             frames
         )
 
-        truth = self.client.latest_training_state()
-        if truth is None or truth.base_position is None:
-            raise InvalidTransitionError(
-                "MuJoCo reward requires synchronized trunk velocity and position"
-            )
         if final_state.actuator_torque is None:
             raise InvalidTransitionError("MuJoCo reward requires joint torque feedback")
         world_velocity = np.asarray(truth.world_velocity)
@@ -499,8 +586,6 @@ class Go2MujocoEnv(Go2Environment):
         base_clearance = float(
             local_base_clearance(np.asarray(truth.base_position)[2], 0.0)
         )
-        height_failure = self.fall_detector.update_base_clearance(base_clearance)
-        failure = height_failure or failure
         foot_position_body, _ = foot_position_velocity_body(
             final_state.joint_q, final_state.joint_dq
         )
@@ -610,7 +695,9 @@ class Go2MujocoEnv(Go2Environment):
             if terminated:
                 observation = self._manual_failure_reset()
             else:
-                observation = self._logical_reset(observation)
+                observation = self._physical_episode_reset(
+                    "Episode time limit reached."
+                )
             info["episode_return"] = np.asarray(
                 [terminal_info["episode_return"]], dtype=np.float32
             )

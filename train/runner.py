@@ -8,6 +8,38 @@ from xml.etree import ElementTree
 from train.config import DEFAULT_MUJOCO_SCENE, PROJECT_ROOT
 
 
+SUPPORTED_ALGORITHMS = frozenset({"sqrl_sac"})
+SUPPORTED_ENVIRONMENTS = frozenset({"go2"})
+
+
+def _validate_experiment_config(raw_config, command):
+    """Validate selectors that used to be silently ignored by the runner."""
+
+    experiment = raw_config.get("experiment", {})
+    if not isinstance(experiment, dict):
+        raise ValueError("configuration experiment section must be a mapping")
+    unknown = set(experiment) - {"algorithm", "environment"}
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(
+            f"unsupported experiment keys: {names}; the CLI command selects the phase"
+        )
+
+    algorithm_name = str(experiment.get("algorithm", "sqrl_sac")).strip().lower()
+    if algorithm_name not in SUPPORTED_ALGORITHMS:
+        supported = ", ".join(sorted(SUPPORTED_ALGORITHMS))
+        raise ValueError(
+            f"unsupported experiment.algorithm={algorithm_name!r}; supported: {supported}"
+        )
+    environment_name = str(experiment.get("environment", "go2")).strip().lower()
+    if environment_name not in SUPPORTED_ENVIRONMENTS:
+        supported = ", ".join(sorted(SUPPORTED_ENVIRONMENTS))
+        raise ValueError(
+            f"unsupported experiment.environment={environment_name!r}; supported: {supported}"
+        )
+    return algorithm_name, "test" if command in ("zero-shot", "eval") else "train"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="SQRL reproduction with local Go2 environments")
     parser.add_argument("command", choices=("sim", "pretrain", "zero-shot", "finetune", "eval", "show-config"))
@@ -50,7 +82,17 @@ def main(argv=None):
         scene = Path(args.scene).expanduser().resolve()
         if not scene.is_file():
             raise FileNotFoundError(f"MuJoCo scene not found: {scene}")
+        canonical_scene = DEFAULT_MUJOCO_SCENE.resolve()
+        if scene != canonical_scene:
+            raise ValueError(
+                "Strict SQRL transfer only supports the validated canonical "
+                f"MuJoCo scene {canonical_scene}; got {scene}"
+            )
+        from train.mujoco.pytorch.sdk import validate_go2_mjcf_contract
+
+        validate_go2_mjcf_contract(scene)
         environment = os.environ.copy()
+        environment["ORSA_STRICT_LOCKSTEP"] = "1"
         library_root = simulate_root / "mujoco" / "lib"
         environment["LD_LIBRARY_PATH"] = str(library_root) + (
             f":{environment['LD_LIBRARY_PATH']}" if environment.get("LD_LIBRARY_PATH") else ""
@@ -83,8 +125,14 @@ def main(argv=None):
             raw_config = yaml.safe_load(config_file) or {}
         if not isinstance(raw_config, dict):
             raise ValueError("configuration root must be a mapping")
+    unknown_sections = set(raw_config) - {"experiment", "algorithm", "environment", "runner"}
+    if unknown_sections:
+        names = ", ".join(sorted(unknown_sections))
+        raise ValueError(f"unsupported configuration sections: {names}")
+    algorithm_name, runner_mode = _validate_experiment_config(raw_config, args.command)
 
     algorithm = {
+        "name": algorithm_name,
         "device": "gpu",
         "compile_mode": "reduce-overhead",
         "bf16_mixed_precision_training": False,
@@ -99,7 +147,7 @@ def main(argv=None):
         "safety_buffer_size": 100_000,
         "batch_size": 256,
         "safety_batch_size": 256,
-        "learning_starts": 0,
+        "learning_starts": 5_000,
         "n_pre": 500_000,
         "n_target": 500_000,
         "task_utd_ratio": 1.0,
@@ -111,6 +159,7 @@ def main(argv=None):
         "max_safe_action_samples": 100,
         "max_safety_trajectories": int(environment.get("nr_safety_envs", 1)),
         "k": int(environment.get("nr_safety_envs", 1)),
+        "n_off": 1,
         "target_entropy": "auto",
         "log_std_min": -20,
         "log_std_max": 2,
@@ -118,7 +167,11 @@ def main(argv=None):
         "initial_nu": 0.0,
         "logging_frequency": 50_000,
     }
-    runner = {"output_dir": f"runs/sqrl/{args.command}", "evaluation_episodes": 5}
+    runner = {
+        "output_dir": f"runs/sqrl/{args.command}",
+        "evaluation_episodes": 5,
+        "mode": runner_mode,
+    }
 
     def merge(target, updates):
         for key, value in updates.items():
@@ -130,12 +183,25 @@ def main(argv=None):
     merge(algorithm, raw_config.get("algorithm", {}))
     merge(environment, raw_config.get("environment", {}))
     merge(runner, raw_config.get("runner", {}))
+    configured_mode = str(runner.get("mode", runner_mode)).strip().lower()
+    if configured_mode != runner_mode:
+        raise ValueError(
+            f"runner.mode={configured_mode!r} conflicts with command {args.command!r}; "
+            f"expected {runner_mode!r}"
+        )
+    runner["mode"] = runner_mode
+    configured_algorithm = str(algorithm.get("name", algorithm_name)).strip().lower()
+    if configured_algorithm != algorithm_name:
+        raise ValueError(
+            "algorithm.name and experiment.algorithm must select the same implementation"
+        )
+    algorithm["name"] = algorithm_name
     if "k" not in raw_config.get("algorithm", {}):
         algorithm["k"] = int(environment.get("nr_safety_envs", 1))
     if "max_safety_trajectories" not in raw_config.get("algorithm", {}):
         algorithm["max_safety_trajectories"] = int(algorithm["k"])
     config = config_dict.ConfigDict({"algorithm": algorithm, "environment": environment, "runner": runner})
-    from train.common.base import validate_environment_contract
+    from train.core.base import validate_environment_contract
 
     validate_environment_contract(config.environment)
     if args.command == "show-config":
@@ -180,35 +246,35 @@ def main(argv=None):
                 anim_recording_stop_time=config.environment.anim_recording_stop_time,
             )
             app = AppLauncher(launcher).app
+            from sqrl.sac.pytorch.workflow import SQRLWorkflow
             from train.isaac.pytorch.environment import Go2IsaacEnv
-            from train.isaac.pytorch.training import IsaacTraining
 
             train_env = Go2IsaacEnv(config)
-            training = IsaacTraining(config, train_env, device)
-            training.pretrain()
+            workflow = SQRLWorkflow(config, train_env, device)
+            workflow.pretrain()
             checkpoint = Path(config.runner.output_dir) / "final.model"
-            training.save(str(checkpoint), "pretrain")
+            workflow.save(str(checkpoint), "pretrain")
             logging.getLogger("sqrl_runner").info("saved pretrain checkpoint: %s", checkpoint)
         else:
             if not args.checkpoint or not Path(args.checkpoint).is_file():
                 raise FileNotFoundError("zero-shot, finetune and eval require --checkpoint <model>")
+            from sqrl.sac.pytorch.workflow import SQRLWorkflow
             from train.mujoco.pytorch.environment import Go2MujocoEnv
-            from train.mujoco.pytorch.training import MujocoTraining
 
             train_env, eval_env = Go2MujocoEnv.create_pair(config)
             env = eval_env if args.command in ("zero-shot", "eval") else train_env
-            training = MujocoTraining(config, env, device)
-            checkpoint_phase = training.load(args.checkpoint, transfer=args.command in ("zero-shot", "finetune"))
+            workflow = SQRLWorkflow(config, env, device)
+            checkpoint_phase = workflow.load(args.checkpoint, transfer=args.command in ("zero-shot", "finetune"))
             expected_phase = "finetune" if args.command == "eval" else "pretrain"
             if checkpoint_phase != expected_phase:
                 raise ValueError(f"{args.command} requires a {expected_phase} checkpoint, got {checkpoint_phase}")
             if args.command == "finetune":
-                training.finetune()
+                workflow.finetune()
                 checkpoint = Path(config.runner.output_dir) / "final.model"
-                training.save(str(checkpoint), "finetune")
+                workflow.save(str(checkpoint), "finetune")
                 logging.getLogger("sqrl_runner").info("saved finetune checkpoint: %s", checkpoint)
             else:
-                training.evaluate(config.runner.evaluation_episodes)
+                workflow.evaluate(config.runner.evaluation_episodes)
     finally:
         if train_env is not None:
             train_env.close()

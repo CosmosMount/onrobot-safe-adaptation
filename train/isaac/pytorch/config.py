@@ -1,9 +1,9 @@
 """Dependency-light Isaac configuration; safe to import before AppLauncher."""
 
-from train.common.base import configure_environment_contract
-from train.common.estimation import configure_velocity_estimator
-
 from ml_collections import config_dict
+
+from train.core.base import configure_environment_contract
+from train.core.estimation import configure_velocity_estimator
 
 
 def get_config(environment_name):
@@ -31,6 +31,14 @@ def get_config(environment_name):
     config.playback_terrain_level = -1
     config.viewer_follow_robot = False
     config.render = False
+    # Deterministic-reset contract checks.  They are evaluated after physical
+    # resets when domain randomization is disabled; randomized resets are
+    # intentionally exempt from exact-pose validation.
+    config.reset_joint_validation_tolerance = 1.0e-3
+    config.reset_base_height_validation_tolerance = 2.0e-3
+    config.reset_orientation_validation_tolerance = 1.0e-3
+    config.reset_foot_surface_validation_tolerance = 3.0e-3
+    config.foot_collision_radius = 0.022
 
     # AppLauncher-compatible defaults consumed by the local runner.
     config.disable_fabric = False

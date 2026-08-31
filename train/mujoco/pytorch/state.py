@@ -1,14 +1,6 @@
-"""Public MuJoCo SDK bridge API.
+"""Public synchronized-state API for the MuJoCo bridge."""
 
-Implementation is grouped by responsibility in state, client, mjcf, and reset.
-This module keeps the stable import surface used by callers.
-"""
-
-from .client import SDKClient
-from .mjcf import DEFAULT_GO2_SCENE, SDK_MOTOR_ORDER, validate_go2_mjcf_contract
-from .reset import MujocoResetController
-from .state import (
-    SIMULATOR_TICK_SECONDS,
+from .buffers import (
     FrameOrderError,
     SimulatorRestarted,
     StateBuffer,
@@ -17,6 +9,12 @@ from .state import (
     SynchronizedTrainingState,
     TrainingStateBuffer,
     TrainingStateSyncError,
+)
+from .messages import (
+    SIMULATOR_TICK_SECONDS,
+    TOPIC_HIGHSTATE,
+    TOPIC_LOWCMD,
+    TOPIC_LOWSTATE,
     decode_low_state,
     decode_simulator_tick,
     decode_training_state,
@@ -24,12 +22,11 @@ from .state import (
 )
 
 __all__ = [
-    "DEFAULT_GO2_SCENE",
     "SIMULATOR_TICK_SECONDS",
-    "SDKClient",
-    "SDK_MOTOR_ORDER",
+    "TOPIC_HIGHSTATE",
+    "TOPIC_LOWCMD",
+    "TOPIC_LOWSTATE",
     "FrameOrderError",
-    "MujocoResetController",
     "SimulatorRestarted",
     "StateBuffer",
     "StateBufferError",
@@ -40,6 +37,6 @@ __all__ = [
     "decode_low_state",
     "decode_simulator_tick",
     "decode_training_state",
-    "validate_go2_mjcf_contract",
     "validate_low_state_crc",
 ]
+

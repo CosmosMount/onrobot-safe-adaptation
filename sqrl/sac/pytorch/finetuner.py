@@ -1,3 +1,5 @@
+"""Target-domain SQRL fine-tuning."""
+
 import logging
 
 import numpy as np
@@ -8,7 +10,9 @@ from torch.amp import autocast
 
 from algorithms.sac.pytorch.critic import get_critic as get_task_critic
 from algorithms.sac.pytorch.entropy_coefficient import get_entropy_coefficient
-from sqrl.sac.pytorch.replay_buffer import ReplayBuffer
+from sqrl.sac.environment import resolve_executed_actions
+from sqrl.sac.pytorch.replay_buffer import ReplayBuffer, newly_eligible_transitions
+from sqrl.sac.pytorch.safety_ops import sample_safe_actions
 
 
 sqrl_finetune_logger = logging.getLogger("sqrl_finetune")
@@ -24,12 +28,20 @@ class SQRLFinetuner:
         self.device = torch.device(device)
 
         self.seed = int(config.environment.seed)
-        self.nr_envs = int(config.environment.nr_envs)
+        configured_nr_envs = int(config.environment.nr_envs)
+        self.nr_envs = int(
+            getattr(
+                target_env,
+                "num_envs",
+                getattr(target_env, "nr_envs", configured_nr_envs),
+            )
+        )
         self.bf16_mixed_precision_training = bool(config.algorithm.bf16_mixed_precision_training)
         self.gamma = float(config.algorithm.gamma)
         self.tau = float(config.algorithm.tau)
         self.batch_size = int(config.algorithm.batch_size)
         self.nr_target_steps = int(config.algorithm.get("n_target", config.algorithm.get("total_timesteps", 500_000)))
+        self.learning_starts = int(config.algorithm.get("learning_starts", 0))
         self.task_utd_ratio = float(config.algorithm.get("task_utd_ratio", 1.0))
         self.epsilon_safe = float(config.algorithm.get("epsilon_safe", 0.1))
         self.nr_action_candidates = int(config.algorithm.get("max_safe_action_samples", 100))
@@ -38,6 +50,8 @@ class SQRLFinetuner:
 
         if self.nr_target_steps < 1:
             raise ValueError("n_target must be at least 1")
+        if self.learning_starts < 0:
+            raise ValueError("learning_starts must be non-negative")
         if self.nr_action_candidates < 1:
             raise ValueError("max_safe_action_samples must be at least 1")
         if not np.isfinite(self.task_utd_ratio) or self.task_utd_ratio < 0.0:
@@ -88,26 +102,18 @@ class SQRLFinetuner:
                 device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training
             ):
                 state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-                candidate_states = state[:, None, :].expand(-1, self.nr_action_candidates, -1)
-                flat_states = candidate_states.reshape(self.nr_envs * self.nr_action_candidates, -1)
-                actions, processed_actions, log_probs = self.policy.get_action(flat_states)
-                actions = actions.reshape((self.nr_envs, self.nr_action_candidates) + self.target_env.single_action_space.shape)
-                processed_actions = processed_actions.reshape_as(actions)
-                log_probs = log_probs.reshape(self.nr_envs, self.nr_action_candidates)
-                safe_q = self.qsafe(flat_states, actions.reshape(self.nr_envs * self.nr_action_candidates, -1))
-                safe_q = safe_q.reshape(self.nr_envs, self.nr_action_candidates)
-                # Eq. 3: sample from the task policy restricted to QSafe < epsilon.
-                safe_mask = safe_q < self.epsilon_safe
-                fallback = ~safe_mask.any(dim=1)
-                masked_logits = torch.where(safe_mask, log_probs, torch.full_like(log_probs, -torch.inf))
-                masked_logits = torch.where(fallback[:, None], torch.zeros_like(masked_logits), masked_logits)
-                selected = torch.distributions.Categorical(logits=masked_logits).sample()
-                selected = torch.where(fallback, safe_q.argmin(dim=1), selected)
-                indices = torch.arange(self.nr_envs, device=self.device)
+                actions, processed_actions, safe_q, fallback = sample_safe_actions(
+                    state,
+                    self.policy,
+                    self.qsafe,
+                    self.nr_action_candidates,
+                    self.epsilon_safe,
+                    selection="uniform",
+                )
             return (
-                actions[indices, selected].float().cpu().numpy(),
-                processed_actions[indices, selected].float().cpu().numpy(),
-                safe_q[indices, selected].float().cpu().numpy(),
+                actions.float().cpu().numpy(),
+                processed_actions.float().cpu().numpy(),
+                safe_q.float().cpu().numpy(),
                 fallback.cpu().numpy(),
             )
 
@@ -223,13 +229,24 @@ class SQRLFinetuner:
             actions, processed_actions, selected_safe_q, fallback = sample_actions(self.state)
             next_state, rewards, terminations, truncations, info = self.target_env.step(processed_actions)
             actual_next_state, terminations, failures = process_step(next_state, terminations, truncations, info)
+            executed_actions = resolve_executed_actions(
+                info,
+                actions,
+                self.nr_envs,
+                self.target_env.single_action_space.shape,
+            )
             self.replay_buffer.add(
-                np.asarray(self.state, dtype=np.float32), actual_next_state, actions,
+                np.asarray(self.state, dtype=np.float32), actual_next_state, executed_actions,
                 np.asarray(rewards, dtype=np.float32), terminations.astype(np.float32), failures
             )
             self.state = next_state
+            previous_steps = self.target_steps
             self.target_steps += self.nr_envs
-            self.task_update_credit += self.nr_envs * self.task_utd_ratio
+            self.task_update_credit += newly_eligible_transitions(
+                previous_steps,
+                self.target_steps,
+                self.learning_starts,
+            ) * self.task_utd_ratio
             nr_updates = int(np.floor(self.task_update_credit + 1e-12))
             self.task_update_credit -= nr_updates
             metrics = None

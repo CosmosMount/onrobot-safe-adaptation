@@ -2,7 +2,24 @@ import numpy as np
 import torch
 
 
-class ReplayBuffer():
+def newly_eligible_transitions(previous_steps, current_steps, learning_starts):
+    """Count replay transitions that became trainable after warm-up."""
+
+    previous_steps = int(previous_steps)
+    current_steps = int(current_steps)
+    learning_starts = int(learning_starts)
+    if previous_steps < 0 or current_steps < previous_steps:
+        raise ValueError(
+            "step counters must satisfy 0 <= previous_steps <= current_steps"
+        )
+    if learning_starts < 0:
+        raise ValueError("learning_starts must be non-negative")
+    return max(0, current_steps - learning_starts) - max(
+        0, previous_steps - learning_starts
+    )
+
+
+class ReplayBuffer:
     def __init__(self, capacity, nr_envs, os_shape, as_shape, rng, device):
         self.os_shape = os_shape
         self.as_shape = as_shape
@@ -41,5 +58,3 @@ class ReplayBuffer():
         terminations = torch.tensor(self.terminations[idx1, idx2], dtype=torch.float32).to(self.device).reshape((nr_samples,))
         failures = torch.tensor(self.failures[idx1, idx2], dtype=torch.float32).to(self.device).reshape((nr_samples,))
         return states, next_states, actions, rewards, terminations, failures
-
-
