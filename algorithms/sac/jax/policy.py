@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from rlx.types import ActionSpaceType, ObservationSpaceType
+from algorithms.types import ActionSpaceType, ObservationSpaceType
 
 def get_processed_action_function(env_as_low, env_as_high):
     def get_clipped_and_scaled_action(action, env_as_low=env_as_low, env_as_high=env_as_high):
@@ -15,7 +15,11 @@ def get_processed_action_function(env_as_low, env_as_high):
 def get_policy(config, env):
     action_space_type = env.general_properties.action_space_type
     observation_space_type = env.general_properties.observation_space_type
-    policy_observation_indices = getattr(env, "policy_observation_indices", jnp.arange(env.single_observation_space.shape[0]))
+    policy_observation_indices = getattr(
+        env.general_properties,
+        "policy_observation_indices",
+        jnp.arange(env.general_properties.observation_space_shape[0]),
+    )
 
     if action_space_type == ActionSpaceType.CONTINUOUS and observation_space_type == ObservationSpaceType.FLAT_VALUES:
         return (Policy(env.single_action_space.shape, config.algorithm.log_std_min, config.algorithm.log_std_max, config.algorithm.nr_hidden_units, policy_observation_indices),
@@ -32,13 +36,13 @@ class Policy(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = x[..., self.policy_observation_indices]
-        x = nn.Dense(self.nr_hidden_units)(x)
+        x = nn.Dense(self.nr_hidden_units, name="Dense_0")(x)
         x = nn.relu(x)
-        x = nn.Dense(self.nr_hidden_units)(x)
+        x = nn.Dense(self.nr_hidden_units, name="Dense_1")(x)
         x = nn.relu(x)
 
-        mean = nn.Dense(np.prod(self.as_shape).item())(x)
-        log_std = nn.Dense(np.prod(self.as_shape).item())(x)
+        mean = nn.Dense(np.prod(self.as_shape).item(), name="Mean")(x)
+        log_std = nn.Dense(np.prod(self.as_shape).item(), name="LogStd")(x)
         log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
 
         return mean, log_std

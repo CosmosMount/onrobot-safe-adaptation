@@ -110,7 +110,16 @@ class SQRLPretrainer:
     def safe_critic(self):
         return self.safety.critic
 
-    def train(self):
+    def train(self, checkpoint_frequency=0, checkpoint_callback=None):
+        checkpoint_frequency = int(checkpoint_frequency)
+        if checkpoint_frequency < 0:
+            raise ValueError("checkpoint_frequency must be non-negative")
+        if checkpoint_frequency and checkpoint_callback is None:
+            raise ValueError(
+                "checkpoint_callback is required when checkpoint_frequency is positive"
+            )
+        next_checkpoint = checkpoint_frequency
+
         reset_result = self.task_env.reset()
         task_state = (
             reset_result[0] if isinstance(reset_result, tuple) else reset_result
@@ -144,6 +153,10 @@ class SQRLPretrainer:
                 metrics["selected_safe_q"],
                 metrics["epsilon_minus_selected_q"],
             )
+            if checkpoint_frequency and self.task.steps >= next_checkpoint:
+                checkpoint_callback(self.task.steps)
+                while next_checkpoint <= self.task.steps:
+                    next_checkpoint += checkpoint_frequency
 
         return self.policy, self.safe_critic.q
 

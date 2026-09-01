@@ -99,7 +99,16 @@ class SQRLFinetuner:
         self.updates = 0
         self.task_update_credit = 0.0
 
-    def train(self):
+    def train(self, checkpoint_frequency=0, checkpoint_callback=None):
+        checkpoint_frequency = int(checkpoint_frequency)
+        if checkpoint_frequency < 0:
+            raise ValueError("checkpoint_frequency must be non-negative")
+        if checkpoint_frequency and checkpoint_callback is None:
+            raise ValueError(
+                "checkpoint_callback is required when checkpoint_frequency is positive"
+            )
+        next_checkpoint = checkpoint_frequency
+
         def sample_actions(state):
             with torch.no_grad(), autocast(
                 device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16_mixed_precision_training
@@ -261,5 +270,9 @@ class SQRLFinetuner:
                     self.target_steps, self.updates, failures.mean(), fallback.mean(), selected_safe_q.mean(),
                     metrics["policy_loss"], metrics["nu"]
                 )
+            if checkpoint_frequency and self.target_steps >= next_checkpoint:
+                checkpoint_callback(self.target_steps)
+                while next_checkpoint <= self.target_steps:
+                    next_checkpoint += checkpoint_frequency
 
         return self.policy

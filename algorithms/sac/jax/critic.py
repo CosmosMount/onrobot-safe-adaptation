@@ -3,7 +3,7 @@ import numpy as np
 import jax.numpy as jnp
 import flax.linen as nn
 
-from rlx.types import ObservationSpaceType
+from algorithms.types import ObservationSpaceType
 
 def get_critic(config, env):
     observation_space_type = env.general_properties.observation_space_type

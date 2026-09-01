@@ -1,7 +1,7 @@
 """Public SQRL workflow: phases, evaluation, and checkpoints."""
 
 import logging
-import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -11,9 +11,17 @@ from algorithms.sac.pytorch.policy import get_policy
 from sqrl.sac.pytorch.finetuner import SQRLFinetuner
 from sqrl.sac.pytorch.pretrainer import SQRLPretrainer
 from sqrl.sac.pytorch.safety_ops import sample_safe_actions
+from sqrl.checkpoint import (
+    PORTABLE_FORMAT,
+    load_portable_checkpoint,
+    load_torch_component,
+    save_portable_checkpoint,
+    torch_state_to_arrays,
+)
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
+LEGACY_TORCH_CHECKPOINT_SCHEMA_VERSION = 2
 CHECKPOINT_ALGORITHM_ID = "sqrl_sac"
 CHECKPOINT_ARTIFACT_TYPE = "policy_qsafe_transfer"
 CHECKPOINT_PHASES = frozenset({"pretrain", "finetune"})
@@ -42,18 +50,36 @@ class SQRLWorkflow:
         if self.safe_critic is None:
             self.safe_critic = get_safe_critic(self.config, self.env, self.device)
 
-    def pretrain(self, safety_env):
+    def pretrain(self, safety_env, checkpoint_dir=None, checkpoint_frequency=0):
         """Run source pre-training on independent task and safety environments."""
 
         trainer = SQRLPretrainer(
             self.config, self.env, safety_env, self.device
         )
-        trainer.train()
+
+        def save_checkpoint(task_steps):
+            self.policy = trainer.policy
+            self.safe_critic = trainer.safe_critic
+            path = Path(checkpoint_dir) / f"step_{task_steps:09d}.npz"
+            self.save(path, "pretrain", training_state={"task_steps": task_steps})
+            sqrl_workflow_logger.info(
+                "saved periodic pretrain checkpoint: %s", path
+            )
+
+        if checkpoint_dir is None and not checkpoint_frequency:
+            trainer.train()
+        else:
+            trainer.train(
+                checkpoint_frequency=checkpoint_frequency,
+                checkpoint_callback=(
+                    save_checkpoint if checkpoint_dir is not None else None
+                ),
+            )
         self.policy = trainer.policy
         self.safe_critic = trainer.safe_critic
         return self.policy, self.safe_critic.q
 
-    def finetune(self):
+    def finetune(self, checkpoint_dir=None, checkpoint_frequency=0):
         """Run target-domain SQRL fine-tuning."""
 
         self._ensure_models()
@@ -64,7 +90,28 @@ class SQRLWorkflow:
             self.safe_critic.q,
             self.device,
         )
-        self.policy = trainer.train()
+
+        def save_checkpoint(target_steps):
+            self.policy = trainer.policy
+            path = Path(checkpoint_dir) / f"step_{target_steps:09d}.npz"
+            self.save(
+                path,
+                "finetune",
+                training_state={"target_steps": target_steps},
+            )
+            sqrl_workflow_logger.info(
+                "saved periodic finetune checkpoint: %s", path
+            )
+
+        if checkpoint_dir is None and not checkpoint_frequency:
+            self.policy = trainer.train()
+        else:
+            self.policy = trainer.train(
+                checkpoint_frequency=checkpoint_frequency,
+                checkpoint_callback=(
+                    save_checkpoint if checkpoint_dir is not None else None
+                ),
+            )
         return self.policy
 
     def evaluate(self, episodes):
@@ -152,8 +199,8 @@ class SQRLWorkflow:
         )
         return metrics
 
-    def save(self, path, phase):
-        """Save the cross-backend policy/QSafe transfer artifact."""
+    def save(self, path, phase, training_state=None):
+        """Save a framework-neutral policy/QSafe transfer artifact."""
 
         self._ensure_models()
         phase = str(phase)
@@ -169,50 +216,69 @@ class SQRLWorkflow:
         if not isinstance(manifest, dict) or not manifest:
             raise ValueError("checkpoint_manifest() must return a non-empty mapping")
 
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        torch.save(
-            {
-                "schema_version": CHECKPOINT_SCHEMA_VERSION,
-                "algorithm_id": CHECKPOINT_ALGORITHM_ID,
-                "artifact_type": CHECKPOINT_ARTIFACT_TYPE,
-                "phase": phase,
-                "policy": self.policy.state_dict(),
-                "qsafe": self.safe_critic.q.state_dict(),
-                "manifest": manifest,
-                "config": self.config.to_dict()
-                if hasattr(self.config, "to_dict")
-                else dict(self.config),
-            },
-            path,
+        metadata = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "algorithm_id": CHECKPOINT_ALGORITHM_ID,
+            "artifact_type": CHECKPOINT_ARTIFACT_TYPE,
+            "format": PORTABLE_FORMAT,
+            "dense_kernel_layout": "input_output",
+            "phase": phase,
+            "manifest": manifest,
+            "config": self.config.to_dict()
+            if hasattr(self.config, "to_dict")
+            else dict(self.config),
+            "training_state": dict(training_state or {}),
+        }
+        arrays = {}
+        arrays.update(torch_state_to_arrays("policy", self.policy.state_dict()))
+        arrays.update(
+            torch_state_to_arrays("qsafe", self.safe_critic.q.state_dict())
         )
+        save_portable_checkpoint(path, metadata, arrays)
 
     def load(self, path, transfer=False):
-        """Load a versioned artifact after validating its environment contract."""
+        """Load a portable NPZ or a version-2 PyTorch transfer artifact."""
 
         self._ensure_models()
-        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        path = Path(path)
+        if path.suffix.lower() == ".npz":
+            checkpoint, arrays = load_portable_checkpoint(path)
+            required = {
+                "schema_version",
+                "algorithm_id",
+                "artifact_type",
+                "format",
+                "phase",
+                "manifest",
+            }
+            expected_schema = CHECKPOINT_SCHEMA_VERSION
+        else:
+            checkpoint = torch.load(
+                path, map_location=self.device, weights_only=True
+            )
+            arrays = None
+            required = {
+                "schema_version",
+                "algorithm_id",
+                "artifact_type",
+                "phase",
+                "policy",
+                "qsafe",
+                "manifest",
+            }
+            expected_schema = LEGACY_TORCH_CHECKPOINT_SCHEMA_VERSION
         if not isinstance(checkpoint, dict):
             raise ValueError("Checkpoint must be a versioned mapping")
-        required = {
-            "schema_version",
-            "algorithm_id",
-            "artifact_type",
-            "phase",
-            "policy",
-            "qsafe",
-            "manifest",
-        }
         missing = sorted(required.difference(checkpoint))
         if missing:
             raise ValueError(
                 "Legacy or incomplete checkpoint is not a supported transfer "
                 f"artifact; missing fields: {', '.join(missing)}"
             )
-        if checkpoint["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+        if checkpoint["schema_version"] != expected_schema:
             raise ValueError(
                 "Unsupported checkpoint schema_version "
-                f"{checkpoint['schema_version']!r}; expected "
-                f"{CHECKPOINT_SCHEMA_VERSION}"
+                f"{checkpoint['schema_version']!r}; expected {expected_schema}"
             )
         if checkpoint["algorithm_id"] != CHECKPOINT_ALGORITHM_ID:
             raise ValueError(
@@ -227,6 +293,11 @@ class SQRLWorkflow:
             )
         if checkpoint["phase"] not in CHECKPOINT_PHASES:
             raise ValueError(f"Invalid checkpoint phase {checkpoint['phase']!r}")
+        if arrays is not None and checkpoint["format"] != PORTABLE_FORMAT:
+            raise ValueError(
+                f"Checkpoint format must be {PORTABLE_FORMAT!r}, "
+                f"got {checkpoint['format']!r}"
+            )
 
         manifest = checkpoint["manifest"]
         if not isinstance(manifest, dict) or not manifest:
@@ -244,7 +315,14 @@ class SQRLWorkflow:
             )
         validator(manifest, None)
 
-        self.policy.load_state_dict(checkpoint["policy"], strict=True)
-        self.safe_critic.q.load_state_dict(checkpoint["qsafe"], strict=True)
-        self.safe_critic.q_target.load_state_dict(checkpoint["qsafe"], strict=True)
+        if arrays is None:
+            self.policy.load_state_dict(checkpoint["policy"], strict=True)
+            self.safe_critic.q.load_state_dict(checkpoint["qsafe"], strict=True)
+            self.safe_critic.q_target.load_state_dict(
+                checkpoint["qsafe"], strict=True
+            )
+        else:
+            load_torch_component(self.policy, arrays, "policy")
+            load_torch_component(self.safe_critic.q, arrays, "qsafe")
+            load_torch_component(self.safe_critic.q_target, arrays, "qsafe")
         return checkpoint["phase"]

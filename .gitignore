@@ -1,3 +1,16 @@
 .vscode/
 *.egg-info/
 __pycache__/
+*.py[cod]
+
+# Test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+test-results/
+junit*.xml
+
+# Training, evaluation, and simulator run artifacts
+runs/
+wandb/

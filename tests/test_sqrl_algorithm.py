@@ -33,8 +33,10 @@ from sqrl.sac.pytorch.workflow import (
     CHECKPOINT_ALGORITHM_ID,
     CHECKPOINT_ARTIFACT_TYPE,
     CHECKPOINT_SCHEMA_VERSION,
+    LEGACY_TORCH_CHECKPOINT_SCHEMA_VERSION,
     SQRLWorkflow,
 )
+from sqrl.checkpoint import flax_params, load_portable_checkpoint
 
 
 class AttrDict(dict):
@@ -432,20 +434,60 @@ class CheckpointTests(unittest.TestCase):
     def test_checkpoint_is_versioned_and_validated_before_loading(self):
         training = self.make_training()
         with tempfile.TemporaryDirectory() as directory:
-            path = f"{directory}/artifact.model"
+            path = f"{directory}/artifact.npz"
             training.save(path, "pretrain")
-            artifact = torch.load(path, map_location="cpu", weights_only=False)
+            artifact, arrays = load_portable_checkpoint(path)
             self.assertEqual(artifact["schema_version"], CHECKPOINT_SCHEMA_VERSION)
             self.assertEqual(artifact["algorithm_id"], CHECKPOINT_ALGORITHM_ID)
             self.assertEqual(artifact["artifact_type"], CHECKPOINT_ARTIFACT_TYPE)
             self.assertEqual(artifact["phase"], "pretrain")
             self.assertTrue(artifact["manifest"])
+            self.assertIn("policy/Root/kernel", arrays)
+            self.assertIn("qsafe/Root/kernel", arrays)
+            self.assertEqual(
+                flax_params(arrays, "policy")["params"]["Root"]["kernel"].shape,
+                (3, 2),
+            )
 
+            expected_policy = {
+                key: value.detach().clone()
+                for key, value in training.policy.state_dict().items()
+            }
+            expected_qsafe = {
+                key: value.detach().clone()
+                for key, value in training.safe_critic.q.state_dict().items()
+            }
+            for parameter in training.policy.parameters():
+                parameter.data.zero_()
+            for parameter in training.safe_critic.q.parameters():
+                parameter.data.zero_()
             phase = training.load(path, transfer=False)
             self.assertEqual(phase, "pretrain")
             self.assertEqual(training.env.validation_modes, ["evaluation"])
+            for key, value in training.policy.state_dict().items():
+                torch.testing.assert_close(value, expected_policy[key])
+            for key, value in training.safe_critic.q.state_dict().items():
+                torch.testing.assert_close(value, expected_qsafe[key])
             training.load(path, transfer=True)
             self.assertEqual(training.env.validation_modes[-1], "transfer")
+
+    def test_version_two_pytorch_checkpoint_remains_loadable(self):
+        training = self.make_training()
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/artifact.model"
+            torch.save(
+                {
+                    "schema_version": LEGACY_TORCH_CHECKPOINT_SCHEMA_VERSION,
+                    "algorithm_id": CHECKPOINT_ALGORITHM_ID,
+                    "artifact_type": CHECKPOINT_ARTIFACT_TYPE,
+                    "phase": "pretrain",
+                    "policy": training.policy.state_dict(),
+                    "qsafe": training.safe_critic.q.state_dict(),
+                    "manifest": training.env.checkpoint_manifest(None),
+                },
+                path,
+            )
+            self.assertEqual(training.load(path, transfer=True), "pretrain")
 
     def test_legacy_checkpoint_is_rejected_instead_of_silently_loaded(self):
         training = self.make_training()
@@ -624,7 +666,12 @@ class PretrainerTests(unittest.TestCase):
             ) as safety_constructor,
         ):
             trainer = SQRLPretrainer(config, task_env, safety_env, "cpu")
-            trainer.train()
+            trainer.train(
+                checkpoint_frequency=2,
+                checkpoint_callback=lambda steps: events.append(
+                    f"checkpoint_{steps}"
+                ),
+            )
 
         self.assertIs(task_constructor.call_args.args[1], task_env)
         self.assertIs(safety_constructor.call_args.args[1], safety_env)
@@ -640,6 +687,7 @@ class PretrainerTests(unittest.TestCase):
                 "task",
                 "task",
                 "safety",
+                "checkpoint_2",
                 "task",
                 "safety",
             ],
