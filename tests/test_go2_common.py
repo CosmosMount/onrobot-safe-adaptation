@@ -283,3 +283,33 @@ def test_terminal_failure_penalty_is_one_shot_and_optional_reward_contract():
     validate_transfer_manifest(source, target)
     with pytest.raises(ValueError, match="failure_reward_shaping"):
         validate_manifest(source, target)
+
+
+def test_qsafe_shared_threshold_retains_recall_for_every_horizon():
+    from rl_x.algorithms.qsafe.offline_train import (
+        _passes_action_ranking_gate,
+        _passes_multi_horizon_gate,
+        _threshold_for_minimum_recall,
+    )
+
+    probabilities = np.asarray(
+        [0.9, 0.8, 0.7, 0.6, 0.10, 0.08, 0.05, 0.02], dtype=np.float32
+    )
+    candidate_probabilities = np.full((8, 3), 0.05, dtype=np.float32)
+    predictions = {
+        5: {
+            "probabilities": probabilities,
+            "labels": np.asarray([1, 1, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+            "candidate_probabilities": candidate_probabilities,
+        },
+        10: {
+            "probabilities": probabilities,
+            "labels": np.asarray([1, 1, 1, 1, 0, 0, 0, 0], dtype=np.float32),
+            "candidate_probabilities": candidate_probabilities,
+        },
+    }
+    epsilon, individual, reports = _threshold_for_minimum_recall(predictions)
+    assert individual == {5: pytest.approx(0.8), 10: pytest.approx(0.6)}
+    assert epsilon == pytest.approx(0.6)
+    assert not _passes_action_ranking_gate(reports[5])
+    assert _passes_multi_horizon_gate(reports)

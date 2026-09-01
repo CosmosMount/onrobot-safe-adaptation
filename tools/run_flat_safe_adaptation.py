@@ -100,28 +100,95 @@ def _validate_legacy_flat_actor_manifest(manifest: dict) -> None:
         )
 
 
-def _validate_legacy_flat_qsafe_metadata(metadata: dict) -> None:
-    """Reject a universal-v2 or otherwise incompatible QSafe checkpoint."""
+def _validate_flat_qsafe_metadata(
+    metadata: dict, calibration_report: dict | None = None
+) -> None:
+    """Accept the frozen baseline or a calibrated flat action-v1 QSafe v2."""
 
-    expected = {
-        "version": 1,
-        "observation_shape": [46],
-        "action_shape": [12],
-        "gamma": 0.7,
-        "epsilon": 0.1,
-    }
-    actual = {
-        "version": int(metadata.get("qsafe_version", 1)),
+    version = int(metadata.get("qsafe_version", 1))
+    common = {
         "observation_shape": list(metadata.get("observation_shape", [])),
         "action_shape": list(metadata.get("action_shape", [])),
-        "gamma": float(metadata.get("gamma", float("nan"))),
-        "epsilon": float(metadata.get("epsilon", float("nan"))),
+    }
+    if version == 1:
+        expected = {
+            "observation_shape": [46],
+            "action_shape": [12],
+            "gamma": 0.7,
+            "epsilon": 0.1,
+        }
+        actual = {
+            **common,
+            "gamma": float(metadata.get("gamma", float("nan"))),
+            "epsilon": float(metadata.get("epsilon", float("nan"))),
+        }
+        if actual != expected:
+            raise ValueError(
+                "Incompatible legacy flat QSafe contract; "
+                f"expected {expected}, got {actual}"
+            )
+        return
+
+    if version != 2:
+        raise ValueError(f"Unsupported flat QSafe version: {version}")
+    environment = metadata.get("environment_contract", {})
+    action = environment.get("action", {})
+    scale = action.get("scale")
+    expected = {
+        "observation_shape": [230],
+        "base_observation_shape": [46],
+        "action_shape": [12],
+        "history_length": 5,
+        "control_dt": 0.02,
+        "observation_version": "go2-observation-v3-body-velocity",
+        "action_version": "go2-action-v1",
+        "action_pipeline": "sdk-absolute-position-v2",
+        "action_scale": 0.25,
+        "failure_version": "tilt-or-low-terrain-clearance-sustained-v3",
+    }
+    actual = {
+        **common,
+        "base_observation_shape": list(
+            metadata.get("base_observation_shape", [])
+        ),
+        "history_length": int(metadata.get("history_length", -1)),
+        "control_dt": float(metadata.get("control_dt", float("nan"))),
+        "observation_version": environment.get("observation", {}).get("version"),
+        "action_version": action.get("version"),
+        "action_pipeline": action.get("pipeline_version"),
+        "action_scale": float(scale) if isinstance(scale, (int, float)) else scale,
+        "failure_version": environment.get("failure", {}).get("version"),
     }
     if actual != expected:
         raise ValueError(
-            "Flat Safe Adaptation requires the frozen legacy-v1 QSafe "
-            f"contract; expected {expected}, got {actual}"
+            "Incompatible calibrated flat QSafe v2 contract; "
+            f"expected {expected}, got {actual}"
         )
+    gamma = float(metadata.get("gamma", float("nan")))
+    epsilon = float(metadata.get("epsilon", float("nan")))
+    if not 0.0 < gamma < 1.0 or not 0.0 < epsilon < 1.0:
+        raise ValueError(
+            f"Calibrated QSafe requires gamma and epsilon in (0, 1), got "
+            f"gamma={gamma}, epsilon={epsilon}."
+        )
+    report = dict(calibration_report or {})
+    selected = report.get("selected", {})
+    if not (
+        report.get("universal_qsafe_v2_pass") is True
+        and report.get("horizons") == [5, 10, 25]
+        and selected.get("validation_pass") is True
+        and selected.get("test_pass") is True
+        and abs(float(selected.get("gamma_safe", float("nan"))) - gamma) <= 1e-9
+        and abs(float(selected.get("epsilon", float("nan"))) - epsilon) <= 1e-9
+    ):
+        raise ValueError(
+            "QSafe v2 has not passed the required held-out 5/10/25-step "
+            "calibration gate; refusing to spend time on SAC fine-tuning."
+        )
+
+
+# Kept for older imports while the flat experiment now accepts both contracts.
+_validate_legacy_flat_qsafe_metadata = _validate_flat_qsafe_metadata
 
 
 def _git_metadata() -> dict:
@@ -966,9 +1033,16 @@ def _validate_and_enrich(args) -> dict:
         raise ValueError("--checkpoint-frequency must be positive")
 
     qsafe_payload = torch.load(args.qsafe, map_location="cpu", weights_only=False)
-    qsafe_metadata = dict(qsafe_payload["metadata"])
-    _validate_legacy_flat_qsafe_metadata(qsafe_metadata)
     calibration = dict(qsafe_payload.get("calibration_report", {}))
+    qsafe_metadata = dict(qsafe_payload["metadata"])
+    _validate_flat_qsafe_metadata(qsafe_metadata, calibration)
+    if int(qsafe_metadata.get("qsafe_version", 1)) == 2:
+        for key in (
+            "safety_observation_normalizer_state_dict",
+            "safety_observation_normalizer_metadata",
+        ):
+            if key not in qsafe_payload:
+                raise ValueError(f"QSafe v2 checkpoint is missing {key}.")
     args.qsafe_version = int(qsafe_metadata.get("qsafe_version", 1))
     args.qsafe_gamma = float(qsafe_metadata["gamma"])
     args.qsafe_epsilon = float(qsafe_metadata["epsilon"])

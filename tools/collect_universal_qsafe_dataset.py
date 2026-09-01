@@ -67,6 +67,14 @@ FRS_DIAGNOSTIC_ROLES = {
     "step_seed1": "validation",
     "heldout_flat": "test",
 }
+FLAT_LEGACY_V1_ROLES = {
+    "flat_train_sqrl": "train",
+    "flat_train_bodyvel": "train",
+    "flat_validation": "validation",
+    # This is the ordinary SAC actor used by flat Safe Adaptation. Keep it
+    # actor-isolated as the final transfer test rather than training on it.
+    "flat_target_sac": "test",
+}
 
 
 def profile_cells(profile):
@@ -76,6 +84,14 @@ def profile_cells(profile):
             for terrain_name, _ in TERRAINS
             if not terrain_name.startswith("stairs_up_l")
             for noise in NOISE_LEVELS
+        ]
+    if profile == "flat_legacy_v1":
+        # Rate limiting makes small Gaussian perturbations very benign on
+        # Isaac flat ground. Include strong behavior perturbations to collect
+        # complete failure trajectories, while keeping deterministic and
+        # moderate-noise cells for normal actions.
+        return [
+            ("flat", noise) for noise in (0.0, 0.5, 1.0, 2.0, 3.0)
         ]
     if profile != "frs_diagnostic_v1":
         raise ValueError(f"Unknown collection profile: {profile}")
@@ -133,11 +149,18 @@ def main(argv=None):
     parser.add_argument("--actors", required=True, help="Actor inventory JSON")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--episodes-per-run", type=int, default=20)
+    parser.add_argument("--parallel-envs", type=int, default=20)
+    parser.add_argument("--candidate-actions", type=int, default=20)
     parser.add_argument("--map-seed-start", type=int, default=10000)
     parser.add_argument("--episode-offset", type=int, default=0)
     parser.add_argument(
         "--profile",
-        choices=("legacy_full", "formal_v2", "frs_diagnostic_v1"),
+        choices=(
+            "legacy_full",
+            "formal_v2",
+            "frs_diagnostic_v1",
+            "flat_legacy_v1",
+        ),
         default="legacy_full",
     )
     parser.add_argument(
@@ -155,6 +178,8 @@ def main(argv=None):
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.parallel_envs < 1 or args.candidate_actions < 1:
+        raise ValueError("parallel-envs and candidate-actions must be positive.")
     actor_inventory_path = Path(args.actors).expanduser().resolve()
     actors = json.loads(actor_inventory_path.read_text(encoding="utf-8"))
     if not actors:
@@ -176,12 +201,31 @@ def main(argv=None):
             raise FileNotFoundError(policy)
         policy_artifact = torch.load(policy, map_location="cpu", weights_only=False)
         manifest = policy_artifact.get("environment_manifest")
-        if not isinstance(manifest, dict) or int(manifest.get("manifest_version", -1)) != 11:
-            raise ValueError(f"{actor_id} does not use checkpoint manifest v11.")
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{actor_id} has no checkpoint environment manifest.")
         if manifest.get("observation", {}).get("size") != 46:
             raise ValueError(f"{actor_id} does not use the 46D actor observation.")
         if manifest.get("action", {}).get("size") != 12:
             raise ValueError(f"{actor_id} does not use the 12D action contract.")
+        if args.profile == "flat_legacy_v1":
+            observation = manifest.get("observation", {})
+            action = manifest.get("action", {})
+            scale = action.get("scale")
+            if not (
+                observation.get("version")
+                == "go2-observation-v3-body-velocity"
+                and action.get("version") == "go2-action-v1"
+                and action.get("pipeline_version")
+                == "sdk-absolute-position-v2"
+                and isinstance(scale, (int, float))
+                and abs(float(scale) - 0.25) <= 1e-7
+            ):
+                raise ValueError(
+                    f"{actor_id} is not compatible with the flat action-v1 "
+                    "Safe Adaptation tensor/action contract."
+                )
+        elif int(manifest.get("manifest_version", -1)) != 11:
+            raise ValueError(f"{actor_id} does not use checkpoint manifest v11.")
         resolved_actors.append(
             {
                 **actor,
@@ -192,12 +236,15 @@ def main(argv=None):
                 "environment_manifest": manifest,
             }
         )
-    required_roles = (
-        FRS_DIAGNOSTIC_ROLES
-        if args.profile == "frs_diagnostic_v1"
-        else FORMAL_ROLES
-    )
-    if args.formal or args.profile in ("formal_v2", "frs_diagnostic_v1"):
+    required_roles = {
+        "frs_diagnostic_v1": FRS_DIAGNOSTIC_ROLES,
+        "flat_legacy_v1": FLAT_LEGACY_V1_ROLES,
+    }.get(args.profile, FORMAL_ROLES)
+    if args.formal or args.profile in (
+        "formal_v2",
+        "frs_diagnostic_v1",
+        "flat_legacy_v1",
+    ):
         actual_roles = {actor["id"]: actor["split"] for actor in resolved_actors}
         if actual_roles != required_roles:
             raise ValueError(
@@ -305,6 +352,12 @@ def main(argv=None):
                     "--seed",
                     str(map_seed),
                     f"--runner.nr_test_episodes={remaining_episodes}",
+                    flag("environment", "nr_envs", args.parallel_envs),
+                    flag("environment", "nr_task_envs", args.parallel_envs),
+                    flag("environment", "nr_safety_envs", 0),
+                    flag(
+                        "algorithm", "qsafe.candidate_actions", args.candidate_actions
+                    ),
                     flag("algorithm", "qsafe.dataset.directory", dataset_directory),
                     flag("algorithm", "qsafe.dataset.actor_id", actor_id),
                     flag("algorithm", "qsafe.dataset.map_seed", map_seed),
@@ -316,6 +369,12 @@ def main(argv=None):
                     flag("algorithm", "qsafe.dataset.split", split),
                     flag("algorithm", "qsafe.dataset.terrain", terrain_name),
                     flag("algorithm", "qsafe.dataset.action_noise", noise),
+                    flag(
+                        "algorithm",
+                        "qsafe.dataset.store_candidates",
+                        split in ("validation", "test"),
+                    ),
+                    flag("algorithm", "compile_policy", False),
                 ]
                 merged = {**terrain_overrides, **actor_overrides}
                 command.extend(

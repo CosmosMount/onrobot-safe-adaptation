@@ -28,6 +28,7 @@ def test_isaac_launcher_string_defaults_are_not_none():
     assert config.playback_terrain_type == "auto"
     assert config.playback_terrain_level == -1
     assert config.viewer_follow_robot is False
+    assert config.action_profile == "per_joint_v2"
 
 
 def test_isaac_joint_gather_uses_sdk_order():
@@ -59,6 +60,13 @@ def test_isaac_action_term_requires_sdk_order_and_shared_offset():
         _scale=ACTION_SPEC.scale,
     )
     validate_action_term_contract(valid)
+
+    legacy = SimpleNamespace(
+        _joint_names=valid._joint_names,
+        _offset=valid._offset,
+        _scale=np.full(12, 0.25, dtype=np.float32),
+    )
+    validate_action_term_contract(legacy, np.full(12, 0.25, dtype=np.float32))
 
     wrong_order = SimpleNamespace(
         _joint_names=[

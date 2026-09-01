@@ -21,6 +21,7 @@ import torch.nn.functional as torch_functional
 from gymnasium.spaces import Box
 
 from rl_x.algorithms.qsafe.flax.safety_critic import SafetyQNetwork
+from rl_x.algorithms.qsafe.flax.qsafe import QSafe
 from rl_x.algorithms.sac.flax.policy import get_policy
 from rl_x.algorithms.sac.pytorch.policy import (
     squashed_gaussian_log_probability as torch_squashed_gaussian_log_probability,
@@ -414,3 +415,44 @@ def test_squashed_gaussian_log_probability_matches_torch_before_projection():
         gaussian_term - np.log(1.0 - projected_action**2 + 1e-6), axis=-1
     )
     assert not np.allclose(actual, wrong_projected_correction)
+
+
+def test_flax_finetune_qsafe_preserves_candidate_zero_until_rejected():
+    class ActionRisk:
+        @staticmethod
+        def apply(params, states, actions):
+            del params, states
+            return actions[..., :1]
+
+    qsafe = object.__new__(QSafe)
+    qsafe.epsilon = 0.5
+    qsafe.network = ActionRisk()
+    states = jnp.zeros((3, 2), dtype=jnp.float32)
+    candidates = jnp.asarray(
+        [
+            [[0.1], [0.2], [0.3]],
+            [[0.9], [0.2], [0.1]],
+            [[0.9], [0.8], [0.95]],
+        ],
+        dtype=jnp.float32,
+    )
+    log_probabilities = jnp.asarray(
+        [[-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0]],
+        dtype=jnp.float32,
+    )
+    selected_actions, selected, metrics = qsafe._select_kernel(
+        None,
+        states,
+        candidates,
+        log_probabilities,
+        jax.random.PRNGKey(0),
+        pretrain=False,
+    )
+    np.testing.assert_array_equal(np.asarray(selected), np.asarray([0, 1, 1]))
+    np.testing.assert_allclose(
+        np.asarray(selected_actions).reshape(-1), np.asarray([0.1, 0.2, 0.8])
+    )
+    assert float(metrics["qsafe/action_change_fraction"]) == pytest.approx(2 / 3)
+    assert float(metrics["qsafe/safety_intervention_fraction"]) == pytest.approx(
+        2 / 3
+    )

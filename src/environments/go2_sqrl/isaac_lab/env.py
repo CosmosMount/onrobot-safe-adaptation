@@ -19,10 +19,12 @@ from ..common.specs import (
     OBSERVATION_SPEC,
     OBSERVATION_SIZE,
     PHYSICS_STEPS_PER_ACTION,
+    action_profile,
     format_policy_io_contract,
 )
 from ..common.manifest import (
     build_manifest,
+    validate_actor_transfer_manifest,
     validate_manifest,
     validate_transfer_manifest,
 )
@@ -83,7 +85,9 @@ def relabel_isaac_backend_manager_output(output: str) -> str:
     return output
 
 
-def project_action_targets_tensor(previous_q_target, actions):
+def project_action_targets_tensor(
+    previous_q_target, actions, action_scale=ACTION_SPEC.scale
+):
     """Torch-native, differentiable counterpart of the common projection."""
 
     if not torch.is_tensor(actions):
@@ -100,7 +104,7 @@ def project_action_targets_tensor(previous_q_target, actions):
         DEFAULT_JOINT_POSITION, dtype=actions.dtype, device=actions.device
     )
     scale = torch.as_tensor(
-        ACTION_SPEC.scale, dtype=actions.dtype, device=actions.device
+        action_scale, dtype=actions.dtype, device=actions.device
     )
     lower = torch.as_tensor(
         JOINT_LOWER_LIMIT, dtype=actions.dtype, device=actions.device
@@ -302,6 +306,10 @@ class Go2IsaacEnv:
             )
         self.backend = backend
         self.config = config.environment
+        self.action_contract = action_profile(self.config.action_profile)
+        self._action_scale = np.asarray(
+            self.action_contract["scale"], dtype=np.float32
+        )
         self._select_playback_terrain()
         self._domain_randomization = bool(self.config.domain_randomization)
         self.nr_envs = int(self.config.nr_envs)
@@ -323,7 +331,7 @@ class Go2IsaacEnv:
         self.safety_critic_observation_indices = np.arange(OBSERVATION_SIZE)
         robot = self.backend.scene["robot"]
         validate_action_term_contract(
-            self.backend.action_manager.get_term("joint_pos")
+            self.backend.action_manager.get_term("joint_pos"), self._action_scale
         )
         self._joint_indices = sdk_joint_indices(robot.joint_names, robot.device)
         foot_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
@@ -435,6 +443,26 @@ class Go2IsaacEnv:
         )
         return applied
 
+    def project_configured_actions(self, states, actions):
+        """Project with the action profile selected for this environment."""
+
+        if not torch.is_tensor(actions):
+            actions = torch.as_tensor(actions, dtype=torch.float32)
+        if not torch.is_tensor(states):
+            states = torch.as_tensor(
+                states, dtype=actions.dtype, device=actions.device
+            )
+        else:
+            states = states.to(dtype=actions.dtype, device=actions.device)
+        if states.shape[-1] != OBSERVATION_SIZE:
+            raise ValueError(f"Observation must end in 46 values, got {states.shape}")
+        applied, _ = project_action_targets_tensor(
+            states[..., OBSERVATION_SPEC.previous_action_q_target],
+            actions,
+            self._action_scale,
+        )
+        return applied
+
     @property
     def _robot(self):
         return self.backend.scene["robot"]
@@ -536,7 +564,7 @@ class Go2IsaacEnv:
             actions, dtype=torch.float32, device=self._robot.device
         ).reshape(self.nr_envs, ACTION_SIZE)
         applied_action, target = project_action_targets_tensor(
-            self._previous_target, action
+            self._previous_target, action, self._action_scale
         )
         reward_action = action.clamp(-1.0, 1.0)
         self._previous_target = target
@@ -891,6 +919,7 @@ class Go2IsaacEnv:
             terminal_failure_penalty=float(
                 self.config.terminal_failure_penalty
             ),
+            action_profile=str(self.config.action_profile),
         )
 
     def validate_checkpoint_manifest(self, manifest, normalizer=None):
@@ -898,3 +927,10 @@ class Go2IsaacEnv:
 
     def validate_transfer_checkpoint_manifest(self, manifest, normalizer=None):
         validate_transfer_manifest(manifest, self.checkpoint_manifest(normalizer))
+
+    def validate_actor_checkpoint_manifest(self, manifest, normalizer=None):
+        """Validate behavior-policy tensors without binding collection labels."""
+
+        validate_actor_transfer_manifest(
+            manifest, self.checkpoint_manifest(normalizer)
+        )

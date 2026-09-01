@@ -8,6 +8,7 @@ from tools.run_flat_safe_adaptation import (
     DEFAULT_QSAFE,
     _task_flags,
     _train_command,
+    _validate_flat_qsafe_metadata,
     _validate_legacy_flat_actor_manifest,
     _validate_legacy_flat_qsafe_metadata,
 )
@@ -82,5 +83,43 @@ def test_verified_legacy_qsafe_contract_is_explicit():
     }
     _validate_legacy_flat_qsafe_metadata(metadata)
     metadata["qsafe_version"] = 2
-    with pytest.raises(ValueError, match="legacy-v1 QSafe"):
+    with pytest.raises(ValueError, match="calibrated flat QSafe v2"):
         _validate_legacy_flat_qsafe_metadata(metadata)
+
+
+def test_calibrated_flat_qsafe_v2_contract_is_accepted_only_after_gate():
+    metadata = {
+        "qsafe_version": 2,
+        "observation_shape": [230],
+        "base_observation_shape": [46],
+        "action_shape": [12],
+        "history_length": 5,
+        "control_dt": 0.02,
+        "gamma": 0.9,
+        "epsilon": 0.031,
+        "environment_contract": {
+            "observation": {"version": "go2-observation-v3-body-velocity"},
+            "action": {
+                "version": "go2-action-v1",
+                "pipeline_version": "sdk-absolute-position-v2",
+                "scale": 0.25,
+            },
+            "failure": {
+                "version": "tilt-or-low-terrain-clearance-sustained-v3"
+            },
+        },
+    }
+    report = {
+        "horizons": [5, 10, 25],
+        "universal_qsafe_v2_pass": True,
+        "selected": {
+            "gamma_safe": 0.9,
+            "epsilon": 0.031,
+            "validation_pass": True,
+            "test_pass": True,
+        },
+    }
+    _validate_flat_qsafe_metadata(metadata, report)
+    report["selected"]["test_pass"] = False
+    with pytest.raises(ValueError, match="refusing to spend time"):
+        _validate_flat_qsafe_metadata(metadata, report)

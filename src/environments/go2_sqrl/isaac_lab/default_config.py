@@ -2,6 +2,7 @@ from ml_collections import config_dict
 
 from ..common.estimation.velocity import configure_velocity_estimator
 from ..common.specs import configure_failure_detection
+from ..common.specs import DEFAULT_ACTION_PROFILE
 
 
 def get_config(environment_name):
@@ -14,6 +15,7 @@ def get_config(environment_name):
     config.rollout_mode = "partitioned"
     config.device = "gpu"
     config.target_velocity_x = 0.5
+    config.action_profile = DEFAULT_ACTION_PROFILE
     configure_velocity_estimator(config)
     configure_failure_detection(config)
     config.terrain_mode = "rough"

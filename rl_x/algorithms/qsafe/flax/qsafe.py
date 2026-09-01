@@ -421,10 +421,18 @@ class QSafe:
             scores = jnp.where(safe_mask, q_values, -jnp.inf)
             selected = jnp.argmax(scores, axis=1)
         else:
-            logits = candidate_log_probs.reshape((nr_envs, nr_candidates))
-            logits = jnp.where(safe_mask, logits, -jnp.inf)
-            logits = jnp.where(fallback[:, None], jnp.zeros_like(logits), logits)
-            selected = jax.random.categorical(selection_key, logits, axis=-1)
+            # Candidate actions are already IID task-policy samples. Selecting
+            # the first safe proposal is exact finite rejection sampling and
+            # preserves candidate zero whenever it is safe. Reweighting by
+            # candidate_log_probs here would incorrectly sample proportional
+            # to pi^2 and perturb the actor without a safety intervention.
+            del selection_key
+            candidate_indices = jnp.broadcast_to(
+                jnp.arange(nr_candidates)[None, :], (nr_envs, nr_candidates)
+            )
+            selected = jnp.min(
+                jnp.where(safe_mask, candidate_indices, nr_candidates), axis=1
+            )
 
         lowest_risk = jnp.argmin(q_values, axis=1)
         selected = jnp.where(fallback, lowest_risk, selected)

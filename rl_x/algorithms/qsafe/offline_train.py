@@ -2,8 +2,8 @@
 
 This module intentionally has no Isaac dependency.  It consumes complete raw
 46D trajectories, constructs the 5-frame safety history, trains the SQRL
-Bellman risk critic, and evaluates every published gamma/epsilon candidate on
-actor- and map-isolated validation/test splits.
+Bellman risk critic, and selects one gamma/threshold on actor- and map-isolated
+validation trajectories before reporting untouched test performance.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from rl_x.algorithms.qsafe.calibration import (
     calibration_report,
     future_failure_labels,
-    passes_isaac_gate,
 )
 from rl_x.algorithms.qsafe.common import (
     safety_bellman_target,
@@ -33,7 +32,7 @@ from rl_x.algorithms.sac_qsafe.pytorch.default_config import get_config
 
 
 GAMMAS = (0.7, 0.9, 0.97)
-EPSILONS = (0.05, 0.10, 0.15, 0.20)
+HORIZONS = (5, 10, 25)
 
 
 class _DatasetEnvironment:
@@ -170,7 +169,9 @@ def _build_qsafe(dataset, gamma, device, seed):
     config.algorithm.device = "gpu" if device.type == "cuda" else "cpu"
     config.algorithm.phase = "pretrain"
     config.algorithm.qsafe.gamma = float(gamma)
-    config.algorithm.qsafe.epsilon = float(EPSILONS[0])
+    # This placeholder is replaced by held-out threshold selection after
+    # training; it must never be treated as a historical default.
+    config.algorithm.qsafe.epsilon = 0.1
     config.environment = SimpleNamespace(nr_envs=1)
     return QSafe(
         config,
@@ -282,14 +283,103 @@ def _train_one(qsafe, trajectories, updates, batch_size, seed):
     return float(loss.detach().cpu())
 
 
+def _prediction_arrays_for_horizons(qsafe, trajectories, horizons):
+    """Score states/candidates once and attach each requested future label."""
+
+    horizons = tuple(int(value) for value in horizons)
+    first = _prediction_arrays(qsafe, trajectories, horizons[0])
+    result = {horizons[0]: first}
+    for horizon in horizons[1:]:
+        result[horizon] = {
+            "probabilities": first["probabilities"],
+            "labels": np.concatenate(
+                [
+                    future_failure_labels(trajectory["failures"], horizon)
+                    for trajectory in trajectories
+                ]
+            ),
+            "candidate_probabilities": first["candidate_probabilities"],
+        }
+    return result
+
+
+def _threshold_for_minimum_recall(predictions_by_horizon, target_recall=0.80):
+    """Choose the highest shared threshold retaining recall on every horizon."""
+
+    horizon_thresholds = {}
+    for horizon, predictions in predictions_by_horizon.items():
+        probabilities = np.asarray(predictions["probabilities"], dtype=np.float64)
+        labels = np.asarray(predictions["labels"], dtype=bool)
+        positives = probabilities[labels]
+        if not positives.size:
+            raise RuntimeError(f"Horizon {horizon} has no future-failure positives.")
+        required = max(1, int(math.ceil(float(target_recall) * positives.size)))
+        horizon_thresholds[int(horizon)] = float(np.sort(positives)[-required])
+    # A lower threshold rejects more actions. Satisfying every horizon requires
+    # the most conservative of their individually feasible thresholds.
+    epsilon = min(horizon_thresholds.values())
+    reports = {
+        int(horizon): _evaluate_predictions(predictions, epsilon)
+        for horizon, predictions in predictions_by_horizon.items()
+    }
+    return epsilon, horizon_thresholds, reports
+
+
+def _passes_action_ranking_gate(report):
+    fallback = float(report["fallback_rate"])
+    return bool(
+        report["recall_future_failure"] >= 0.80
+        and report["safe_action_false_rejection_rate"] <= 0.20
+        and np.isfinite(fallback)
+        and fallback <= 0.05
+    )
+
+
+def _passes_multi_horizon_gate(reports):
+    """Require early-warning recall, with rejection quality at max horizon.
+
+    A transition 8 steps before failure is correctly positive at H=10 but is
+    labelled negative at H=5. Applying the false-rejection gate independently
+    to every nested horizon would therefore penalize the desired early warning.
+    """
+
+    primary = reports[max(reports)]
+    return bool(
+        all(
+            report["recall_future_failure"] >= 0.80
+            for report in reports.values()
+        )
+        and _passes_action_ranking_gate(primary)
+    )
+
+
+def _candidate_rank(reports):
+    values = tuple(reports.values())
+    passed = _passes_multi_horizon_gate(reports)
+    minimum_recall = min(report["recall_future_failure"] for report in values)
+    primary = reports[max(reports)]
+    primary_false_rejection = primary["safe_action_false_rejection_rate"]
+    primary_fallback = primary["fallback_rate"]
+    mean_brier_improvement = float(
+        np.mean([report["brier_improvement"] for report in values])
+    )
+    return (
+        int(passed),
+        -primary_false_rejection,
+        minimum_recall,
+        -primary_fallback,
+        mean_brier_improvement,
+    )
+
+
 def train(args):
     dataset = SafetyTrajectoryDataset(args.dataset)
     dataset.validate_isolation()
     statistics = dataset.statistics()
     minimum_outcomes = {
-        "train": 500,
-        "validation": 100,
-        "test": 100,
+        "train": int(args.min_train_outcomes),
+        "validation": int(args.min_validation_outcomes),
+        "test": int(args.min_test_outcomes),
     }
     data_gate = all(
         statistics["by_split"][split][outcome] >= minimum
@@ -303,9 +393,8 @@ def train(args):
             for split in ("train", "validation", "test")
         )
         raise RuntimeError(
-            "Stage-4 split data gate failed: train requires 500 fall and 500 "
-            "success trajectories; validation and test each require 100 fall and "
-            f"100 success trajectories. Found {counts}."
+            "QSafe split data gate failed. Required fall and success trajectories "
+            f"per split: {minimum_outcomes}. Found {counts}."
         )
     split_entries = {
         split: dataset.entries(split) for split in ("train", "validation", "test")
@@ -331,7 +420,13 @@ def train(args):
     output.mkdir(parents=True, exist_ok=True)
     candidates = []
     best = None
-    for gamma in GAMMAS:
+    horizons = tuple(int(value) for value in args.horizons.split(",") if value)
+    gammas = tuple(float(value) for value in args.gammas.split(",") if value)
+    if not horizons or any(value < 1 for value in horizons):
+        raise ValueError("--horizons must contain positive integers.")
+    if not gammas or any(not 0.0 < value < 1.0 for value in gammas):
+        raise ValueError("--gammas must contain values strictly between 0 and 1.")
+    for gamma in gammas:
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
@@ -339,63 +434,59 @@ def train(args):
         final_loss = _train_one(
             qsafe, splits["train"], args.updates, args.batch_size, args.seed
         )
-        validation_predictions = _prediction_arrays(
-            qsafe, splits["validation"], args.horizon_steps
+        validation_predictions = _prediction_arrays_for_horizons(
+            qsafe, splits["validation"], horizons
         )
-        for epsilon in EPSILONS:
-            validation = _evaluate_predictions(
-                validation_predictions, epsilon
-            )
-            candidate = {
-                "gamma_safe": gamma,
-                "epsilon": epsilon,
-                "final_loss": final_loss,
-                "validation": validation,
-                "validation_pass": passes_isaac_gate(validation),
-            }
-            # Diagnostic selection is intentionally less brittle than the
-            # publication gate: among candidates with at least 70% recall,
-            # prefer the lowest safe-action rejection. If none reaches 70%,
-            # prefer recall, then proper-scoring/calibration quality.
-            relaxed_eligible = bool(
-                np.isfinite(validation["recall_future_failure"])
-                and validation["recall_future_failure"] >= 0.70
-            )
-            rank = (
-                int(relaxed_eligible),
-                (
-                    -validation["safe_action_false_rejection_rate"]
-                    if relaxed_eligible
-                    else validation["recall_future_failure"]
-                ),
-                validation["brier_improvement"],
-                -validation["ece"],
-                -np.nan_to_num(validation["fallback_rate"], nan=1.0),
-            )
-            candidate["diagnostic_recall_gate"] = relaxed_eligible
-            candidates.append(candidate)
-            if best is None or rank > best[0]:
-                best = (rank, qsafe, candidate)
+        epsilon, per_horizon_thresholds, validation_reports = (
+            _threshold_for_minimum_recall(validation_predictions)
+        )
+        candidate = {
+            "gamma_safe": gamma,
+            "epsilon": epsilon,
+            "per_horizon_maximum_threshold_at_80pct_recall": (
+                per_horizon_thresholds
+            ),
+            "final_loss": final_loss,
+            "validation_by_horizon": validation_reports,
+            "validation_pass": _passes_multi_horizon_gate(validation_reports),
+        }
+        rank = _candidate_rank(validation_reports)
+        candidates.append(candidate)
+        if best is None or rank > best[0]:
+            best = (rank, qsafe, candidate)
     _, qsafe, selected = best
     qsafe.epsilon = float(selected["epsilon"])
     qsafe.config.epsilon = float(selected["epsilon"])
-    test_report = _evaluate(
-        qsafe, splits["test"], selected["epsilon"], args.horizon_steps
+    test_predictions = _prediction_arrays_for_horizons(
+        qsafe, splits["test"], horizons
     )
+    test_reports = {
+        horizon: _evaluate_predictions(predictions, selected["epsilon"])
+        for horizon, predictions in test_predictions.items()
+    }
     validation_pass = bool(selected["validation_pass"])
-    test_pass = passes_isaac_gate(test_report)
+    test_pass = _passes_multi_horizon_gate(test_reports)
+    primary_horizon = max(horizons)
+    test_report = test_reports[primary_horizon]
     report = {
         "dataset": str(Path(args.dataset).resolve()),
         "statistics": statistics,
         "data_gate_pass": data_gate,
-        "horizon_steps": int(args.horizon_steps),
+        "horizon_steps": int(primary_horizon),
+        "horizons": list(horizons),
         "horizon_seconds": float(
-            args.horizon_steps * dataset.manifest["contract"]["control_dt"]
+            primary_horizon * dataset.manifest["contract"]["control_dt"]
         ),
+        "minimum_outcomes": minimum_outcomes,
+        "updates_per_gamma": int(args.updates),
+        "gammas": list(gammas),
         "candidates": candidates,
         "selected": {
             **{key: selected[key] for key in ("gamma_safe", "epsilon")},
+            "validation_by_horizon": selected["validation_by_horizon"],
+            "validation_pass": validation_pass,
             "test": test_report,
+            "test_by_horizon": test_reports,
             "test_pass": test_pass,
         },
         "universal_qsafe_v2_pass": bool(
@@ -428,7 +519,17 @@ def build_parser():
     parser.add_argument("--output", required=True)
     parser.add_argument("--updates", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--horizon-steps", type=int, default=25)
+    parser.add_argument(
+        "--horizons",
+        default=",".join(map(str, HORIZONS)),
+        help="Comma-separated future-failure horizons used by one shared threshold.",
+    )
+    parser.add_argument(
+        "--gammas", default=",".join(map(str, GAMMAS))
+    )
+    parser.add_argument("--min-train-outcomes", type=int, default=500)
+    parser.add_argument("--min-validation-outcomes", type=int, default=100)
+    parser.add_argument("--min-test-outcomes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("gpu", "cpu"), default="gpu")
     parser.add_argument("--allow-incomplete-data", action="store_true")

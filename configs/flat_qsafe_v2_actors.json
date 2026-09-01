@@ -1,0 +1,42 @@
+[
+  {
+    "id": "flat_train_sqrl",
+    "checkpoint": "runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models",
+    "split": "train",
+    "environment_overrides": {
+      "action_profile": "legacy_v1",
+      "target_velocity_x": 0.5,
+      "domain_randomization": false
+    }
+  },
+  {
+    "id": "flat_train_bodyvel",
+    "checkpoint": "runs/go2_sqrl/pretrain/isaac_bodyvel_v4_300k/models",
+    "split": "train",
+    "environment_overrides": {
+      "action_profile": "legacy_v1",
+      "target_velocity_x": 0.5,
+      "domain_randomization": false
+    }
+  },
+  {
+    "id": "flat_validation",
+    "checkpoint": "runs/go2_sqrl/pretrain/isaac_sqrl_v9_qsafecal_seed0_full300k_20260827/models",
+    "split": "validation",
+    "environment_overrides": {
+      "action_profile": "legacy_v1",
+      "target_velocity_x": 0.5,
+      "domain_randomization": false
+    }
+  },
+  {
+    "id": "flat_target_sac",
+    "checkpoint": "runs/go2_sqrl/pretrain/isaac_sac_height_dr_v1/models",
+    "split": "test",
+    "environment_overrides": {
+      "action_profile": "legacy_v1",
+      "target_velocity_x": 0.5,
+      "domain_randomization": false
+    }
+  }
+]

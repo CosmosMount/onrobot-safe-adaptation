@@ -344,16 +344,20 @@ class QSafe:
             )
             selected = boundary_scores.argmax(dim=1)
         elif phase == "finetune":
-            # Equation 3: mask unsafe samples, then sample the safe set in
-            # proportion to their probability under the task policy.
-            logits = candidate_log_probs.reshape(nr_envs, nr_candidates)
-            masked_logits = torch.where(
-                safe_mask, logits, torch.full_like(logits, -torch.inf)
-            )
-            masked_logits = torch.where(
-                fallback[:, None], torch.zeros_like(masked_logits), masked_logits
-            )
-            selected = torch.distributions.Categorical(logits=masked_logits).sample()
+            # Candidates are already IID samples from the task policy.  The
+            # first accepted sample is therefore rejection sampling from
+            # pi(a|s) conditioned on QSafe < epsilon.  Weighting these samples
+            # by their policy density a second time would instead approximate
+            # pi(a|s)^2 and would change the actor even when candidate zero is
+            # safe.
+            candidate_indices = torch.arange(
+                nr_candidates, device=candidate_actions.device
+            )[None, :].expand(nr_envs, -1)
+            selected = torch.where(
+                safe_mask,
+                candidate_indices,
+                torch.full_like(candidate_indices, nr_candidates),
+            ).min(dim=1).values
         else:
             raise ValueError(f"Unknown SQRL phase: {phase}")
 
@@ -362,9 +366,25 @@ class QSafe:
         batch_indices = torch.arange(nr_envs, device=candidate_actions.device)
         log_probs = candidate_log_probs.reshape(nr_envs, nr_candidates)
         flat_q = q_values.reshape(-1)
-        return candidate_actions[batch_indices, selected], selected, {
+        selected_actions = candidate_actions[batch_indices, selected]
+        candidate_zero_rejected = ~safe_mask[:, 0]
+        action_delta = selected_actions - candidate_actions[:, 0]
+        action_changed = torch.linalg.vector_norm(
+            action_delta.reshape(nr_envs, -1), dim=-1
+        ) > 1e-6
+        return selected_actions, selected, {
             "qsafe/rejected_fraction": (~safe_mask).float().mean().item(),
             "qsafe/fallback_fraction": fallback.float().mean().item(),
+            "qsafe/action_change_fraction": action_changed.float().mean().item(),
+            "qsafe/action_change_l2": torch.linalg.vector_norm(
+                action_delta.reshape(nr_envs, -1), dim=-1
+            ).mean().item(),
+            "qsafe/candidate0_rejected_fraction": (
+                candidate_zero_rejected.float().mean().item()
+            ),
+            "qsafe/safety_intervention_fraction": (
+                (action_changed & candidate_zero_rejected).float().mean().item()
+            ),
             "qsafe/selected_value": q_values[batch_indices, selected].mean().item(),
             "qsafe/candidate_value_p50": torch.quantile(flat_q, 0.50).item(),
             "qsafe/candidate_value_p90": torch.quantile(flat_q, 0.90).item(),

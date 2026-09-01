@@ -294,9 +294,24 @@ class SAC_QSafe:
             self.observation_normalizer.validate_metadata(metadata)
         self.observation_normalizer.load_state_dict(normalizer_state)
         environment_manifest = checkpoint.get("environment_manifest")
-        if hasattr(self.train_env, "validate_transfer_checkpoint_manifest"):
-            if environment_manifest is None:
-                raise ValueError("Pretrained policy is missing environment manifest.")
+        if environment_manifest is None:
+            raise ValueError("Pretrained policy is missing environment manifest.")
+        dataset_config = getattr(self.config.algorithm.qsafe, "dataset", None)
+        collecting_behavior_data = bool(
+            dataset_config is not None and getattr(dataset_config, "enabled", False)
+        )
+        if collecting_behavior_data and hasattr(
+            self.train_env, "validate_actor_checkpoint_manifest"
+        ):
+            # Dataset labels belong to the current collection environment.  A
+            # behavior actor neither consumes nor predicts the failure label,
+            # so require exact actor-visible tensors while allowing the label
+            # contract to evolve from legacy absolute height to terrain-relative
+            # clearance.  QSafe transfer remains on the strict path below.
+            self.train_env.validate_actor_checkpoint_manifest(
+                environment_manifest, self.observation_normalizer.metadata()
+            )
+        elif hasattr(self.train_env, "validate_transfer_checkpoint_manifest"):
             self.train_env.validate_transfer_checkpoint_manifest(
                 environment_manifest, self.observation_normalizer.metadata()
             )
@@ -319,7 +334,11 @@ class SAC_QSafe:
         semantics identical.
         """
 
-        project_actions = getattr(self.train_env, "project_actions", None)
+        project_actions = getattr(
+            self.train_env,
+            "project_configured_actions",
+            getattr(self.train_env, "project_actions", None),
+        )
         if project_actions is None:
             return actions
         projected = project_actions(raw_states, actions)

@@ -14,7 +14,12 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
 
 from src.config import PROJECT_ROOT
 
-from ..common.specs import ACTION_SPEC, DEFAULT_BASE_HEIGHT, JOINT_NAMES
+from ..common.specs import (
+    ACTION_SPEC,
+    DEFAULT_BASE_HEIGHT,
+    JOINT_NAMES,
+    action_profile,
+)
 from .randomization_cfg import configure_existing_events
 from .terrain_cfg import (
     boxes_height_range,
@@ -141,6 +146,11 @@ class Go2SQRLIsaacEnvCfg(LocomotionVelocityRoughEnvCfg):
 
 def make_env_cfg(config, num_envs=None):
     cfg = Go2SQRLIsaacEnvCfg()
+    configured_action = action_profile(config.environment.action_profile)
+    cfg.actions.joint_pos.scale = {
+        f"{joint_name}_joint": float(scale)
+        for joint_name, scale in zip(JOINT_NAMES, configured_action["scale"])
+    }
     configure_terrain_mode(
         cfg.scene.terrain,
         cfg.curriculum,

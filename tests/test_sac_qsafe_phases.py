@@ -18,6 +18,7 @@ from rl_x.algorithms.sac_qsafe.pytorch.rollout import (
 )
 from rl_x.algorithms.sac.pytorch.entropy_coefficient import EntropyCoefficient
 from rl_x.algorithms.sac_qsafe.pytorch.sac_qsafe import SAC_QSafe
+from rl_x.algorithms.qsafe.pytorch.qsafe import QSafe
 
 
 class _IdentityNormalizer:
@@ -74,6 +75,41 @@ class _SelectingQSafe:
 
     def normalize_observations(self, states):
         return states
+
+
+def test_finetune_qsafe_preserves_candidate_zero_until_it_is_rejected():
+    class ActionRisk(torch.nn.Module):
+        def forward(self, states, actions):
+            del states
+            return actions[..., :1]
+
+    qsafe = object.__new__(QSafe)
+    qsafe.version = 1
+    qsafe.phase = "finetune"
+    qsafe.epsilon = 0.5
+    qsafe.online = ActionRisk()
+    states = torch.zeros((3, 2))
+    candidates = torch.tensor(
+        [
+            [[0.1], [0.2], [0.3]],
+            [[0.9], [0.2], [0.1]],
+            [[0.9], [0.8], [0.95]],
+        ]
+    )
+    # Deliberately prefer later candidates. These log probabilities must not
+    # cause a second policy-density weighting after IID proposal sampling.
+    log_probabilities = torch.tensor(
+        [[-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0]]
+    )
+    selected_actions, selected, metrics = qsafe.select_safe_action(
+        states, candidates, log_probabilities
+    )
+    torch.testing.assert_close(selected, torch.tensor([0, 1, 1]))
+    torch.testing.assert_close(
+        selected_actions.reshape(-1), torch.tensor([0.1, 0.2, 0.8])
+    )
+    assert metrics["qsafe/action_change_fraction"] == pytest.approx(2 / 3)
+    assert metrics["qsafe/safety_intervention_fraction"] == pytest.approx(2 / 3)
 
 
 def _action_sampling_model():

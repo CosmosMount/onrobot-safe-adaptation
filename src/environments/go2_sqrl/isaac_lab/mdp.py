@@ -23,7 +23,7 @@ def sdk_joint_indices(source_names, device=None):
     )
 
 
-def validate_action_term_contract(action_term) -> None:
+def validate_action_term_contract(action_term, expected_scale=ACTION_SPEC.scale) -> None:
     """Fail fast unless Isaac executes the exact shared SDK action mapping."""
 
     actual_names = tuple(action_term._joint_names)
@@ -48,10 +48,11 @@ def validate_action_term_contract(action_term) -> None:
     scale = action_term._scale
     if torch.is_tensor(scale):
         scale = scale.detach().cpu().numpy()
-    if not np.allclose(scale, ACTION_SPEC.scale, atol=1e-7, rtol=0.0):
+    expected_scale = np.asarray(expected_scale, dtype=np.float32)
+    if not np.allclose(scale, expected_scale, atol=1e-7, rtol=0.0):
         raise RuntimeError(
             "Isaac action scale does not match the shared action contract: "
-            f"expected {ACTION_SPEC.scale}, got {scale}"
+            f"expected {expected_scale}, got {scale}"
         )
 
 
