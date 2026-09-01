@@ -5,6 +5,9 @@ experiment:
 runner:
   # The CLI command is the single source of train/test mode.
   evaluation_episodes: 10
+  # Save portable policy/QSafe snapshots every N environment transitions.
+  # Set to 0 to disable periodic snapshots.
+  checkpoint_frequency: 10000
 
 algorithm:
   device: gpu

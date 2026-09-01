@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -49,6 +50,11 @@ def main(argv=None):
     parser.add_argument("--scene", default=str(DEFAULT_MUJOCO_SCENE))
     parser.add_argument("--domain-id", type=int, default=1)
     parser.add_argument("--interface", default="lo")
+    parser.add_argument(
+        "--episode-seconds",
+        type=float,
+        help="zero-shot/eval maximum duration of one episode in seconds",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s - %(message)s")
@@ -170,6 +176,7 @@ def main(argv=None):
     runner = {
         "output_dir": f"runs/sqrl/{args.command}",
         "evaluation_episodes": 5,
+        "checkpoint_frequency": 10_000,
         "mode": runner_mode,
     }
 
@@ -183,6 +190,15 @@ def main(argv=None):
     merge(algorithm, raw_config.get("algorithm", {}))
     merge(environment, raw_config.get("environment", {}))
     merge(runner, raw_config.get("runner", {}))
+    if args.episode_seconds is not None:
+        if args.command not in ("zero-shot", "eval"):
+            parser.error("--episode-seconds is only valid for zero-shot and eval")
+        if not math.isfinite(args.episode_seconds) or args.episode_seconds <= 0.0:
+            parser.error("--episode-seconds must be a positive finite number")
+        environment["evaluation_episode_steps"] = max(
+            1,
+            math.ceil(args.episode_seconds / float(environment["control_dt"])),
+        )
     configured_mode = str(runner.get("mode", runner_mode)).strip().lower()
     if configured_mode != runner_mode:
         raise ValueError(
@@ -190,6 +206,10 @@ def main(argv=None):
             f"expected {runner_mode!r}"
         )
     runner["mode"] = runner_mode
+    checkpoint_frequency = int(runner.get("checkpoint_frequency", 0))
+    if checkpoint_frequency < 0:
+        raise ValueError("runner.checkpoint_frequency must be non-negative")
+    runner["checkpoint_frequency"] = checkpoint_frequency
     configured_algorithm = str(algorithm.get("name", algorithm_name)).strip().lower()
     if configured_algorithm != algorithm_name:
         raise ValueError(
@@ -232,8 +252,12 @@ def main(argv=None):
             pretrain_envs = IsaacPretrainEnvironments(config)
             train_env = pretrain_envs.task
             workflow = SQRLWorkflow(config, train_env, device)
-            workflow.pretrain(pretrain_envs.safety)
-            checkpoint = Path(config.runner.output_dir) / "final.model"
+            workflow.pretrain(
+                pretrain_envs.safety,
+                checkpoint_dir=config.runner.output_dir,
+                checkpoint_frequency=config.runner.checkpoint_frequency,
+            )
+            checkpoint = Path(config.runner.output_dir) / "final.npz"
             workflow.save(str(checkpoint), "pretrain")
             logging.getLogger("sqrl_runner").info("saved pretrain checkpoint: %s", checkpoint)
         else:
@@ -250,8 +274,11 @@ def main(argv=None):
             if checkpoint_phase != expected_phase:
                 raise ValueError(f"{args.command} requires a {expected_phase} checkpoint, got {checkpoint_phase}")
             if args.command == "finetune":
-                workflow.finetune()
-                checkpoint = Path(config.runner.output_dir) / "final.model"
+                workflow.finetune(
+                    checkpoint_dir=config.runner.output_dir,
+                    checkpoint_frequency=config.runner.checkpoint_frequency,
+                )
+                checkpoint = Path(config.runner.output_dir) / "final.npz"
                 workflow.save(str(checkpoint), "finetune")
                 logging.getLogger("sqrl_runner").info("saved finetune checkpoint: %s", checkpoint)
             else:

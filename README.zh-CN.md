@@ -43,7 +43,7 @@ python -m train.runner pretrain
 默认输出：
 
 ```text
-runs/sqrl/pretrain/final.model
+runs/sqrl/pretrain/final.npz
 ```
 
 严格暂停需要两个 Isaac/Kit 上下文，并且主进程还持有 PyTorch 模型，因此显存需求
@@ -69,6 +69,7 @@ environment:
 
 runner:
   output_dir: runs/sqrl/smoke-pretrain
+  checkpoint_frequency: 10000
 ```
 
 然后运行：
@@ -94,6 +95,7 @@ nr_task_envs + nr_safety_envs == nr_envs
 cd /path/to/unitree_mujoco
 git checkout 4134cb5dc7ff1ba7f484deda48b5274b58694519
 git apply /absolute/path/to/ora-refactor/assets/robots/go2/unitree_mujoco_bridge_lockstep.patch
+git apply /absolute/path/to/ora-refactor/assets/robots/go2/unitree_mujoco_bridge_lossless_publish.patch
 cmake -S simulate -B simulate/build -DCMAKE_BUILD_TYPE=Release
 cmake --build simulate/build --parallel
 ```
@@ -141,24 +143,35 @@ python -m train.runner sim
 ```bash
 # 使用预训练 checkpoint 直接在 MuJoCo 中评估
 python -m train.runner zero-shot \
-  --checkpoint runs/sqrl/pretrain/final.model
+  --checkpoint runs/sqrl/pretrain/final.npz
 
 # 使用预训练 checkpoint 在线微调
 python -m train.runner finetune \
-  --checkpoint runs/sqrl/pretrain/final.model
+  --checkpoint runs/sqrl/pretrain/final.npz
 
 # 评估微调后的 checkpoint
 python -m train.runner eval \
-  --checkpoint runs/sqrl/finetune/final.model
+  --checkpoint runs/sqrl/finetune/final.npz
 ```
+
+默认每个 zero-shot 回合最长 10 秒。要让机器人连续运行更久，可只延长评估
+回合，例如运行 60 秒：
+
+```bash
+python -m train.runner zero-shot \
+  --checkpoint runs/sqrl/pretrain/final.npz \
+  --episode-seconds 60
+```
+
+该参数不会改变训练或 checkpoint 契约；若机器人提前跌倒，安全终止仍会立即复位。
 
 各命令的输入和输出为：
 
 | 命令 | 后端 | 必需 checkpoint | 默认输出 |
 |---|---|---|---|
-| `pretrain` | Isaac Lab | 无 | `runs/sqrl/pretrain/final.model` |
+| `pretrain` | Isaac Lab | 无 | `runs/sqrl/pretrain/final.npz` |
 | `zero-shot` | MuJoCo/SDK2 | `pretrain` checkpoint | 只输出评估指标 |
-| `finetune` | MuJoCo/SDK2 | `pretrain` checkpoint | `runs/sqrl/finetune/final.model` |
+| `finetune` | MuJoCo/SDK2 | `pretrain` checkpoint | `runs/sqrl/finetune/final.npz` |
 | `eval` | MuJoCo/SDK2 | `finetune` checkpoint | 只输出评估指标 |
 
 如果不使用默认 DDS 设置，模拟器和训练命令必须传入完全相同的 domain 和网络接口：
@@ -170,7 +183,7 @@ python -m train.runner sim --domain-id 7 --interface eth0
 # 终端 B
 python -m train.runner zero-shot \
   --domain-id 7 --interface eth0 \
-  --checkpoint runs/sqrl/pretrain/final.model
+  --checkpoint runs/sqrl/pretrain/final.npz
 ```
 
 ## 项目分层
@@ -339,8 +352,26 @@ accepted candidate，则使用风险最小的候选，并记录 fallback。默�
 rejection sampling，从而匹配 Eq. 3 的条件分布；这是经过测试的明确选择，但不声称
 逐字复现该歧义句子。
 
-保留原始 QSafe 网络，包括最后的 `tanh` 激活。checkpoint 是 policy/QSafe 的
-跨后端迁移产物，不是包含 optimizer state 的断点续训文件。
+保留原始 QSafe 网络，包括最后的 `tanh` 激活。runner 默认每 10,000 个 task
+transition 原子保存一个 `step_XXXXXXXXX.npz`，完整结束后保存 `final.npz`；通过
+`runner.checkpoint_frequency` 可以修改间隔，设为 `0` 可关闭周期保存。checkpoint
+是 policy/QSafe 的跨后端迁移产物，不是包含 optimizer state 的断点续训文件。
+
+NPZ 文件不使用 pickle：JSON 元数据、环境契约和框架无关的 NumPy 权重位于同一个
+文件中，Dense kernel 统一采用 Flax 的 `[input, output]` 布局。PyTorch 通过
+`SQRLWorkflow.load` 读取；JAX/Flax 可以直接读取同一文件：
+
+```python
+from sqrl.checkpoint import flax_params, load_portable_checkpoint
+
+metadata, arrays = load_portable_checkpoint("runs/sqrl/pretrain/final.npz")
+policy_variables = flax_params(arrays, "policy")
+qsafe_variables = flax_params(arrays, "qsafe")
+```
+
+旧版本生成的 version-2 `.model` 仍可由 PyTorch workflow 读取，新文件统一保存为
+`.npz`。这里不使用 ONNX，因为 ONNX 是推理图格式，不能完整表达 SQRL 迁移所需的
+训练阶段和环境契约。
 
 已回退的 SAC actor 保留原实现的数值近似
 `log(1 - tanh(a)^2 + 1e-6)`，用于 tanh change-of-variables 修正，不包装环境

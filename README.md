@@ -55,9 +55,9 @@ train/mujoco/pytorch/
 ```bash
 python -m train.runner sim
 python -m train.runner pretrain
-python -m train.runner zero-shot --checkpoint runs/sqrl/pretrain/final.model
-python -m train.runner finetune --checkpoint runs/sqrl/pretrain/final.model
-python -m train.runner eval --checkpoint runs/sqrl/finetune/final.model
+python -m train.runner zero-shot --checkpoint runs/sqrl/pretrain/final.npz
+python -m train.runner finetune --checkpoint runs/sqrl/pretrain/final.npz
+python -m train.runner eval --checkpoint runs/sqrl/finetune/final.npz
 ```
 
 The simulator command uses the MJCF and meshes in this repository and locates
@@ -186,8 +186,29 @@ choice is intentional and tested, but is not a claim of reproducing that
 ambiguous sentence word for word.
 
 The original QSafe network implementation is retained, including its final
-`tanh` activation. Checkpoints are policy/QSafe transfer artifacts, not
+`tanh` activation. The runner atomically saves `step_XXXXXXXXX.npz` every
+`runner.checkpoint_frequency` task transitions (10,000 by default) and writes
+`final.npz` after successful completion. Set the frequency to zero to disable
+periodic snapshots. These files are policy/QSafe transfer artifacts, not
 optimizer-state training resumes.
+
+The NPZ representation contains JSON metadata plus framework-neutral NumPy
+arrays and never uses pickle. Dense kernels use the Flax `[input, output]`
+layout. PyTorch loading is handled by `SQRLWorkflow.load`; JAX/Flax code can use
+the same file directly:
+
+```python
+from sqrl.checkpoint import flax_params, load_portable_checkpoint
+
+metadata, arrays = load_portable_checkpoint("runs/sqrl/pretrain/final.npz")
+policy_variables = flax_params(arrays, "policy")
+qsafe_variables = flax_params(arrays, "qsafe")
+```
+
+Version-2 `.model` files produced by earlier revisions remain readable by the
+PyTorch workflow, but new checkpoints are always portable `.npz` files. ONNX
+is intentionally not used because it is an inference graph format and does not
+preserve the training phase and environment contract needed for SQRL transfer.
 
 The reverted SAC actor retains its original numerical approximation,
 `log(1 - tanh(a)^2 + 1e-6)`, for the tanh change-of-variables correction. The
