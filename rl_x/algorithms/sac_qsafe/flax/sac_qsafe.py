@@ -1,6 +1,7 @@
-import os
+import hashlib
 import json
 import logging
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -47,6 +48,20 @@ from rl_x.algorithms.sac_qsafe.flax.observation_normalizer import (
 from rl_x.environments.safety_rollout import InvalidTransitionError
 
 rlx_logger = logging.getLogger("rl_x")
+
+
+def _parameter_fingerprint(value) -> str:
+    """Return a stable digest for an initialized JAX parameter/state tree."""
+
+    digest = hashlib.sha256()
+    leaves, tree_definition = jax.tree_util.tree_flatten(value)
+    digest.update(str(tree_definition).encode("utf-8"))
+    for leaf in leaves:
+        array = np.asarray(jax.device_get(leaf))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _apply_gradients_if_enabled(train_state, gradients, enabled):
@@ -261,6 +276,46 @@ class SAC_QSafe:
                 + "; task critics, targets, entropy temperature, replay, "
                 "optimizers, and nu start fresh"
             )
+
+            initialization_contract = {
+                "seed": int(self.seed),
+                "source_policy_path": str(
+                    config.algorithm.pretrained_policy_path
+                ),
+                "alpha_init": float(config.algorithm.alpha_init),
+                "learning_starts": int(self.learning_starts),
+                "actor_warmup_steps": int(self.finetune_actor_warmup_steps),
+                "actor_update_interval": int(
+                    self.finetune_actor_update_interval
+                ),
+                "task_utd_ratio": float(self.task_utd_ratio),
+                "fingerprints": {
+                    "policy": _parameter_fingerprint(
+                        self.policy_state.params
+                    ),
+                    "task_critic": _parameter_fingerprint(
+                        self.critic_state.params
+                    ),
+                    "target_task_critic": _parameter_fingerprint(
+                        self.critic_state.target_params
+                    ),
+                    "entropy_temperature": _parameter_fingerprint(
+                        self.entropy_coefficient_state.params
+                    ),
+                    "actor_normalizer": _parameter_fingerprint(
+                        self.observation_normalizer.state_dict()
+                    ),
+                },
+            }
+            destination = Path(run_path) / "initialization_contract.json"
+            temporary = destination.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(
+                    initialization_contract, indent=2, sort_keys=True
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(destination)
 
         self._build_action_kernels()
         self._warm_up_action_kernels()

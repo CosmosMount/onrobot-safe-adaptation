@@ -148,7 +148,9 @@ def test_numpy_sdk_projection_is_side_effect_free_and_matches_mapper():
     actions_before = actions.copy()
 
     common = project_actions_from_observation(states, actions)
-    sdk = Go2SDKMujocoEnv.project_actions(states, actions)
+    sdk_environment = object.__new__(Go2SDKMujocoEnv)
+    sdk_environment.action_contract = {"scale": ActionMapper().action_scale}
+    sdk = sdk_environment.project_actions(states, actions)
     expected = []
     for prior, action in zip(previous, actions):
         mapper = ActionMapper()

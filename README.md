@@ -19,6 +19,7 @@ python -m src.run zero-shot
 python -m src.run finetune
 python -m src.run finetune-sac
 python -m src.run eval
+python tools/run_flat_safe_adaptation.py --steps 200000 --seeds 0,1,2
 ```
 
 The simulator command locates the existing `unitree_mujoco` checkout under the
@@ -85,20 +86,19 @@ one update per newly collected transition; changing the number of parallel
 environments therefore no longer silently changes the optimization budget.
 QSafe updates are credited only when complete safety trajectories are committed.
 
-The Go2 transfer manifest is deliberately strict. Manifest v11 records the SDK
-joint order, shared reset pose, absolute joint-target semantics, PD gains,
-torque limits, and the common tilt-or-low-base failure label. Older checkpoints
-are rejected; run `python -m src.run pretrain` again instead of reusing policy
-and safety-critic weights trained with different tensor or incident semantics.
-The source and target tasks both use flat ground. Source pre-training enables
-bounded transfer randomization for friction, base/leg mass, COM, actuator
-gains, reset state, and proprioceptive sensor noise. Rough terrain remains a
-later robustness gate.
+The Go2 transfer manifest is deliberately strict. New Universal-QSafe actors
+use manifest v11. The formal flat Safe-Adaptation regression intentionally
+retains one older, deployment-verified manifest-v9/action-v1 actor and rejects
+every other legacy combination. Both contracts record the SDK joint order,
+shared reset pose, absolute joint-target semantics, PD gains, torque limits,
+and the common tilt-or-low-base failure label. The source and target tasks both
+use flat ground. Rough terrain remains a later robustness gate.
 
 ## Verified MuJoCo flat SAC fine-tuning
 
 There is one supported standard-SAC target recipe. It transfers only the actor
-and its observation normalizer from the compatible manifest-v11 flat policy.
+and its observation normalizer from the verified
+`isaac_sac_height_dr_v1` manifest-v9 flat policy.
 The target task creates new task critics and targets, replay, optimizers, and
 entropy temperature. The actor and alpha remain frozen for the first 10,000
 transitions while the new critic learns; afterwards they update once per ten
@@ -119,7 +119,7 @@ Then run the retained 30k regression recipe in another terminal:
 
 ```bash
 python -m src.run finetune-sac \
-  --checkpoint runs/go2_sqrl/pretrain/isaac_sac_flat_action_v2_legacy_v1/models \
+  --checkpoint runs/go2_sqrl/pretrain/isaac_sac_height_dr_v1/models \
   --seed 0 \
   --domain-id 1 \
   --interface lo \
@@ -131,13 +131,13 @@ python -m src.run finetune-sac \
   --algorithm.alpha_init=0.0002 \
   --environment.target_velocity_x=0.6 \
   --environment.terrain_profile=flat \
-  --environment.foot_clearance_target=0.0 \
+  --environment.foot_clearance_target=0.07 \
   --environment.clearance_reward_mode=legacy_mean \
   --environment.phase_reward_scale=0.0 \
   --environment.stable_progress_scale=0.0 \
   --environment.terminal_failure_penalty=0.0 \
   --runner.track_tb=true \
-  --runner.run_name=mujoco_sac_flat_v11_s0_30k
+  --runner.run_name=mujoco_sac_old_applied_flat_repro_s0_30k
 ```
 
 The regression run finished at `0.534 m/s` forward velocity. A separate
@@ -153,7 +153,7 @@ Evaluate the saved task policy with the same flat reward contract:
 
 ```bash
 python -m src.run eval \
-  --checkpoint runs/go2_sqrl/finetune/mujoco_sac_flat_v11_s0_30k/models/final.model \
+  --checkpoint runs/go2_sqrl/finetune/mujoco_sac_old_applied_flat_repro_s0_30k/models/final.model \
   --seed 0 \
   --domain-id 1 \
   --interface lo \
@@ -161,9 +161,30 @@ python -m src.run eval \
   --algorithm.eval_policy=task \
   --environment.target_velocity_x=0.6 \
   --environment.terrain_profile=flat \
-  --environment.foot_clearance_target=0.0 \
+  --environment.foot_clearance_target=0.07 \
   --environment.phase_reward_scale=0.0
 ```
+
+For the formal QSafe on/off comparison, both arms use that same actor,
+normalizer, target-task initialization seed, alpha, and update schedule. The
+independent frozen safety critic is
+`isaac_sqrl_height_dr_v1/models/qsafe.model`; only
+`algorithm.qsafe.enabled` changes between arms. Run three paired 200k seeds
+from the repository root with:
+
+```bash
+python tools/run_flat_safe_adaptation.py \
+  --steps 200000 \
+  --seeds 0,1,2 \
+  --parallel-seeds 1
+```
+
+The launcher starts a fresh flat simulator for each arm, verifies matching
+actor/task-critic/target-critic/alpha/normalizer fingerprints, stops on major
+runtime or learning failures, evaluates the final deterministic task actors,
+and writes falls-per-100k, episode fall probability, velocity, rejection,
+fallback, and action-selection diagnostics under
+`runs/go2_sqrl/ablation/flat_safe_adaptation_v1`.
 
 ## Deterministic gait-capability gate
 

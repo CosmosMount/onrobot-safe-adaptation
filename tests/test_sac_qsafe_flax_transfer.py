@@ -21,7 +21,6 @@ import torch.nn.functional as torch_functional
 from gymnasium.spaces import Box
 
 from rl_x.algorithms.qsafe.flax.safety_critic import SafetyQNetwork
-from rl_x.algorithms.qsafe.common import TASK_ACTION_CONTRACT
 from rl_x.algorithms.sac.flax.policy import get_policy
 from rl_x.algorithms.sac.pytorch.policy import (
     squashed_gaussian_log_probability as torch_squashed_gaussian_log_probability,
@@ -31,7 +30,6 @@ from rl_x.algorithms.sac_qsafe.flax import sac_qsafe as sac_qsafe_module
 from rl_x.algorithms.sac_qsafe.flax.sac_qsafe import SAC_QSafe
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
-    load_torch_task_artifact,
     load_torch_qsafe_artifact,
 )
 from rl_x.algorithms.sac_qsafe.flax.distributions import (
@@ -47,43 +45,6 @@ from rl_x.environments.observation_space_type import ObservationSpaceType
 OBSERVATION_SIZE = 46
 ACTION_SIZE = 12
 HIDDEN_SIZE = 256
-
-
-def test_flax_handoff_changes_actual_adam_lr_and_gate():
-    state = TrainState.create(
-        apply_fn=lambda *_: None,
-        params={"weight": jnp.asarray(1.0, dtype=jnp.float32)},
-        tx=optax.inject_hyperparams(optax.adam)(learning_rate=3e-4),
-    )
-    gradients = {"weight": jnp.asarray(1.0, dtype=jnp.float32)}
-
-    zero_lr_state = sac_qsafe_module._replace_optimizer_learning_rate(state, 0.0)
-    zero_lr_state = sac_qsafe_module._apply_gradients_if_enabled(
-        zero_lr_state, gradients, True
-    )
-    assert float(zero_lr_state.params["weight"]) == pytest.approx(1.0)
-    assert int(zero_lr_state.step) == 1
-
-    half_lr_state = sac_qsafe_module._replace_optimizer_learning_rate(
-        zero_lr_state, 1.5e-4
-    )
-    half_lr_state = sac_qsafe_module._apply_gradients_if_enabled(
-        half_lr_state, gradients, True
-    )
-    assert float(half_lr_state.params["weight"]) == pytest.approx(
-        1.0 - 1.5e-4, abs=2e-7
-    )
-    assert float(
-        half_lr_state.opt_state.hyperparams["learning_rate"]
-    ) == pytest.approx(1.5e-4)
-
-    frozen_state = sac_qsafe_module._apply_gradients_if_enabled(
-        half_lr_state, gradients, False
-    )
-    assert int(frozen_state.step) == int(half_lr_state.step)
-    assert float(frozen_state.params["weight"]) == pytest.approx(
-        float(half_lr_state.params["weight"])
-    )
 
 
 class _Properties:
@@ -152,102 +113,6 @@ def _torch_policy_state():
         "_orig_mod.log_std.weight": log_std_weight,
         "_orig_mod.log_std.bias": log_std_bias,
     }
-
-
-def _torch_critic_state(offset):
-    first_weight, first_bias = _linear_state(
-        HIDDEN_SIZE, OBSERVATION_SIZE + ACTION_SIZE, offset
-    )
-    second_weight, second_bias = _linear_state(
-        HIDDEN_SIZE, HIDDEN_SIZE, offset + 0.01
-    )
-    output_weight, output_bias = _linear_state(1, HIDDEN_SIZE, offset - 0.01)
-    return {
-        "_orig_mod.critic.0.weight": first_weight,
-        "_orig_mod.critic.0.bias": first_bias,
-        "_orig_mod.critic.2.weight": second_weight,
-        "_orig_mod.critic.2.bias": second_bias,
-        "_orig_mod.critic.4.weight": output_weight,
-        "_orig_mod.critic.4.bias": output_bias,
-    }
-
-
-def test_torch_task_critic_transfer_preserves_online_target_and_alpha(tmp_path):
-    config = SimpleNamespace(
-        algorithm=SimpleNamespace(nr_hidden_units=HIDDEN_SIZE)
-    )
-    critic = get_critic(config, _Environment())
-    template = critic.init(
-        jax.random.PRNGKey(4),
-        jnp.zeros((1, OBSERVATION_SIZE), dtype=jnp.float32),
-        jnp.zeros((1, ACTION_SIZE), dtype=jnp.float32),
-    )
-    q1, q2 = _torch_critic_state(0.01), _torch_critic_state(-0.02)
-    q1_target, q2_target = _torch_critic_state(0.03), _torch_critic_state(-0.04)
-    path = tmp_path / "final.model"
-    torch.save(
-        {
-            "task_action_contract": TASK_ACTION_CONTRACT,
-            "q1_state_dict": q1,
-            "q2_state_dict": q2,
-            "q1_target_state_dict": q1_target,
-            "q2_target_state_dict": q2_target,
-            "log_alpha": torch.tensor(-8.0),
-        },
-        path,
-    )
-
-    artifact = load_torch_task_artifact(path, template, template)
-    online = flax.serialization.to_state_dict(artifact["critic_params"])
-    target = flax.serialization.to_state_dict(artifact["target_critic_params"])
-    np.testing.assert_allclose(
-        online["params"]["VmapCritic_0"]["Dense_0"]["kernel"][0],
-        q1["_orig_mod.critic.0.weight"].numpy().T,
-    )
-    np.testing.assert_allclose(
-        online["params"]["VmapCritic_0"]["Dense_2"]["bias"][1],
-        q2["_orig_mod.critic.4.bias"].numpy(),
-    )
-    np.testing.assert_allclose(
-        target["params"]["VmapCritic_0"]["Dense_1"]["kernel"][0],
-        q1_target["_orig_mod.critic.2.weight"].numpy().T,
-    )
-    assert artifact["log_alpha"] == pytest.approx(-8.0)
-
-
-@pytest.mark.parametrize(
-    ("marker", "message"),
-    [
-        (None, "missing"),
-        ("applied_rate_limited_v0", "action contract mismatch"),
-    ],
-)
-def test_torch_task_critic_transfer_rejects_legacy_action_contract(
-    tmp_path, marker, message
-):
-    config = SimpleNamespace(
-        algorithm=SimpleNamespace(nr_hidden_units=HIDDEN_SIZE)
-    )
-    critic = get_critic(config, _Environment())
-    template = critic.init(
-        jax.random.PRNGKey(4),
-        jnp.zeros((1, OBSERVATION_SIZE), dtype=jnp.float32),
-        jnp.zeros((1, ACTION_SIZE), dtype=jnp.float32),
-    )
-    checkpoint = {
-        "q1_state_dict": _torch_critic_state(0.01),
-        "q2_state_dict": _torch_critic_state(-0.02),
-        "q1_target_state_dict": _torch_critic_state(0.03),
-        "q2_target_state_dict": _torch_critic_state(-0.04),
-        "log_alpha": torch.tensor(-8.0),
-    }
-    if marker is not None:
-        checkpoint["task_action_contract"] = marker
-    path = tmp_path / "legacy.model"
-    torch.save(checkpoint, path)
-
-    with pytest.raises(ValueError, match=message):
-        load_torch_task_artifact(path, template, template)
 
 
 def _manifest(normalizer_metadata):

@@ -5,7 +5,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from rl_x.algorithms.qsafe.common import TASK_ACTION_CONTRACT
 from rl_x.algorithms.sac_qsafe.pytorch.checkpoint import (
     load_checkpoint_bundle,
     save_checkpoint_bundle,
@@ -92,21 +91,21 @@ def _action_sampling_model():
     return model
 
 
-def test_unconstrained_sampling_returns_raw_task_action_but_applies_projection():
+def test_unconstrained_sampling_returns_applied_task_action():
     model = _action_sampling_model()
 
-    raw_action, processed_action = model._sample_unconstrained_action(
+    applied_action, processed_action = model._sample_unconstrained_action(
         np.zeros((1, 4), dtype=np.float32)
     )
 
-    torch.testing.assert_close(raw_action, torch.full((1, 2), 0.1))
+    torch.testing.assert_close(applied_action, torch.full((1, 2), 0.35))
     torch.testing.assert_close(processed_action, torch.full((1, 2), 0.35))
 
 
-def test_qsafe_selection_keeps_raw_and_applied_candidate_indices_paired():
+def test_qsafe_selection_returns_the_selected_applied_candidate():
     model = _action_sampling_model()
 
-    raw_action, processed_action, _ = model._sample_policy_candidates(
+    applied_action, processed_action, _ = model._sample_policy_candidates(
         np.zeros((1, 4), dtype=np.float32)
     )
 
@@ -114,10 +113,9 @@ def test_qsafe_selection_keeps_raw_and_applied_candidate_indices_paired():
         model.qsafe.seen_candidates[0, :, 0],
         torch.tensor([0.35, 0.45, 0.55]),
     )
-    # QSafe selected candidate one in applied-action space.  Task replay must
-    # receive raw candidate one, while the environment receives its paired
-    # projected value.
-    torch.testing.assert_close(raw_action, torch.full((1, 2), 0.2))
+    # QSafe selected candidate one in applied-action space. Replay and the
+    # environment use that same projected action contract.
+    torch.testing.assert_close(applied_action, torch.full((1, 2), 0.45))
     torch.testing.assert_close(processed_action, torch.full((1, 2), 0.45))
 
 
@@ -200,10 +198,7 @@ def _partitioned_update_model():
     )
     model.phase = "finetune"
     model.finetune_actor_warmup_steps = 10_000
-    model.finetune_actor_handoff_steps = 10_000
     model.finetune_actor_update_interval = 10
-    model._actor_handoff_enabled = True
-    model._policy_nominal_learning_rates = [1e-3]
     model.finetune_constraints_enabled = False
     model.gamma = 0.99
     model.tau = 0.005
@@ -213,65 +208,6 @@ def _partitioned_update_model():
     model._normalize_states = lambda states, update=False: states
     model._project_actions = lambda raw_states, actions: actions + 0.25
     return model
-
-
-def _task_checkpoint(model, marker=TASK_ACTION_CONTRACT):
-    checkpoint = {
-        "q1_state_dict": model.critic.q1.state_dict(),
-        "q2_state_dict": model.critic.q2.state_dict(),
-        "q1_target_state_dict": model.critic.q1_target.state_dict(),
-        "q2_target_state_dict": model.critic.q2_target.state_dict(),
-        "log_alpha": torch.tensor([-4.0]),
-    }
-    if marker is not None:
-        checkpoint["task_action_contract"] = marker
-    return checkpoint
-
-
-def test_pytorch_task_warm_start_accepts_matching_raw_action_contract(tmp_path):
-    model = _partitioned_update_model()
-    with torch.no_grad():
-        model.critic.q1.linear.weight.fill_(0.17)
-        model.critic.q1.linear.bias.fill_(-0.23)
-    checkpoint_path = tmp_path / "task.model"
-    torch.save(_task_checkpoint(model), checkpoint_path)
-    with torch.no_grad():
-        model.critic.q1.linear.weight.zero_()
-        model.critic.q1.linear.bias.zero_()
-        model.entropy_coefficient.log_alpha.zero_()
-
-    model._load_pretrained_task_state(checkpoint_path)
-
-    torch.testing.assert_close(
-        model.critic.q1.linear.weight,
-        torch.full_like(model.critic.q1.linear.weight, 0.17),
-    )
-    torch.testing.assert_close(
-        model.critic.q1.linear.bias,
-        torch.full_like(model.critic.q1.linear.bias, -0.23),
-    )
-    torch.testing.assert_close(
-        model.entropy_coefficient.log_alpha,
-        torch.full_like(model.entropy_coefficient.log_alpha, -4.0),
-    )
-
-
-@pytest.mark.parametrize(
-    ("marker", "message"),
-    [
-        (None, "missing: task_action_contract"),
-        ("applied_rate_limited_v0", "action contract mismatch"),
-    ],
-)
-def test_pytorch_task_warm_start_rejects_legacy_action_contract(
-    tmp_path, marker, message
-):
-    model = _partitioned_update_model()
-    checkpoint_path = tmp_path / "legacy-task.model"
-    torch.save(_task_checkpoint(model, marker=marker), checkpoint_path)
-
-    with pytest.raises(ValueError, match=message):
-        model._load_pretrained_task_state(checkpoint_path)
 
 
 def test_fresh_alpha_is_held_with_transferred_actor_during_warmup():
@@ -289,10 +225,10 @@ def test_fresh_alpha_is_held_with_transferred_actor_during_warmup():
     assert metrics["updates/actor_enabled"] == 0.0
     assert metrics["updates/alpha_enabled"] == 0.0
     assert metrics["finetune/alpha_anti_windup"] == 1.0
-    assert metrics["lr/policy_learning_rate"] == pytest.approx(0.0)
+    assert metrics["lr/learning_rate"] == pytest.approx(1e-3)
 
 
-def test_actor_and_alpha_share_interval_and_optimizer_lr_handoff():
+def test_actor_and_alpha_share_update_interval_without_lr_handoff():
     model = _partitioned_update_model()
     replay = _FixedReplay()
 
@@ -307,13 +243,13 @@ def test_actor_and_alpha_share_interval_and_optimizer_lr_handoff():
     updated = model._partitioned_task_update(replay, global_step=15_010)
     assert updated["updates/actor_enabled"] == 1.0
     assert updated["updates/alpha_enabled"] == 1.0
-    assert updated["lr/policy_learning_rate"] == pytest.approx(0.000501)
+    assert updated["lr/learning_rate"] == pytest.approx(1e-3)
     assert not torch.equal(
         model.entropy_coefficient.log_alpha.detach(), alpha_before
     )
 
 
-def test_actor_optimizer_takes_a_real_zero_lr_step_at_handoff_boundary():
+def test_actor_optimizer_updates_at_warmup_boundary_without_lr_ramp():
     model = _partitioned_update_model()
     replay = _FixedReplay()
     actor_before = model.policy.raw_action_parameter.detach().clone()
@@ -321,26 +257,25 @@ def test_actor_optimizer_takes_a_real_zero_lr_step_at_handoff_boundary():
     boundary = model._partitioned_task_update(replay, global_step=10_000)
 
     assert boundary["updates/actor_enabled"] == 1.0
-    assert boundary["lr/policy_learning_rate"] == pytest.approx(0.0)
-    torch.testing.assert_close(model.policy.raw_action_parameter, actor_before)
+    assert boundary["lr/learning_rate"] == pytest.approx(1e-3)
+    assert not torch.equal(model.policy.raw_action_parameter, actor_before)
     optimizer_state = model.policy_optimizer.state[
         model.policy.raw_action_parameter
     ]
     assert int(optimizer_state["step"]) == 1
 
 
-def test_task_critics_consume_raw_actions_after_actor_unfreezes():
+def test_task_critics_consume_applied_actions_after_actor_unfreezes():
     model = _partitioned_update_model()
     replay = _FixedReplay()
     expected_policy_action = torch.tanh(
         model.policy.raw_action_parameter.detach()
-    ).expand(2, -1)
+    ).expand(2, -1) + 0.25
 
     metrics = model._partitioned_task_update(replay, global_step=10_000)
 
-    # Target critics consume the raw next-policy action.  Online critics see
-    # replay raw actions first, then the raw current-policy action.  The +0.25
-    # projection is reserved for QSafe/environment execution and diagnostics.
+    # Target and online actor losses use the same projected action contract as
+    # replay and the environment.
     torch.testing.assert_close(
         model.critic.q1_target.seen_actions[-1], expected_policy_action
     )

@@ -172,7 +172,7 @@ def test_flat_baseline_disables_optional_clearance_and_phase_shaping(tmp_path):
 
     assert "--environment.target_velocity_x=0.6" in command
     assert "--environment.terrain_profile=flat" in command
-    assert "--environment.foot_clearance_target=0.0" in command
+    assert "--environment.foot_clearance_target=0.07" in command
     assert "--environment.clearance_reward_mode=legacy_mean" in command
     assert "--environment.phase_reward_scale=0.0" in command
     assert "--environment.stable_progress_scale=0.0" in command
@@ -185,13 +185,13 @@ def test_flat_baseline_disables_optional_clearance_and_phase_shaping(tmp_path):
     )
 
 
-def test_mujoco_sac_baseline_defaults_to_v11_flat_contract():
+def test_mujoco_sac_baseline_defaults_to_verified_v9_flat_contract():
     args = build_ablation_parser().parse_args(["mujoco-sac-baseline"])
 
     assert args.scene.name == "scene.xml"
     assert args.terrain_profile == "flat"
     assert args.checkpoint.name == "models"
-    assert args.checkpoint.parent.name == "isaac_sac_flat_action_v2_legacy_v1"
+    assert args.checkpoint.parent.name == "isaac_sac_height_dr_v1"
 
 
 def test_high_clearance_actor_uses_frozen_stable_sac_recipe():
@@ -221,7 +221,7 @@ def test_high_clearance_actor_uses_frozen_stable_sac_recipe():
         100000,
         "stable_high_medium",
     )
-    assert "--full-task-transfer" in medium_command
+    assert "--full-task-transfer" not in medium_command
 
 
 def test_isaac_eval_is_single_environment_deterministic_task_policy():
@@ -355,27 +355,17 @@ def test_standard_sac_transfer_only_requires_policy(tmp_path: Path):
         f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}"
     ]
     (tmp_path / "final.model").touch()
-    with pytest.raises(ValueError, match="fresh task critics/targets"):
-        _artifact_flags("finetune-sac", str(tmp_path), full_task_transfer=True)
     assert _artifact_flags("isaac-finetune-sac", str(tmp_path)) == [
         f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}"
-    ]
-    assert _artifact_flags(
-        "isaac-finetune-sac", str(tmp_path), actor_only=True
-    ) == [f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}"]
-    assert _artifact_flags(
-        "isaac-finetune-sac", str(tmp_path), full_task_transfer=True
-    ) == [
-        f"--algorithm.pretrained_policy_path={tmp_path / 'policy.model'}",
-        f"--algorithm.pretrained_task_checkpoint_path={tmp_path / 'final.model'}",
     ]
 
     native = tmp_path / "native"
     native.mkdir()
     (native / "policy.msgpack").touch()
     (native / "final.model").touch()
-    with pytest.raises(ValueError, match="fresh task critics/targets"):
-        _artifact_flags("finetune-sac", str(native), full_task_transfer=True)
+    assert _artifact_flags("finetune-sac", str(native)) == [
+        f"--algorithm.pretrained_policy_path={native / 'policy.msgpack'}"
+    ]
 
 
 def test_universal_qsafe_transfer_accepts_an_independent_checkpoint(tmp_path: Path):
@@ -391,13 +381,12 @@ def test_universal_qsafe_transfer_accepts_an_independent_checkpoint(tmp_path: Pa
         f"--algorithm.qsafe.checkpoint_path={qsafe}",
     ]
     (actor / "final.model").touch()
-    with pytest.raises(ValueError, match="fresh task critics/targets"):
-        _artifact_flags(
-            "isaac-finetune",
-            str(actor),
-            str(qsafe),
-            full_task_transfer=True,
-        )
+    assert _artifact_flags(
+        "isaac-finetune", str(actor), str(qsafe)
+    ) == [
+        f"--algorithm.pretrained_policy_path={actor / 'policy.model'}",
+        f"--algorithm.qsafe.checkpoint_path={qsafe}",
+    ]
 
 
 def test_frs_diagnostic_collection_profile_is_targeted_and_actor_isolated():

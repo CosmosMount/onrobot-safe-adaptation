@@ -431,9 +431,26 @@ class QSafe:
         batch_indices = jnp.arange(nr_envs)
         log_probs = candidate_log_probs.reshape((nr_envs, nr_candidates))
         flat_q = q_values.reshape((-1,))
-        return candidate_actions[batch_indices, selected], selected, {
+        selected_actions = candidate_actions[batch_indices, selected]
+        candidate_zero_rejected = ~safe_mask[:, 0]
+        action_delta = selected_actions - candidate_actions[:, 0]
+        action_changed = jnp.linalg.norm(action_delta, axis=-1) > 1e-6
+        return selected_actions, selected, {
             "qsafe/rejected_fraction": jnp.mean(~safe_mask),
             "qsafe/fallback_fraction": jnp.mean(fallback),
+            # Candidate zero is the within-pool task-policy reference. Total
+            # selector changes are not pure safety interventions, so keep them
+            # separate from changes that replace a QSafe-rejected reference.
+            "qsafe/action_change_fraction": jnp.mean(action_changed),
+            "qsafe/action_change_l2": jnp.mean(
+                jnp.linalg.norm(action_delta, axis=-1)
+            ),
+            "qsafe/candidate0_rejected_fraction": jnp.mean(
+                candidate_zero_rejected
+            ),
+            "qsafe/safety_intervention_fraction": jnp.mean(
+                action_changed & candidate_zero_rejected
+            ),
             "qsafe/selected_value": jnp.mean(q_values[batch_indices, selected]),
             "qsafe/candidate_value_p50": jnp.quantile(flat_q, 0.50),
             "qsafe/candidate_value_p90": jnp.quantile(flat_q, 0.90),

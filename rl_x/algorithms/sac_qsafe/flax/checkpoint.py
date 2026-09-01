@@ -8,9 +8,6 @@ from typing import Any, Mapping
 import numpy as np
 from flax import serialization
 
-from rl_x.algorithms.qsafe.common import TASK_ACTION_CONTRACT
-
-
 POLICY_ARTIFACT_FORMAT = "sac_qsafe_flax_policy"
 POLICY_ARTIFACT_VERSION = 1
 
@@ -200,85 +197,6 @@ def convert_torch_critic_params(
         vmapped[dense_name]["kernel"] = kernels
         vmapped[dense_name]["bias"] = biases
     return serialization.from_state_dict(template_params, state)
-
-
-def load_torch_task_artifact(
-    file_path: str | Path,
-    online_template,
-    target_template,
-) -> dict[str, Any]:
-    """Load task critics/targets and alpha while leaving optimizers fresh."""
-
-    checkpoint = _load_torch(file_path)
-    required = {
-        "task_action_contract",
-        "q1_state_dict",
-        "q2_state_dict",
-        "q1_target_state_dict",
-        "q2_target_state_dict",
-        "log_alpha",
-    }
-    missing = required.difference(checkpoint)
-    if missing:
-        raise ValueError(f"PyTorch task checkpoint is missing {sorted(missing)}")
-    if checkpoint["task_action_contract"] != TASK_ACTION_CONTRACT:
-        raise ValueError(
-            "PyTorch task checkpoint action contract mismatch: expected "
-            f"{TASK_ACTION_CONTRACT}, got {checkpoint['task_action_contract']}"
-        )
-    return {
-        "critic_params": convert_torch_critic_params(
-            online_template,
-            checkpoint["q1_state_dict"],
-            checkpoint["q2_state_dict"],
-        ),
-        "target_critic_params": convert_torch_critic_params(
-            target_template,
-            checkpoint["q1_target_state_dict"],
-            checkpoint["q2_target_state_dict"],
-        ),
-        "log_alpha": float(_as_numpy(checkpoint["log_alpha"]).reshape(())),
-    }
-
-
-def load_task_artifact(
-    file_path: str | Path,
-    online_template,
-    target_template,
-) -> dict[str, Any]:
-    """Load Torch or native-Flax task parameters without optimizer state."""
-
-    if looks_like_torch_checkpoint(file_path):
-        return load_torch_task_artifact(
-            file_path, online_template, target_template
-        )
-    with open(file_path, "rb") as model_file:
-        payload = serialization.msgpack_restore(model_file.read())
-    try:
-        if payload.get("task_action_contract") != TASK_ACTION_CONTRACT:
-            raise ValueError(
-                "Native task checkpoint action contract mismatch: expected "
-                f"{TASK_ACTION_CONTRACT}, got "
-                f"{payload.get('task_action_contract')}"
-            )
-        checkpoint = payload["checkpoint"]
-        critic = checkpoint["critic"]
-        entropy = checkpoint["entropy_coefficient"]
-        return {
-            "critic_params": serialization.from_state_dict(
-                online_template, critic["params"]
-            ),
-            "target_critic_params": serialization.from_state_dict(
-                target_template, critic["target_params"]
-            ),
-            "log_alpha": float(
-                np.asarray(entropy["params"]["params"]["log_alpha"]).reshape(())
-            ),
-        }
-    except (KeyError, TypeError) as exc:
-        raise ValueError(
-            f"Native task checkpoint {file_path} has an invalid structure"
-        ) from exc
 
 
 def _normalizer_state_from_torch(state: Mapping[str, Any]) -> dict[str, Any]:
