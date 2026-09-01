@@ -101,41 +101,54 @@ class SafetyTrainer:
 
         self.policy.eval()
         self.critic.q.train()
-        reset_result = self.env.reset()
-        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         collected = 0
         selected_q_sum = 0.0
         fallback_count = 0
         action_count = 0
         while collected < self.rollouts_per_block:
-            actions, processed_actions, selected_q, fallback = self._sample_actions(
-                state
-            )
-            actions = validate_policy_commands(
-                actions, self.nr_envs, self.env.single_action_space.shape
-            )
-            selected_q_sum += float(selected_q.sum())
-            fallback_count += int(fallback.sum())
-            action_count += int(fallback.size)
-            next_state, _, terminated, truncated, info = self.env.step(
-                processed_actions
-            )
-            actual_next_state, terminations, truncations, failures = (
-                self._process_step(next_state, terminated, truncated, info)
-            )
-            # Replay the policy command; actuator projection is part of env.step.
-            completed = self.replay_buffer.add(
-                np.asarray(state, dtype=np.float32),
-                actual_next_state,
-                actions,
-                failures,
-                terminations,
-                truncations,
+            wave_size = min(
                 self.rollouts_per_block - collected,
+                self.nr_envs,
             )
-            collected += completed
-            self.rollouts += completed
-            state = next_state
+            reset_result = self.env.reset()
+            state = (
+                reset_result[0]
+                if isinstance(reset_result, tuple)
+                else reset_result
+            )
+            active_lanes = np.arange(self.nr_envs) < wave_size
+
+            while active_lanes.any():
+                actions, processed_actions, selected_q, fallback = (
+                    self._sample_actions(state)
+                )
+                actions = validate_policy_commands(
+                    actions, self.nr_envs, self.env.single_action_space.shape
+                )
+                selected_q_sum += float(selected_q[active_lanes].sum())
+                fallback_count += int(fallback[active_lanes].sum())
+                action_count += int(active_lanes.sum())
+                next_state, _, terminated, truncated, info = self.env.step(
+                    processed_actions
+                )
+                actual_next_state, terminations, truncations, failures = (
+                    self._process_step(next_state, terminated, truncated, info)
+                )
+                # Replay the policy command; actuator projection is part of env.step.
+                completed_lanes = self.replay_buffer.add(
+                    np.asarray(state, dtype=np.float32),
+                    actual_next_state,
+                    actions,
+                    failures,
+                    terminations,
+                    truncations,
+                    active_lanes,
+                )
+                completed_now = int(completed_lanes.sum())
+                collected += completed_now
+                self.rollouts += completed_now
+                active_lanes &= ~completed_lanes
+                state = next_state
 
         nr_updates = self.optimizer_steps
         if nr_updates is None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+from dataclasses import fields
 from io import StringIO
 
 import numpy as np
@@ -117,6 +118,9 @@ class Go2IsaacEnv(Go2Environment):
         )
         self._window_tilt_failure = self._window_failure.clone()
         self._window_height_failure = self._window_failure.clone()
+        self._first_failure_frame = torch.full(
+            (self.nr_envs,), -1, dtype=torch.long, device=robot.device
+        )
         self._latest_estimated_body_velocity = torch.zeros(
             self.nr_envs, 3, device=robot.device
         )
@@ -256,10 +260,36 @@ class Go2IsaacEnv(Go2Environment):
         failure = self._fall_detector.update(
             frame.imu_quat, frame.base_clearance
         )
+        first_failure = failure & ~self._window_failure
+        self._first_failure_frame[first_failure] = len(self._physics_frames)
+        self._window_tilt_failure[first_failure] = (
+            self._fall_detector.last_tilt_failure[first_failure]
+        )
+        self._window_height_failure[first_failure] = (
+            self._fall_detector.last_height_failure[first_failure]
+        )
         self._window_failure |= failure
-        self._window_tilt_failure |= self._fall_detector.last_tilt_failure
-        self._window_height_failure |= self._fall_detector.last_height_failure
         self._physics_frames.append(frame)
+
+    def _transition_frame(self) -> IsaacPhysicsFrame:
+        """Select each lane's first failure frame, or its final normal frame."""
+
+        if not bool(self._window_failure.any()):
+            return self._physics_frames[-1]
+        final_index = len(self._physics_frames) - 1
+        frame_indices = torch.where(
+            self._first_failure_frame >= 0,
+            self._first_failure_frame,
+            torch.full_like(self._first_failure_frame, final_index),
+        )
+        env_indices = torch.arange(self.nr_envs, device=self._robot.device)
+        values = {
+            field.name: torch.stack(
+                [getattr(frame, field.name) for frame in self._physics_frames]
+            )[frame_indices, env_indices]
+            for field in fields(IsaacPhysicsFrame)
+        }
+        return IsaacPhysicsFrame(**values)
 
     def _observation_from_frame(self, frame: IsaacPhysicsFrame):
         observation, quaternion = build_observation_tensor(
@@ -432,6 +462,7 @@ class Go2IsaacEnv(Go2Environment):
         self._window_failure.zero_()
         self._window_tilt_failure.zero_()
         self._window_height_failure.zero_()
+        self._first_failure_frame.fill_(-1)
         self._collect_physics_frames = True
         try:
             _, _, backend_terminated, backend_truncated, extras = self.backend.step(
@@ -448,7 +479,7 @@ class Go2IsaacEnv(Go2Environment):
                 f"{len(self._physics_frames)} physics frames; expected exactly "
                 f"{PHYSICS_STEPS_PER_ACTION}"
             )
-        terminal_frame = self._physics_frames[-1]
+        terminal_frame = self._transition_frame()
         terminal_observation = self._observation_from_frame(terminal_frame)
         target_velocity = float(self.config.target_velocity_x)
         reward_terms, reward = compute_reward_tensor(

@@ -417,7 +417,8 @@ class IsaacEnvironmentContractTest(unittest.TestCase):
     def test_timeout_reward_and_final_observation_are_pre_reset(self):
         env, backend = self.make_env()
         frames = [
-            {"velocity_x": [0.5], "q_delta": 0.05} for _ in range(10)
+            {"velocity_x": [0.5], "q_delta": 0.01 * (index + 1)}
+            for index in range(10)
         ]
         backend.queue(frames, truncated=[True])
 
@@ -430,7 +431,7 @@ class IsaacEnvironmentContractTest(unittest.TestCase):
         self.assertAlmostEqual(float(reward[0]), 1.0, places=6)
         np.testing.assert_allclose(
             info["final_observation"][0][:12],
-            DEFAULT_JOINT_POSITION + 0.05,
+            DEFAULT_JOINT_POSITION + 0.1,
             atol=1e-6,
         )
         np.testing.assert_allclose(
@@ -488,6 +489,47 @@ class IsaacEnvironmentContractTest(unittest.TestCase):
         )
         self.assertTrue(terminated[0])
         self.assertEqual(float(info["failure/height"][0]), 1.0)
+
+    def test_each_lane_uses_its_first_failure_or_final_normal_frame(self):
+        env, backend = self.make_env(nr_envs=2, nr_task_envs=1)
+        bad_quaternion = _roll_quaternion(1.0)
+        good_quaternion = [1.0, 0.0, 0.0, 0.0]
+        frames = []
+        for index in range(10):
+            lane_zero_incident = index < 5
+            frames.append(
+                {
+                    "q_delta": [0.01 * (index + 1), 0.02 * (index + 1)],
+                    "velocity_x": [0.2 + 0.01 * index, 0.5 + 0.01 * index],
+                    "base_z": [0.17 if lane_zero_incident else 0.289, 0.289],
+                    "quaternion": [
+                        bad_quaternion if lane_zero_incident else good_quaternion,
+                        good_quaternion,
+                    ],
+                }
+            )
+        backend.queue(frames)
+
+        observation, _, terminated, truncated, info = env.step(
+            np.zeros((2, 12), dtype=np.float32)
+        )
+
+        np.testing.assert_array_equal(terminated, [True, False])
+        np.testing.assert_array_equal(truncated, [False, False])
+        np.testing.assert_allclose(
+            info["final_observation"][0][:12],
+            DEFAULT_JOINT_POSITION + 0.05,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            observation[1, :12], DEFAULT_JOINT_POSITION + 0.2, atol=1e-6
+        )
+        np.testing.assert_allclose(info["forward_velocity"], [0.24, 0.59])
+        np.testing.assert_allclose(info["base_clearance"], [0.17, 0.289])
+        np.testing.assert_array_equal(info["failure"], [1.0, 0.0])
+        np.testing.assert_array_equal(info["failure/tilt"], [1.0, 0.0])
+        np.testing.assert_array_equal(info["failure/height"], [1.0, 0.0])
+        self.assertEqual(backend.public_reset_calls, [(0,)])
 
 if __name__ == "__main__":
     unittest.main()

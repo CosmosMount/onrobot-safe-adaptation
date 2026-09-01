@@ -555,7 +555,8 @@ class Go2MujocoEnv(Go2Environment):
         failure = False
         tilt_failure = False
         height_failure = False
-        for frame, frame_truth in zip(frames, truth_frames):
+        transition_index = len(frames) - 1
+        for index, (frame, frame_truth) in enumerate(zip(frames, truth_frames)):
             frame_clearance = float(
                 local_base_clearance(
                     np.asarray(frame_truth.base_position, dtype=np.float64)[2],
@@ -566,13 +567,16 @@ class Go2MujocoEnv(Go2Environment):
             frame_height_failure = self.fall_detector.update_base_clearance(
                 frame_clearance
             )
-            tilt_failure = frame_tilt_failure or tilt_failure
-            height_failure = frame_height_failure or height_failure
-            failure = frame_tilt_failure or frame_height_failure or failure
-        final_state = frames[-1]
-        truth = truth_frames[-1]
+            if frame_tilt_failure or frame_height_failure:
+                transition_index = index
+                tilt_failure = frame_tilt_failure
+                height_failure = frame_height_failure
+                failure = True
+                break
+        final_state = frames[transition_index]
+        truth = truth_frames[transition_index]
         observation, estimated_body_velocity = self.observation_builder.build_many(
-            frames
+            frames[: transition_index + 1]
         )
 
         if final_state.actuator_torque is None:

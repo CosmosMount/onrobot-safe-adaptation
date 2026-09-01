@@ -36,7 +36,10 @@ class SafetySamplingMetricsTests(unittest.TestCase):
         trainer.optimizer_steps = 1
         trainer.epochs_per_block = None
         trainer.replay_buffer = mock.Mock(size=2)
-        trainer.replay_buffer.add.side_effect = [0, 2]
+        trainer.replay_buffer.add.side_effect = [
+            np.asarray([False, False]),
+            np.asarray([True, True]),
+        ]
         trainer.rollouts = 0
         trainer.blocks = 0
         trainer.update_steps = 0

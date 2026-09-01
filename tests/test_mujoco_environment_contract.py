@@ -223,6 +223,10 @@ class MujocoTransitionContractTest(unittest.TestCase):
     def test_timeout_physically_resets_but_preserves_terminal_observation(self):
         env = _environment()
         frames = [_state(tick) for tick in range(2, 22, 2)]
+        final_quaternion = np.asarray(
+            [math.cos(0.05), 0.0, 0.0, math.sin(0.05)], dtype=np.float32
+        )
+        frames[-1] = _state(20, quaternion=final_quaternion)
         truths = [_truth(frame.tick) for frame in frames]
         env._wait_window = lambda count=None: frames
         env._training_states_for_frames = lambda supplied: truths
@@ -246,14 +250,23 @@ class MujocoTransitionContractTest(unittest.TestCase):
         self.assertFalse(
             np.array_equal(info["final_observation"][0], reset_observation)
         )
-
-    def test_failure_is_retained_if_first_five_frames_are_bad(self):
-        env = _environment()
-        tilted = np.asarray(
-            [math.cos(0.45), math.sin(0.45), 0.0, 0.0], dtype=np.float32
+        np.testing.assert_allclose(
+            info["final_observation"][0][OBSERVATION_SPEC.imu_quat],
+            final_quaternion,
+            atol=1e-6,
         )
+
+    def test_failure_uses_the_first_triggering_physics_frame(self):
+        env = _environment()
+        tilted = [
+            np.asarray(
+                [math.cos(angle / 2.0), math.sin(angle / 2.0), 0.0, 0.0],
+                dtype=np.float32,
+            )
+            for angle in np.linspace(0.9, 1.1, 5)
+        ]
         frames = [
-            _state(tick, quaternion=tilted if index < 5 else None)
+            _state(tick, quaternion=tilted[index] if index < 5 else None)
             for index, tick in enumerate(range(2, 22, 2))
         ]
         truths = [
@@ -269,8 +282,48 @@ class MujocoTransitionContractTest(unittest.TestCase):
         )
         self.assertTrue(bool(terminated[0]))
         self.assertFalse(bool(truncated[0]))
+        self.assertEqual(float(info["failure"][0]), 1.0)
         self.assertEqual(float(info["failure/tilt"][0]), 1.0)
         self.assertEqual(float(info["failure/height"][0]), 1.0)
+        np.testing.assert_allclose(
+            info["final_observation"][0][OBSERVATION_SPEC.imu_quat],
+            tilted[4],
+            atol=1e-6,
+        )
+
+    def test_tilt_counter_crosses_policy_window_boundary(self):
+        env = _environment()
+        tilted = np.asarray(
+            [math.cos(0.45), math.sin(0.45), 0.0, 0.0], dtype=np.float32
+        )
+        frames = [
+            _state(tick, quaternion=tilted if index >= 6 else None)
+            for index, tick in enumerate(range(2, 22, 2))
+        ]
+        truths = [_truth(frame.tick) for frame in frames]
+        env._wait_window = lambda count=None: frames
+        env._training_states_for_frames = lambda supplied: truths
+
+        _, _, terminated, _, _ = env.step(np.zeros((1, 12), dtype=np.float32))
+        self.assertFalse(bool(terminated[0]))
+
+        frames = [
+            _state(tick, quaternion=tilted if index == 0 else None)
+            for index, tick in enumerate(range(22, 42, 2))
+        ]
+        truths = [_truth(frame.tick) for frame in frames]
+        reset_observation = np.zeros(46, dtype=np.float32)
+        env._manual_failure_reset = lambda: reset_observation.copy()
+        _, _, terminated, _, info = env.step(
+            np.zeros((1, 12), dtype=np.float32)
+        )
+        self.assertTrue(bool(terminated[0]))
+        self.assertEqual(float(info["failure/tilt"][0]), 1.0)
+        np.testing.assert_allclose(
+            info["final_observation"][0][OBSERVATION_SPEC.imu_quat],
+            tilted,
+            atol=1e-6,
+        )
 
     def test_eval_reset_uses_physical_simulator_reset(self):
         env = _environment()

@@ -20,24 +20,36 @@ class RolloutBuffer:
     def nr_trajectories(self):
         return len(self.trajectories)
 
-    def add(self, states, next_states, actions, failures, terminations, truncations, remaining):
-        completed = []
-        for env_index in range(self.nr_envs):
+    def add(
+        self,
+        states,
+        next_states,
+        actions,
+        failures,
+        terminations,
+        truncations,
+        active_lanes,
+    ):
+        """Append one step to active lanes and return the lanes that completed."""
+
+        active_lanes = np.asarray(active_lanes, dtype=bool)
+        if active_lanes.shape != (self.nr_envs,):
+            raise ValueError(
+                f"active_lanes must have shape ({self.nr_envs},), "
+                f"got {active_lanes.shape}"
+            )
+        completed = np.zeros(self.nr_envs, dtype=bool)
+        for env_index in np.flatnonzero(active_lanes):
             transition = tuple(
                 np.array(field[env_index], copy=True)
                 for field in (states, next_states, actions, failures, terminations, truncations)
             )
             self.pending[env_index].append(transition)
             if terminations[env_index] or truncations[env_index]:
-                completed.append(self.pending[env_index])
+                self.add_trajectory(self.pending[env_index])
                 self.pending[env_index] = []
-
-        completed = completed[:remaining]
-        for trajectory in completed:
-            self.add_trajectory(trajectory)
-        if len(completed) == remaining:
-            self.pending = [[] for _ in range(self.nr_envs)]
-        return len(completed)
+                completed[env_index] = True
+        return completed
 
     def add_trajectory(self, trajectory):
         if not trajectory:

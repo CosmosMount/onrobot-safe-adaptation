@@ -93,6 +93,93 @@ class SafetyComponentsTests(unittest.TestCase):
         ]
         self.assertEqual(retained, [1.0, 2.0])
 
+    def test_safety_trainer_collects_k_in_complete_lane_waves(self):
+        from sqrl.sac.pytorch.safety_trainer import SafetyTrainer
+
+        wave_step = 0
+
+        def reset_wave():
+            nonlocal wave_step
+            wave_step = 0
+            return np.zeros((2, 1), dtype=np.float32), {}
+
+        def step_wave(actions):
+            nonlocal wave_step
+            wave_step += 1
+            return (
+                np.full((2, 1), wave_step, dtype=np.float32),
+                np.zeros(2, dtype=np.float32),
+                np.asarray([True, wave_step == 3], dtype=bool),
+                np.zeros(2, dtype=bool),
+                {},
+            )
+
+        env = mock.Mock(
+            num_envs=2,
+            single_action_space=BoxStub((1,)),
+            reset=mock.Mock(side_effect=reset_wave),
+            step=mock.Mock(side_effect=step_wave),
+        )
+        trainer = SafetyTrainer.__new__(SafetyTrainer)
+        trainer.env = env
+        trainer.policy = mock.Mock()
+        trainer.critic = SimpleNamespace(q=mock.Mock())
+        trainer.nr_envs = 2
+        trainer.rollouts_per_block = 3
+        trainer.epsilon = 0.1
+        trainer.replay_buffer = RolloutBuffer(
+            20,
+            2,
+            (1,),
+            (1,),
+            np.random.default_rng(5),
+            max_trajectories=3,
+        )
+        trainer.optimizer_steps = 1
+        trainer.epochs_per_block = None
+        trainer.batch_size = 2
+        trainer.rollouts = 0
+        trainer.blocks = 0
+        trainer.update_steps = 0
+
+        def sample_actions(state):
+            lane_zero_is_inactive = bool(state[1, 0] > 0.0)
+            return (
+                np.zeros((2, 1), dtype=np.float32),
+                np.zeros((2, 1), dtype=np.float32),
+                np.asarray(
+                    [0.9 if lane_zero_is_inactive else 0.01, 0.02],
+                    dtype=np.float32,
+                ),
+                np.asarray([lane_zero_is_inactive, False]),
+            )
+
+        trainer._sample_actions = mock.Mock(side_effect=sample_actions)
+        trainer._process_step = mock.Mock(
+            side_effect=lambda next_state, terminated, truncated, info: (
+                next_state,
+                terminated,
+                truncated,
+                np.zeros(2, dtype=np.float32),
+            )
+        )
+        trainer._update_critic = mock.Mock(
+            return_value={"qsafe_loss": 0.0, "safe_q": 0.0, "safe_target": 0.0}
+        )
+
+        metrics = trainer.train_block()
+
+        self.assertEqual(metrics["collected_rollouts"], 3)
+        self.assertEqual(trainer.rollouts, 3)
+        self.assertEqual(env.reset.call_count, 2)
+        self.assertEqual(env.step.call_count, 4)
+        self.assertEqual(
+            [len(trajectory[0]) for trajectory in trainer.replay_buffer.trajectories],
+            [1, 3, 1],
+        )
+        self.assertEqual(metrics["candidate_fallback_rate"], 0.0)
+        self.assertAlmostEqual(metrics["selected_safe_q"], 0.016)
+
     def test_uniform_accepted_selection_is_not_density_reweighted(self):
         rows = 10_000
         safe_q = torch.tensor([[0.01, 0.02, 0.9]], dtype=torch.float32).expand(rows, -1)
