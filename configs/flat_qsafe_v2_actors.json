@@ -10,8 +10,8 @@
     }
   },
   {
-    "id": "flat_train_bodyvel",
-    "checkpoint": "runs/go2_sqrl/pretrain/isaac_bodyvel_v4_300k/models",
+    "id": "flat_train_rough",
+    "checkpoint": "runs/go2_sqrl/pretrain/isaac_sqrl_rough7cm_relative_height_v1/models",
     "split": "train",
     "environment_overrides": {
       "action_profile": "legacy_v1",

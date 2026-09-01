@@ -29,9 +29,13 @@ from tools.run_sqrl_ablation import (
     mujoco_sac_train_command,
 )
 from tools.collect_universal_qsafe_dataset import (
+    FLAT_LEGACY_V1_ROLES,
     FRS_DIAGNOSTIC_ROLES,
+    cell_entries,
     profile_cells,
+    validate_flat_legacy_actor_contract,
 )
+from src.environments.go2_sqrl.common.manifest import build_manifest
 
 
 def test_framework_is_selected_by_training_backend():
@@ -409,6 +413,46 @@ def test_frs_diagnostic_collection_profile_is_targeted_and_actor_isolated():
         } == {0.0, 0.05, 0.10, 0.20}
     assert ("step_6cm", 0.20) in cells
     assert ("boxes_8cm", 0.20) in cells
+
+
+def test_flat_collection_uses_two_compatible_train_actors():
+    assert FLAT_LEGACY_V1_ROLES == {
+        "flat_train_sqrl": "train",
+        "flat_train_rough": "train",
+        "flat_validation": "validation",
+        "flat_target_sac": "test",
+    }
+    normalizer = {
+        "observation_size": 46,
+        "enabled": True,
+        "epsilon": 1e-8,
+        "count": 300032,
+    }
+    manifest = build_manifest(normalizer, action_profile="legacy_v1")
+    validate_flat_legacy_actor_contract("compatible", manifest, normalizer)
+    manifest["observation"]["velocity_estimator"]["version"] = "legacy-v2"
+    with pytest.raises(ValueError, match="velocity_estimator.version"):
+        validate_flat_legacy_actor_contract("incompatible", manifest, normalizer)
+
+
+def test_collection_cell_postcondition_counts_exact_entries(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        '{"trajectories": ['
+        '{"actor_id":"actor","split":"train","map_seed":7,'
+        '"terrain":"flat","action_noise":2.0},'
+        '{"actor_id":"other","split":"train","map_seed":7,'
+        '"terrain":"flat","action_noise":2.0}]}'
+    )
+    entries = cell_entries(
+        manifest_path,
+        actor_id="actor",
+        split="train",
+        map_seed=7,
+        terrain="flat",
+        action_noise=2.0,
+    )
+    assert len(entries) == 1
 
 
 def test_qsafe_ablation_uses_one_gate_for_action_masking_and_eq4():

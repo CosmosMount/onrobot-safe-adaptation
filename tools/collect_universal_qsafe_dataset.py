@@ -19,6 +19,16 @@ from pathlib import Path
 import torch
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.environments.go2_sqrl.common.manifest import (
+    build_manifest,
+    validate_actor_transfer_manifest,
+)
+
+
 NOISE_LEVELS = (0.0, 0.05, 0.10, 0.20)
 TERRAINS = (
     ("flat", {"terrain_mode": "flat", "terrain_profile": "mixed"}),
@@ -69,12 +79,49 @@ FRS_DIAGNOSTIC_ROLES = {
 }
 FLAT_LEGACY_V1_ROLES = {
     "flat_train_sqrl": "train",
-    "flat_train_bodyvel": "train",
+    "flat_train_rough": "train",
     "flat_validation": "validation",
     # This is the ordinary SAC actor used by flat Safe Adaptation. Keep it
     # actor-isolated as the final transfer test rather than training on it.
     "flat_target_sac": "test",
 }
+
+
+def validate_flat_legacy_actor_contract(
+    actor_id, manifest, normalizer_metadata
+):
+    """Require the exact actor-visible contract used by flat adaptation."""
+
+    expected = build_manifest(
+        normalizer_metadata,
+        action_profile="legacy_v1",
+    )
+    try:
+        validate_actor_transfer_manifest(manifest, expected)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{actor_id} is not compatible with the flat action-v1 Safe "
+            f"Adaptation actor contract: {error}"
+        ) from error
+
+
+def cell_entries(
+    manifest_path, *, actor_id, split, map_seed, terrain, action_noise
+):
+    """Return the exact on-disk entries belonging to one collection cell."""
+
+    if not manifest_path.exists():
+        return []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return [
+        entry
+        for entry in manifest.get("trajectories", [])
+        if entry["actor_id"] == actor_id
+        and entry["split"] == split
+        and int(entry["map_seed"]) == int(map_seed)
+        and entry["terrain"] == terrain
+        and float(entry["action_noise"]) == float(action_noise)
+    ]
 
 
 def profile_cells(profile):
@@ -208,22 +255,11 @@ def main(argv=None):
         if manifest.get("action", {}).get("size") != 12:
             raise ValueError(f"{actor_id} does not use the 12D action contract.")
         if args.profile == "flat_legacy_v1":
-            observation = manifest.get("observation", {})
-            action = manifest.get("action", {})
-            scale = action.get("scale")
-            if not (
-                observation.get("version")
-                == "go2-observation-v3-body-velocity"
-                and action.get("version") == "go2-action-v1"
-                and action.get("pipeline_version")
-                == "sdk-absolute-position-v2"
-                and isinstance(scale, (int, float))
-                and abs(float(scale) - 0.25) <= 1e-7
-            ):
-                raise ValueError(
-                    f"{actor_id} is not compatible with the flat action-v1 "
-                    "Safe Adaptation tensor/action contract."
-                )
+            validate_flat_legacy_actor_contract(
+                actor_id,
+                manifest,
+                policy_artifact.get("observation_normalizer_metadata"),
+            )
         elif int(manifest.get("manifest_version", -1)) != 11:
             raise ValueError(f"{actor_id} does not use checkpoint manifest v11.")
         resolved_actors.append(
@@ -318,19 +354,15 @@ def main(argv=None):
                 base_episode_offset = int(args.episode_offset) + (
                     run_index * int(args.episodes_per_run)
                 )
-                existing_entries = []
                 manifest_path = dataset_directory / "manifest.json"
-                if manifest_path.exists():
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    existing_entries = [
-                        entry
-                        for entry in manifest.get("trajectories", [])
-                        if entry["actor_id"] == actor_id
-                        and entry["split"] == split
-                        and int(entry["map_seed"]) == map_seed
-                        and entry["terrain"] == terrain_name
-                        and float(entry["action_noise"]) == float(noise)
-                    ]
+                existing_entries = cell_entries(
+                    manifest_path,
+                    actor_id=actor_id,
+                    split=split,
+                    map_seed=map_seed,
+                    terrain=terrain_name,
+                    action_noise=noise,
+                )
                 if existing_entries and args.no_resume:
                     raise RuntimeError(
                         f"Collection cell already contains {len(existing_entries)} "
@@ -398,9 +430,25 @@ def main(argv=None):
                 elif not args.dry_run:
                     completed_process = subprocess.run(command, check=False)
                     record["return_code"] = int(completed_process.returncode)
-                    record["status"] = (
-                        "completed" if completed_process.returncode == 0 else "failed"
+                    actual_entries = cell_entries(
+                        manifest_path,
+                        actor_id=actor_id,
+                        split=split,
+                        map_seed=map_seed,
+                        terrain=terrain_name,
+                        action_noise=noise,
                     )
+                    record["actual_episodes"] = len(actual_entries)
+                    if completed_process.returncode != 0:
+                        record["status"] = "failed"
+                    elif len(actual_entries) != int(args.episodes_per_run):
+                        record["status"] = "failed_incomplete"
+                        record["error"] = (
+                            f"requested {args.episodes_per_run} total episodes "
+                            f"but found {len(actual_entries)} on disk"
+                        )
+                    else:
+                        record["status"] = "completed"
                 summary["runs"].append(record)
                 temporary = json_summary_path.with_suffix(".json.tmp")
                 temporary.write_text(
@@ -418,8 +466,10 @@ def main(argv=None):
                             "map_seed",
                             "existing_episodes",
                             "requested_episodes",
+                            "actual_episodes",
                             "status",
                             "return_code",
+                            "error",
                         ),
                         extrasaction="ignore",
                     )
@@ -428,6 +478,12 @@ def main(argv=None):
                 if record["status"] == "failed":
                     raise subprocess.CalledProcessError(
                         record["return_code"], command
+                    )
+                if record["status"] == "failed_incomplete":
+                    raise RuntimeError(
+                        "Collection process returned success without writing the "
+                        f"requested trajectories for {actor_id}/{terrain_name}/"
+                        f"{noise:.2f}: {record['error']}"
                     )
                 run_index += 1
     summary["finished_utc"] = datetime.datetime.now(
