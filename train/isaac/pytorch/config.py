@@ -10,8 +10,8 @@ def get_config(environment_name):
     config = config_dict.ConfigDict()
     config.name = environment_name
     config.seed = 0
-    config.nr_envs = 320
-    config.nr_task_envs = 256
+    config.nr_envs = 576
+    config.nr_task_envs = 512
     config.nr_safety_envs = 64
     config.device = "gpu"
     configure_velocity_estimator(config)

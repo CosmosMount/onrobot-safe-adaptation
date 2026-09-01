@@ -140,7 +140,7 @@ def main(argv=None):
     algorithm = {
         "name": algorithm_name,
         "device": "gpu",
-        "compile_mode": "reduce-overhead",
+        "compile_mode": "default",
         "bf16_mixed_precision_training": False,
         "learning_rate": 3e-4,
         "policy_lr": 3e-4,

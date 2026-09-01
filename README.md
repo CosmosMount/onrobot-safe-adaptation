@@ -131,7 +131,7 @@ inference, safety filtering and online gradient updates use PyTorch.
 ## Training budget and checkpoint contract
 
 This reproduction interprets the paper's 500,000-step reference budget as
-500,000 **replayed task transitions**. With 256 task environments this ends at
+500,000 **replayed task transitions**. With 512 task environments this ends at
 500,224 because a vector step cannot be split. The pretrainer reports task
 transition and optimizer-update counts separately and uses a default task UTD
 of one update per newly collected transition; changing the number of parallel

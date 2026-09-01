@@ -36,7 +36,7 @@ YAML 配置。
 python -m train.runner pretrain
 ```
 
-默认配置创建 256 个 task 环境和 64 个 safety 环境。两组环境分别位于两个
+默认配置创建 512 个 task 环境和 64 个 safety 环境。两组环境分别位于两个
 独立的 spawn 子进程中，各自拥有 `AppLauncher`、Isaac 模拟器、episode 状态和
 物理时钟。主进程负责策略、QSafe、replay 和严格串行调度。
 
@@ -315,7 +315,7 @@ worker 异常或超时会终止训练，不会静默重建环境，因为重建�
 ### 训练预算
 
 本复现把论文的 500,000-step 参考预算解释为 500,000 个进入 task replay 的
-transition。使用 256 个 task 环境时，vector step 无法拆分，所以最终为 500,224。
+transition。使用 512 个 task 环境时，vector step 无法拆分，所以最终为 500,224。
 pretrainer 分别报告 task transition 数和 optimizer update 数。默认 task UTD 为
 每个新 transition 一次更新，因此修改并行环境数量不会暗中改变优化预算。
 

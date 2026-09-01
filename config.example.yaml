@@ -11,7 +11,7 @@ runner:
 
 algorithm:
   device: gpu
-  compile_mode: reduce-overhead
+  compile_mode: default
   bf16_mixed_precision_training: false
   # Explicit units: n_pre/n_target count environment transitions.
   n_pre: 500000
