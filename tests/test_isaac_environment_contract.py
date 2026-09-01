@@ -489,43 +489,5 @@ class IsaacEnvironmentContractTest(unittest.TestCase):
         self.assertTrue(terminated[0])
         self.assertEqual(float(info["failure/height"][0]), 1.0)
 
-    def test_public_partition_reset_does_not_touch_other_pool(self):
-        env, backend = self.make_env(nr_envs=2, nr_task_envs=1)
-        backend.robot.data.joint_pos[0] += 0.1
-        backend.robot.data.joint_pos[1] += 0.2
-        env._previous_target[1] += 0.15
-        untouched_target = env._previous_target[1].clone()
-
-        task_observation = env.reset_task_partition()
-
-        self.assertEqual(task_observation.shape, (1, 46))
-        np.testing.assert_allclose(
-            backend.robot.data.joint_pos[0].numpy(),
-            DEFAULT_JOINT_POSITION,
-            atol=1e-6,
-        )
-        np.testing.assert_allclose(
-            backend.robot.data.joint_pos[1].numpy(),
-            DEFAULT_JOINT_POSITION + 0.2,
-            atol=1e-6,
-        )
-        torch.testing.assert_close(env._previous_target[1], untouched_target)
-        self.assertEqual(backend.public_reset_calls, [(0,)])
-
-    def test_partition_step_returns_task_and_safety_slices(self):
-        env, backend = self.make_env(nr_envs=2, nr_task_envs=1)
-        backend.queue([{}] * 10)
-
-        task_step, safety_step = env.step_partitions(
-            task_actions=np.zeros((1, 12), dtype=np.float32)
-        )
-
-        self.assertEqual(task_step.observation.shape, (1, 46))
-        self.assertEqual(safety_step.observation.shape, (1, 46))
-        self.assertEqual(task_step.reward.shape, (1,))
-        self.assertEqual(safety_step.reward.shape, (1,))
-        with self.assertRaisesRegex(ValueError, "Exactly one"):
-            env.step_partitions()
-
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,6 @@ from io import StringIO
 import numpy as np
 import torch
 
-from sqrl.sac.environment import RolloutStep
 from train.core.base import (
     ACTION_SIZE, ACTION_SPEC, DEFAULT_JOINT_POSITION, Go2Environment,
     PHYSICS_DT, PHYSICS_STEPS_PER_ACTION, format_policy_io_contract,
@@ -35,7 +34,7 @@ from .setup import make_env_cfg, relabel_isaac_backend_manager_output
 from .terrain import playback_terrain_column
 
 
-# Partitioned source environment.
+# Child-local Isaac vector environment.
 class Go2IsaacEnv(Go2Environment):
     def __init__(self, config, backend=None):
         validate_environment_contract(config.environment)
@@ -73,10 +72,6 @@ class Go2IsaacEnv(Go2Environment):
         super().__init__(config, config.environment.nr_envs)
         self._select_playback_terrain()
         self._domain_randomization = bool(self.config.domain_randomization)
-        self.nr_task_envs = int(self.config.nr_task_envs)
-        self.nr_safety_envs = int(self.config.nr_safety_envs)
-        if self.nr_task_envs + self.nr_safety_envs != self.nr_envs:
-            raise ValueError("Isaac task and safety pool sizes must sum to nr_envs")
         robot = self.backend.scene["robot"]
         validate_action_term_contract(
             self.backend.action_manager.get_term("joint_pos")
@@ -424,21 +419,6 @@ class Go2IsaacEnv(Go2Environment):
         observation = self._current_reset_observation(env_ids)
         return observation.detach().cpu().numpy(), {}
 
-    def reset_partition(self, env_ids):
-        """Physically reset selected vector environments through a public API."""
-
-        env_ids = self._normalize_env_ids(env_ids)
-        self.backend.reset_envs(env_ids)
-        self._reset_adapter_state(env_ids)
-        self._validate_reset_contract(env_ids)
-        return self._current_reset_observation(env_ids).detach().cpu().numpy()
-
-    def reset_task_partition(self):
-        return self.reset_partition(slice(0, self.nr_task_envs))
-
-    def reset_safety_partition(self):
-        return self.reset_partition(slice(self.nr_task_envs, self.nr_envs))
-
     def step(self, actions):
         action = torch.as_tensor(
             actions, dtype=torch.float32, device=self._robot.device
@@ -551,62 +531,6 @@ class Go2IsaacEnv(Go2Environment):
             truncated.detach().cpu().numpy(),
             info,
         )
-
-    def reset_partitions(self):
-        observation, _ = self.reset()
-        return (
-            observation[: self.nr_task_envs],
-            observation[self.nr_task_envs :],
-        )
-
-    def step_partitions(self, task_actions=None, safety_actions=None):
-        """Advance both pools, using the safe home action for an inactive pool.
-
-        Isaac physics is vectorized, so partitions advance synchronously.  A
-        scheduler may pass ``None`` for a partition whose rollout is currently
-        being discarded; that pool still receives a defined zero/home action
-        and retains normal reset/accounting behavior.
-        """
-
-        if (task_actions is None) == (safety_actions is None):
-            raise ValueError("Exactly one partition must be active")
-        if task_actions is None:
-            task_actions = np.zeros(
-                (self.nr_task_envs, ACTION_SIZE), dtype=np.float32
-            )
-        if safety_actions is None:
-            safety_actions = np.zeros(
-                (self.nr_safety_envs, ACTION_SIZE), dtype=np.float32
-            )
-        actions = np.concatenate((task_actions, safety_actions), axis=0)
-        observation, reward, terminated, truncated, info = self.step(actions)
-
-        def slice_info(start, stop):
-            sliced = {}
-            for key, value in info.items():
-                if isinstance(value, list):
-                    sliced[key] = value[start:stop]
-                else:
-                    array = np.asarray(value)
-                    sliced[key] = array[start:stop]
-            return sliced
-
-        split = self.nr_task_envs
-        task_step = RolloutStep(
-            observation[:split],
-            reward[:split],
-            terminated[:split],
-            truncated[:split],
-            slice_info(0, split),
-        )
-        safety_step = RolloutStep(
-            observation[split:],
-            reward[split:],
-            terminated[split:],
-            truncated[split:],
-            slice_info(split, self.nr_envs),
-        )
-        return task_step, safety_step
 
     def close(self):
         if self._owns_backend:

@@ -6,10 +6,9 @@ import time
 
 import numpy as np
 
-from sqrl.sac.environment import InvalidTransitionError
 from train.core.base import (
     ACTION_SIZE, ACTION_SPEC, CONTROL_DT, DEFAULT_JOINT_POSITION,
-    Go2Environment, PHYSICS_DT,
+    Go2Environment, InvalidTransitionError, PHYSICS_DT,
     PHYSICS_STEPS_PER_ACTION, ActionMapper,
     format_policy_io_contract,
     validate_environment_contract,

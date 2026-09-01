@@ -13,7 +13,6 @@ def get_config(environment_name):
     config.nr_envs = 320
     config.nr_task_envs = 256
     config.nr_safety_envs = 64
-    config.rollout_mode = "partitioned"
     config.device = "gpu"
     configure_velocity_estimator(config)
     configure_environment_contract(config)

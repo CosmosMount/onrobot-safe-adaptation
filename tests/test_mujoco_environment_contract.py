@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 from ml_collections import config_dict
 
-from sqrl.sac.environment import InvalidTransitionError
+from train.core.environment import InvalidTransitionError
 from train.core.base import DEFAULT_JOINT_POSITION, OBSERVATION_SPEC, RobotState
 from train.core.task import EpisodeTracker
 from train.mujoco.pytorch.environment import FallDetector, Go2MujocoEnv, get_config

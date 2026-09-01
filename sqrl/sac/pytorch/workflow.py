@@ -42,10 +42,12 @@ class SQRLWorkflow:
         if self.safe_critic is None:
             self.safe_critic = get_safe_critic(self.config, self.env, self.device)
 
-    def pretrain(self):
-        """Run source pre-training on the environment partitions."""
+    def pretrain(self, safety_env):
+        """Run source pre-training on independent task and safety environments."""
 
-        trainer = SQRLPretrainer(self.config, self.env, self.device)
+        trainer = SQRLPretrainer(
+            self.config, self.env, safety_env, self.device
+        )
         trainer.train()
         self.policy = trainer.policy
         self.safe_critic = trainer.safe_critic
@@ -85,6 +87,9 @@ class SQRLWorkflow:
         returns = []
         failures = 0
         running_returns = np.zeros(nr_envs, dtype=np.float64)
+        selected_q_sum = 0.0
+        fallback_count = 0
+        action_count = 0
 
         self.policy.eval()
         self.safe_critic.q.eval()
@@ -93,13 +98,16 @@ class SQRLWorkflow:
                 states_tensor = torch.as_tensor(
                     states, dtype=torch.float32, device=self.device
                 )
-                _, processed_actions, _, _ = sample_safe_actions(
+                _, processed_actions, selected_q, fallback = sample_safe_actions(
                     states_tensor,
                     self.policy,
                     self.safe_critic.q,
                     nr_candidates,
                     epsilon_safe,
                 )
+            selected_q_sum += float(selected_q.sum().item())
+            fallback_count += int(fallback.sum().item())
+            action_count += int(fallback.numel())
             states, rewards, terminations, truncations, info = self.env.step(
                 processed_actions.float().cpu().numpy()
             )
@@ -125,12 +133,22 @@ class SQRLWorkflow:
             "episodes": episodes,
             "mean_return": float(np.mean(returns)),
             "failures": failures,
+            "candidate_fallback_rate": fallback_count / action_count,
+            "selected_safe_q": selected_q_sum / action_count,
         }
+        metrics["epsilon_minus_selected_q"] = (
+            epsilon_safe - metrics["selected_safe_q"]
+        )
         sqrl_workflow_logger.info(
-            "evaluation episodes=%d mean_return=%.6f failures=%d",
+            "evaluation episodes=%d mean_return=%.6f failures=%d "
+            "candidate_fallback_rate=%.6f selected_safe_q=%.6f "
+            "epsilon_minus_selected_q=%.6f",
             episodes,
             metrics["mean_return"],
             failures,
+            metrics["candidate_fallback_rate"],
+            metrics["selected_safe_q"],
+            metrics["epsilon_minus_selected_q"],
         )
         return metrics
 

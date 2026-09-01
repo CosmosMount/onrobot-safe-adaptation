@@ -220,38 +220,19 @@ def main(argv=None):
     if config.algorithm.bf16_mixed_precision_training and device.type != "cuda":
         raise ValueError("bf16 requires a CUDA training device")
 
-    app = None
+    pretrain_envs = None
     train_env = eval_env = None
     try:
         if args.command == "pretrain":
-            from isaaclab.app import AppLauncher
-
-            launcher = argparse.Namespace(
-                disable_fabric=config.environment.disable_fabric,
-                num_envs=config.environment.nr_envs,
-                task=config.environment.name,
-                headless=not bool(config.environment.render),
-                livestream=config.environment.livestream,
-                enable_cameras=config.environment.enable_cameras,
-                xr=config.environment.xr,
-                device="cuda:0" if config.environment.device == "gpu" else config.environment.device,
-                cpu=config.environment.cpu,
-                verbose=config.environment.verbose,
-                info=config.environment.info,
-                experience=config.environment.experience,
-                rendering_mode=config.environment.rendering_mode,
-                kit_args=config.environment.kit_args,
-                anim_recording_enabled=config.environment.anim_recording_enabled,
-                anim_recording_start_time=config.environment.anim_recording_start_time,
-                anim_recording_stop_time=config.environment.anim_recording_stop_time,
-            )
-            app = AppLauncher(launcher).app
             from sqrl.sac.pytorch.workflow import SQRLWorkflow
-            from train.isaac.pytorch.environment import Go2IsaacEnv
+            from train.isaac.pytorch.pretrain_environment import (
+                IsaacPretrainEnvironments,
+            )
 
-            train_env = Go2IsaacEnv(config)
+            pretrain_envs = IsaacPretrainEnvironments(config)
+            train_env = pretrain_envs.task
             workflow = SQRLWorkflow(config, train_env, device)
-            workflow.pretrain()
+            workflow.pretrain(pretrain_envs.safety)
             checkpoint = Path(config.runner.output_dir) / "final.model"
             workflow.save(str(checkpoint), "pretrain")
             logging.getLogger("sqrl_runner").info("saved pretrain checkpoint: %s", checkpoint)
@@ -276,12 +257,12 @@ def main(argv=None):
             else:
                 workflow.evaluate(config.runner.evaluation_episodes)
     finally:
-        if train_env is not None:
+        if pretrain_envs is not None:
+            pretrain_envs.close()
+        elif train_env is not None:
             train_env.close()
         if eval_env is not None and eval_env is not train_env:
             eval_env.close()
-        if app is not None:
-            app.close()
     return 0
 
 

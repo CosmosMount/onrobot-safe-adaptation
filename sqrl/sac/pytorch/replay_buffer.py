@@ -2,6 +2,20 @@ import numpy as np
 import torch
 
 
+def validate_policy_commands(actions, nr_envs, action_shape):
+    """Return finite, correctly shaped raw policy commands."""
+
+    actions = np.asarray(actions, dtype=np.float32)
+    expected_shape = (int(nr_envs),) + tuple(action_shape)
+    if actions.shape != expected_shape:
+        raise ValueError(
+            f"Policy commands must have shape {expected_shape}, got {actions.shape}"
+        )
+    if not np.all(np.isfinite(actions)):
+        raise ValueError("Policy commands must contain only finite values")
+    return actions
+
+
 def newly_eligible_transitions(previous_steps, current_steps, learning_starts):
     """Count replay transitions that became trainable after warm-up."""
 

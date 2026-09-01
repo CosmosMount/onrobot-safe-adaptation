@@ -38,7 +38,6 @@ from .contracts import (
     format_policy_io_contract,
     validate_environment_contract,
 )
-from .environment import Go2Environment
+from .environment import Go2Environment, InvalidTransitionError
 
 __all__ = [name for name in globals() if not name.startswith("_")]
-

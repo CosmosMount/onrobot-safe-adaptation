@@ -12,6 +12,10 @@ from .contracts import (
 )
 
 
+class InvalidTransitionError(RuntimeError):
+    """Infrastructure failure whose transition must not enter replay."""
+
+
 # Common vector-environment interface implemented by both backends.
 class Go2Environment:
     """Shared vector-environment contract for the Isaac and MuJoCo backends."""
@@ -90,4 +94,3 @@ class Go2Environment:
         from .task import validate_transfer_manifest
 
         validate_transfer_manifest(manifest, self.checkpoint_manifest(normalizer))
-

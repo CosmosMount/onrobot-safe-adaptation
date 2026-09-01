@@ -1,4 +1,4 @@
-"""Safety-partition trainer used by SQRL pre-training."""
+"""Safety rollout trainer used by SQRL pre-training."""
 
 import numpy as np
 import torch
@@ -7,7 +7,7 @@ import torch.optim as optim
 from torch.amp import autocast
 
 from algorithms.qsafe.pytorch.critic import get_critic as get_safe_critic
-from sqrl.sac.environment import resolve_executed_actions
+from sqrl.sac.pytorch.replay_buffer import validate_policy_commands
 from sqrl.sac.pytorch.rollout_buffer import RolloutBuffer
 from sqrl.sac.pytorch.safety_ops import (
     qsafe_bellman_target,
@@ -48,7 +48,7 @@ class SafetyTrainer:
         self.device = torch.device(device)
         algorithm = config.algorithm
 
-        self.nr_envs = int(env.nr_safety_envs)
+        self.nr_envs = int(env.num_envs)
         self.bf16 = bool(algorithm.bf16_mixed_precision_training)
         self.gamma = float(algorithm.get("safe_gamma", 0.7))
         self.tau = float(algorithm.get("safe_tau", algorithm.tau))
@@ -97,31 +97,37 @@ class SafetyTrainer:
         self.update_steps = 0
 
     def train_block(self):
-        """Collect ``k`` complete rollouts, then run the configured QSafe update."""
+        """Collect ``k`` complete safety rollouts, then update QSafe."""
 
         self.policy.eval()
         self.critic.q.train()
-        state = self.env.reset_safety_partition()
+        reset_result = self.env.reset()
+        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         collected = 0
+        selected_q_sum = 0.0
+        fallback_count = 0
+        action_count = 0
         while collected < self.rollouts_per_block:
-            actions, processed_actions = self._sample_actions(state)
-            _, safety_step = self.env.step_partitions(
-                task_actions=None,
-                safety_actions=processed_actions,
+            actions, processed_actions, selected_q, fallback = self._sample_actions(
+                state
+            )
+            actions = validate_policy_commands(
+                actions, self.nr_envs, self.env.single_action_space.shape
+            )
+            selected_q_sum += float(selected_q.sum())
+            fallback_count += int(fallback.sum())
+            action_count += int(fallback.size)
+            next_state, _, terminated, truncated, info = self.env.step(
+                processed_actions
             )
             actual_next_state, terminations, truncations, failures = (
-                self._process_step(safety_step)
+                self._process_step(next_state, terminated, truncated, info)
             )
-            executed_actions = resolve_executed_actions(
-                safety_step.info,
-                actions,
-                self.nr_envs,
-                self.env.single_action_space.shape,
-            )
+            # Replay the policy command; actuator projection is part of env.step.
             completed = self.replay_buffer.add(
                 np.asarray(state, dtype=np.float32),
                 actual_next_state,
-                executed_actions,
+                actions,
                 failures,
                 terminations,
                 truncations,
@@ -129,7 +135,7 @@ class SafetyTrainer:
             )
             collected += completed
             self.rollouts += completed
-            state = safety_step.observation
+            state = next_state
 
         nr_updates = self.optimizer_steps
         if nr_updates is None:
@@ -146,6 +152,11 @@ class SafetyTrainer:
         self.blocks += 1
         metrics["collected_rollouts"] = collected
         metrics["qsafe_optimizer_steps"] = nr_updates
+        metrics["candidate_fallback_rate"] = fallback_count / action_count
+        metrics["selected_safe_q"] = selected_q_sum / action_count
+        metrics["epsilon_minus_selected_q"] = (
+            self.epsilon - metrics["selected_safe_q"]
+        )
         return metrics
 
     def _sample_actions(self, state):
@@ -153,7 +164,7 @@ class SafetyTrainer:
             device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16
         ):
             state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-            actions, processed_actions, _, _ = sample_safe_actions(
+            actions, processed_actions, selected_q, fallback = sample_safe_actions(
                 state,
                 self.policy,
                 self.critic.q,
@@ -161,25 +172,30 @@ class SafetyTrainer:
                 self.epsilon,
                 selection="boundary",
             )
-        return actions.float().cpu().numpy(), processed_actions.float().cpu().numpy()
+        return (
+            actions.float().cpu().numpy(),
+            processed_actions.float().cpu().numpy(),
+            selected_q.float().cpu().numpy(),
+            fallback.cpu().numpy(),
+        )
 
-    def _process_step(self, step):
-        terminations = np.asarray(step.terminated, dtype=bool).reshape(self.nr_envs)
-        truncations = np.asarray(step.truncated, dtype=bool).reshape(self.nr_envs)
-        actual_next_state = np.asarray(step.observation, dtype=np.float32).copy()
+    def _process_step(self, next_state, terminated, truncated, info):
+        terminations = np.asarray(terminated, dtype=bool).reshape(self.nr_envs)
+        truncations = np.asarray(truncated, dtype=bool).reshape(self.nr_envs)
+        actual_next_state = np.asarray(next_state, dtype=np.float32).copy()
         for index in np.flatnonzero(terminations | truncations):
             actual_next_state[index] = np.asarray(
-                self.env.get_final_observation_at_index(step.info, index),
+                self.env.get_final_observation_at_index(info, index),
                 dtype=np.float32,
             )
 
-        if isinstance(step.info, dict) and "failure" in step.info:
-            failures = np.asarray(step.info["failure"], dtype=np.float32)
-        elif isinstance(step.info, dict) and "failures" in step.info:
-            failures = np.asarray(step.info["failures"], dtype=np.float32)
+        if isinstance(info, dict) and "failure" in info:
+            failures = np.asarray(info["failure"], dtype=np.float32)
+        elif isinstance(info, dict) and "failures" in info:
+            failures = np.asarray(info["failures"], dtype=np.float32)
         else:
             raise ValueError(
-                "Safety partition info must provide a binary 'failure' label"
+                "Safety environment info must provide a binary 'failure' label"
             )
         return actual_next_state, terminations, truncations, failures
 

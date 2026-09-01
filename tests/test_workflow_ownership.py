@@ -13,6 +13,7 @@ class WorkflowOwnershipTest(unittest.TestCase):
         owner.config = object()
         owner.device = object()
         owner.env = object()
+        safety_env = object()
         trained_policy = object()
         trained_critic = SimpleNamespace(q=object())
         trainer = mock.Mock(policy=trained_policy, safe_critic=trained_critic)
@@ -20,9 +21,11 @@ class WorkflowOwnershipTest(unittest.TestCase):
         with mock.patch.object(
             sqrl_workflow, "SQRLPretrainer", return_value=trainer
         ) as constructor:
-            result = owner.pretrain()
+            result = owner.pretrain(safety_env)
 
-        constructor.assert_called_once_with(owner.config, owner.env, owner.device)
+        constructor.assert_called_once_with(
+            owner.config, owner.env, safety_env, owner.device
+        )
         trainer.train.assert_called_once_with()
         self.assertEqual(result, (trained_policy, trained_critic.q))
         self.assertIs(owner.policy, trained_policy)
@@ -55,7 +58,7 @@ class WorkflowOwnershipTest(unittest.TestCase):
         self.assertIs(result, trained_policy)
         self.assertIs(owner.policy, trained_policy)
 
-    def test_sqrl_has_no_dependency_on_train_package(self):
+    def test_sqrl_has_no_dependency_on_train_or_process_packages(self):
         root = Path(__file__).resolve().parents[1] / "sqrl"
         violations = []
         for path in root.rglob("*.py"):
@@ -63,15 +66,36 @@ class WorkflowOwnershipTest(unittest.TestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     if any(
-                        alias.name == "train" or alias.name.startswith("train.")
+                        alias.name == "multiprocessing"
+                        or alias.name.startswith("multiprocessing.")
+                        or alias.name == "train"
+                        or alias.name.startswith("train.")
                         for alias in node.names
                     ):
                         violations.append(str(path))
                 elif isinstance(node, ast.ImportFrom):
-                    if node.module == "train" or (node.module or "").startswith(
-                        "train."
-                    ):
+                    module = node.module or ""
+                    if module == "multiprocessing" or module.startswith(
+                        "multiprocessing."
+                    ) or module == "train" or module.startswith("train."):
                         violations.append(str(path))
+        self.assertEqual(violations, [])
+
+    def test_sqrl_has_no_legacy_partition_transport_api(self):
+        root = Path(__file__).resolve().parents[1] / "sqrl"
+        forbidden = (
+            "EnvironmentProcess",
+            "reset_partitions",
+            "step_partitions",
+            "sync_state",
+            "sync_steps",
+        )
+        violations = []
+        for path in root.rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            for name in forbidden:
+                if name in source:
+                    violations.append(f"{path}:{name}")
         self.assertEqual(violations, [])
 
 

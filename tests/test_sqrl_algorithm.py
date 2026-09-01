@@ -16,9 +16,12 @@ from algorithms.types import ObservationSpaceType
 from sqrl.sac.pytorch.pretrainer import (
     SQRLPretrainer,
     qsafe_update_schedule,
+    validate_pretrain_environments,
 )
-from sqrl.sac.environment import resolve_executed_actions
-from sqrl.sac.pytorch.replay_buffer import newly_eligible_transitions
+from sqrl.sac.pytorch.replay_buffer import (
+    newly_eligible_transitions,
+    validate_policy_commands,
+)
 from sqrl.sac.pytorch.rollout_buffer import RolloutBuffer
 from sqrl.sac.pytorch.safety_ops import (
     qsafe_bellman_target,
@@ -188,28 +191,114 @@ class TransitionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             newly_eligible_transitions(0, 1, -1)
 
-    def test_environment_applied_action_takes_precedence(self):
-        proposed = np.zeros((2, 3), dtype=np.float32)
-        applied = np.full((2, 3), 0.25, dtype=np.float32)
-        resolved = resolve_executed_actions(
-            {"applied_action": applied}, proposed, 2, (3,)
+    def test_raw_policy_commands_require_exact_shape_and_finite_values(self):
+        commands = np.zeros((2, 3), dtype=np.float32)
+        np.testing.assert_array_equal(
+            validate_policy_commands(commands, 2, (3,)), commands
         )
-        np.testing.assert_array_equal(resolved, applied)
-
-    def test_executed_action_shape_and_finiteness_are_strict(self):
         with self.assertRaisesRegex(ValueError, "shape"):
-            resolve_executed_actions(
-                {"applied_action": np.zeros((3,), dtype=np.float32)},
-                np.zeros((2, 3), dtype=np.float32),
-                2,
-                (3,),
-            )
-        invalid = np.zeros((2, 3), dtype=np.float32)
-        invalid[0, 0] = np.nan
+            validate_policy_commands(commands.reshape(6), 2, (3,))
+        commands[0, 0] = np.nan
         with self.assertRaisesRegex(ValueError, "finite"):
-            resolve_executed_actions(
-                {"applied_action": invalid}, invalid, 2, (3,)
-            )
+            validate_policy_commands(commands, 2, (3,))
+
+    def test_task_trainer_replays_raw_command_and_steps_processed_action(self):
+        from sqrl.sac.pytorch.task_trainer import TaskTrainer
+
+        raw = np.full((1, 2), 0.25, dtype=np.float32)
+        processed = np.full((1, 2), 0.75, dtype=np.float32)
+        next_state = np.ones((1, 3), dtype=np.float32)
+        step_result = (
+            next_state,
+            np.ones(1, dtype=np.float32),
+            np.zeros(1, dtype=bool),
+            np.zeros(1, dtype=bool),
+            {"applied_action": np.full((1, 2), -0.5, dtype=np.float32)},
+        )
+        trainer = TaskTrainer.__new__(TaskTrainer)
+        trainer.policy = mock.Mock()
+        trainer.critic = SimpleNamespace(q1=mock.Mock(), q2=mock.Mock())
+        trainer.env = mock.Mock()
+        trainer.env.single_action_space.shape = (2,)
+        trainer.env.step.return_value = step_result
+        trainer.replay_buffer = mock.Mock()
+        trainer.state = np.zeros((1, 3), dtype=np.float32)
+        trainer.steps = 0
+        trainer.updates = 0
+        trainer.update_credit = 0.0
+        trainer.nr_envs = 1
+        trainer.learning_starts = 10
+        trainer.utd_ratio = 1.0
+        trainer._sample_actions = mock.Mock(return_value=(raw, processed))
+        trainer._process_step = mock.Mock(
+            return_value=(next_state, np.zeros(1, dtype=bool), np.zeros(1))
+        )
+
+        trainer.train_step()
+
+        np.testing.assert_array_equal(trainer.env.step.call_args.args[0], processed)
+        np.testing.assert_array_equal(
+            trainer.replay_buffer.add.call_args.args[2], raw
+        )
+
+    def test_finetuner_replays_raw_command_and_steps_processed_action(self):
+        from sqrl.sac.pytorch.finetuner import SQRLFinetuner
+
+        raw = torch.full((1, 2), 0.25)
+        processed = torch.full((1, 2), 0.75)
+        env = mock.Mock()
+        env.single_observation_space.shape = (3,)
+        env.single_action_space.shape = (2,)
+        env.reset.return_value = np.zeros((1, 3), dtype=np.float32), {}
+        env.step.return_value = (
+            np.ones((1, 3), dtype=np.float32),
+            np.ones(1, dtype=np.float32),
+            np.zeros(1, dtype=bool),
+            np.zeros(1, dtype=bool),
+            {
+                "failure": np.zeros(1, dtype=np.float32),
+                "applied_action": np.full((1, 2), -0.5, dtype=np.float32),
+            },
+        )
+        trainer = SQRLFinetuner.__new__(SQRLFinetuner)
+        trainer.target_env = env
+        trainer.policy = mock.Mock()
+        trainer.task_critic = SimpleNamespace(q1=mock.Mock(), q2=mock.Mock())
+        trainer.qsafe = mock.Mock()
+        trainer.device = torch.device("cpu")
+        trainer.rng = np.random.default_rng(1)
+        trainer.buffer_size = 8
+        trainer.nr_envs = 1
+        trainer.bf16_mixed_precision_training = False
+        trainer.nr_action_candidates = 2
+        trainer.epsilon_safe = 0.1
+        trainer.nr_target_steps = 1
+        trainer.target_steps = 0
+        trainer.updates = 0
+        trainer.learning_starts = 0
+        trainer.task_utd_ratio = 0.0
+        trainer.task_update_credit = 0.0
+        trainer.logging_frequency = 1
+        replay = mock.Mock()
+
+        with (
+            mock.patch(
+                "sqrl.sac.pytorch.finetuner.ReplayBuffer", return_value=replay
+            ),
+            mock.patch(
+                "sqrl.sac.pytorch.finetuner.sample_safe_actions",
+                return_value=(
+                    raw,
+                    processed,
+                    torch.zeros(1),
+                    torch.zeros(1, dtype=torch.bool),
+                ),
+            ),
+        ):
+            trainer.train()
+
+        np.testing.assert_array_equal(env.step.call_args.args[0], processed.numpy())
+        np.testing.assert_array_equal(replay.add.call_args.args[2], raw.numpy())
 
 
 class EntropyCoefficientTests(unittest.TestCase):
@@ -311,9 +400,8 @@ class PretrainerConfigurationTests(unittest.TestCase):
     def test_n_pre_is_transition_budget_and_env_widths_are_explicit(self):
         from sqrl.sac.pytorch import safety_trainer, task_trainer
 
-        env = EnvStub(5)
-        env.nr_task_envs = 3
-        env.nr_safety_envs = 2
+        task_env = EnvStub(3)
+        safety_env = EnvStub(2)
         dummy_policy = nn.Linear(1, 1)
         task_critic = SimpleNamespace(
             q1=nn.Linear(1, 1), q2=nn.Linear(1, 1),
@@ -348,7 +436,9 @@ class PretrainerConfigurationTests(unittest.TestCase):
                 safety_trainer, "get_safe_critic", return_value=safe_critic
             ),
         ):
-            trainer = SQRLPretrainer(self.config(), env, "cpu")
+            trainer = SQRLPretrainer(
+                self.config(), task_env, safety_env, "cpu"
+            )
 
         self.assertEqual(trainer.nr_pretrain_steps, 37)
         self.assertEqual(trainer.task.nr_envs, 3)
@@ -357,6 +447,18 @@ class PretrainerConfigurationTests(unittest.TestCase):
         self.assertIsNone(trainer.safety.epochs_per_block)
         self.assertIs(trainer.safety.policy, trainer.task.policy)
         self.assertFalse(hasattr(trainer.safety, "policy_optimizer"))
+
+    def test_pretrain_environment_contract_requires_independent_matching_envs(self):
+        task_env = EnvStub(3)
+        safety_env = EnvStub(2)
+        validate_pretrain_environments(task_env, safety_env)
+
+        with self.assertRaisesRegex(ValueError, "independent"):
+            validate_pretrain_environments(task_env, task_env)
+
+        mismatched = EnvStub(2, env_low=-0.5)
+        with self.assertRaisesRegex(ValueError, "action bounds"):
+            validate_pretrain_environments(task_env, mismatched)
 
     def test_qsafe_schedule_defaults_to_algorithm_1_single_update(self):
         self.assertEqual(qsafe_update_schedule(AttrDict()), (1, None))
@@ -380,21 +482,19 @@ class PretrainerConfigurationTests(unittest.TestCase):
 
 
 class PretrainerTests(unittest.TestCase):
-    def test_partition_pretrainer_schedules_n_off_then_safety(self):
+    def test_pretrainer_schedules_n_off_then_safety_without_task_reset(self):
         events = []
 
-        class PartitionEnv(EnvStub):
-            nr_task_envs = 1
-            nr_safety_envs = 1
-
-            def reset_partitions(self):
-                events.append("reset_partitions")
-                state = np.zeros((1, 46), dtype=np.float32)
-                return state, state.copy()
-
-            def reset_task_partition(self):
-                events.append("reset_task")
-                return np.zeros((1, 46), dtype=np.float32)
+        task_env = EnvStub()
+        safety_env = EnvStub()
+        task_env.reset = mock.Mock(
+            side_effect=lambda: (
+                events.append("reset_task_env")
+                or np.zeros((1, 46), dtype=np.float32),
+                {},
+            )
+        )
+        safety_env.reset = mock.Mock()
 
         task = mock.Mock(
             policy=object(),
@@ -414,16 +514,20 @@ class PretrainerTests(unittest.TestCase):
 
         def train_safety():
             events.append("safety")
-            return {"qsafe_loss": 0.0}
+            return {
+                "qsafe_loss": 0.0,
+                "candidate_fallback_rate": 0.0,
+                "selected_safe_q": 0.0,
+                "epsilon_minus_selected_q": 0.1,
+            }
 
         task.train_step.side_effect = train_task
-        task.reset.side_effect = lambda state: events.append("reset_task_trainer")
+        task.set_state.side_effect = lambda state: events.append("set_task_state")
         safety.train_block.side_effect = train_safety
         config = SimpleNamespace(
             environment=AttrDict(seed=1),
             algorithm=AttrDict(n_pre=3, n_off=2),
         )
-        env = PartitionEnv()
         with (
             mock.patch(
                 "sqrl.sac.pytorch.pretrainer.TaskTrainer", return_value=task
@@ -432,27 +536,25 @@ class PretrainerTests(unittest.TestCase):
                 "sqrl.sac.pytorch.pretrainer.SafetyTrainer", return_value=safety
             ) as safety_constructor,
         ):
-            trainer = SQRLPretrainer(config, env, "cpu")
+            trainer = SQRLPretrainer(config, task_env, safety_env, "cpu")
             trainer.train()
 
-        task_constructor.assert_called_once()
-        safety_constructor.assert_called_once()
+        self.assertIs(task_constructor.call_args.args[1], task_env)
+        self.assertIs(safety_constructor.call_args.args[1], safety_env)
         self.assertIs(safety_constructor.call_args.args[2], task.policy)
+        task_env.reset.assert_called_once_with()
+        safety_env.reset.assert_not_called()
 
         self.assertEqual(
             events,
             [
-                "reset_partitions",
-                "reset_task_trainer",
+                "reset_task_env",
+                "set_task_state",
                 "task",
                 "task",
                 "safety",
-                "reset_task",
-                "reset_task_trainer",
                 "task",
                 "safety",
-                "reset_task",
-                "reset_task_trainer",
             ],
         )
 

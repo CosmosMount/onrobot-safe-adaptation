@@ -10,8 +10,11 @@ from torch.amp import autocast
 
 from algorithms.sac.pytorch.critic import get_critic as get_task_critic
 from algorithms.sac.pytorch.entropy_coefficient import get_entropy_coefficient
-from sqrl.sac.environment import resolve_executed_actions
-from sqrl.sac.pytorch.replay_buffer import ReplayBuffer, newly_eligible_transitions
+from sqrl.sac.pytorch.replay_buffer import (
+    ReplayBuffer,
+    newly_eligible_transitions,
+    validate_policy_commands,
+)
 from sqrl.sac.pytorch.safety_ops import sample_safe_actions
 
 
@@ -227,16 +230,14 @@ class SQRLFinetuner:
         self.state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         while self.target_steps < self.nr_target_steps:
             actions, processed_actions, selected_safe_q, fallback = sample_actions(self.state)
+            actions = validate_policy_commands(
+                actions, self.nr_envs, self.target_env.single_action_space.shape
+            )
             next_state, rewards, terminations, truncations, info = self.target_env.step(processed_actions)
             actual_next_state, terminations, failures = process_step(next_state, terminations, truncations, info)
-            executed_actions = resolve_executed_actions(
-                info,
-                actions,
-                self.nr_envs,
-                self.target_env.single_action_space.shape,
-            )
+            # Replay the policy command; actuator projection is part of env.step.
             self.replay_buffer.add(
-                np.asarray(self.state, dtype=np.float32), actual_next_state, executed_actions,
+                np.asarray(self.state, dtype=np.float32), actual_next_state, actions,
                 np.asarray(rewards, dtype=np.float32), terminations.astype(np.float32), failures
             )
             self.state = next_state

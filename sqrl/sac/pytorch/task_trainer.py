@@ -1,4 +1,4 @@
-"""Task-partition trainer used by SQRL pre-training."""
+"""Task SAC trainer used by SQRL pre-training."""
 
 import numpy as np
 import torch
@@ -9,19 +9,22 @@ from torch.amp import autocast
 from algorithms.sac.pytorch.critic import get_critic as get_task_critic
 from algorithms.sac.pytorch.entropy_coefficient import get_entropy_coefficient
 from algorithms.sac.pytorch.policy import get_policy
-from sqrl.sac.environment import resolve_executed_actions
-from sqrl.sac.pytorch.replay_buffer import ReplayBuffer, newly_eligible_transitions
+from sqrl.sac.pytorch.replay_buffer import (
+    ReplayBuffer,
+    newly_eligible_transitions,
+    validate_policy_commands,
+)
 
 
 class TaskTrainer:
-    """Train the SAC task policy on the task environment partition."""
+    """Train the SAC task policy on one standard vector environment."""
 
     def __init__(self, config, env, device, rng):
         self.env = env
         self.device = torch.device(device)
         algorithm = config.algorithm
 
-        self.nr_envs = int(env.nr_task_envs)
+        self.nr_envs = int(env.num_envs)
         self.bf16 = bool(algorithm.bf16_mixed_precision_training)
         self.gamma = float(algorithm.gamma)
         self.tau = float(algorithm.tau)
@@ -79,7 +82,9 @@ class TaskTrainer:
         self.updates = 0
         self.update_credit = 0.0
 
-    def reset(self, state):
+    def set_state(self, state):
+        """Set the current task observation after the initial reset."""
+
         self.state = state
 
     def train_step(self):
@@ -90,26 +95,25 @@ class TaskTrainer:
         self.critic.q2.train()
 
         actions, processed_actions = self._sample_actions()
-        task_step, _ = self.env.step_partitions(
-            task_actions=processed_actions,
-            safety_actions=None,
+        actions = validate_policy_commands(
+            actions, self.nr_envs, self.env.single_action_space.shape
         )
-        actual_next_state, terminations, failures = self._process_step(task_step)
-        executed_actions = resolve_executed_actions(
-            task_step.info,
-            actions,
-            self.nr_envs,
-            self.env.single_action_space.shape,
+        next_state, rewards, terminated, truncated, info = self.env.step(
+            processed_actions
         )
+        actual_next_state, terminations, failures = self._process_step(
+            next_state, terminated, truncated, info
+        )
+        # Replay the policy command; actuator projection is part of env.step.
         self.replay_buffer.add(
             np.asarray(self.state, dtype=np.float32),
             actual_next_state,
-            executed_actions,
-            np.asarray(task_step.reward, dtype=np.float32),
+            actions,
+            np.asarray(rewards, dtype=np.float32),
             terminations.astype(np.float32),
             failures,
         )
-        self.state = task_step.observation
+        self.state = next_state
 
         previous_steps = self.steps
         self.steps += self.nr_envs
@@ -127,6 +131,8 @@ class TaskTrainer:
         return metrics
 
     def _sample_actions(self):
+        """Sample one vector of task-policy commands."""
+
         if self.steps < self.learning_starts:
             processed_actions = np.asarray(
                 [self.env.single_action_space.sample() for _ in range(self.nr_envs)],
@@ -145,20 +151,20 @@ class TaskTrainer:
             )
         return actions.cpu().numpy(), processed_actions.cpu().numpy()
 
-    def _process_step(self, step):
-        terminations = np.asarray(step.terminated, dtype=bool).reshape(self.nr_envs)
-        truncations = np.asarray(step.truncated, dtype=bool).reshape(self.nr_envs)
-        actual_next_state = np.asarray(step.observation, dtype=np.float32).copy()
+    def _process_step(self, next_state, terminated, truncated, info):
+        terminations = np.asarray(terminated, dtype=bool).reshape(self.nr_envs)
+        truncations = np.asarray(truncated, dtype=bool).reshape(self.nr_envs)
+        actual_next_state = np.asarray(next_state, dtype=np.float32).copy()
         for index in np.flatnonzero(terminations | truncations):
             actual_next_state[index] = np.asarray(
-                self.env.get_final_observation_at_index(step.info, index),
+                self.env.get_final_observation_at_index(info, index),
                 dtype=np.float32,
             )
 
-        if isinstance(step.info, dict) and "failure" in step.info:
-            failures = np.asarray(step.info["failure"], dtype=np.float32)
-        elif isinstance(step.info, dict) and "failures" in step.info:
-            failures = np.asarray(step.info["failures"], dtype=np.float32)
+        if isinstance(info, dict) and "failure" in info:
+            failures = np.asarray(info["failure"], dtype=np.float32)
+        elif isinstance(info, dict) and "failures" in info:
+            failures = np.asarray(info["failures"], dtype=np.float32)
         else:
             failures = np.zeros(self.nr_envs, dtype=np.float32)
         return actual_next_state, terminations, failures

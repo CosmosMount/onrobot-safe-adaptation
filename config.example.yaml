@@ -13,18 +13,21 @@ algorithm:
   # Explicit units: n_pre/n_target count environment transitions.
   n_pre: 500000
   n_target: 500000
-  # Algorithm 1: task vector steps before collecting the next safety block.
+  # Local vector schedule; the paper defines n_off but reports no default.
   n_off: 1
   # Algorithm 1 line 17 is one QSafe gradient update per completed block.
   qsafe_optimizer_steps_per_block: 1
   learning_rate: 0.0003
   buffer_size: 1000000
+  # Local SAC update delay (and task-pretrain random-action threshold).
+  # This value is not specified by the SQRL paper.
   learning_starts: 5000
   batch_size: 256
   tau: 0.005
   gamma: 0.99
   safe_gamma: 0.7
   epsilon_safe: 0.1
+  # Finite-sample approximation; the SQRL paper reports no candidate count.
   max_safe_action_samples: 100
   target_entropy: auto
   log_std_min: -20
