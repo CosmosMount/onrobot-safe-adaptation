@@ -104,15 +104,21 @@ def validate_go2_mjcf_contract(scene_path: str | Path = DEFAULT_GO2_SCENE) -> No
             "Go2 IMU must sample the shared base_link origin, got "
             f"{imu_position.tolist()}"
         )
-    for name in ("imu_quat", "frame_pos", "frame_vel"):
+    frame_sensor_tags = {
+        "imu_quat": "framequat",
+        "frame_pos": "framepos",
+        "frame_vel": "framelinvel",
+    }
+    for name, tag in frame_sensor_tags.items():
         sensor = robot_root.find(f"./sensor/*[@name='{name}']")
         if (
             sensor is None
-            or sensor.get("objtype") != "body"
-            or sensor.get("objname") != "base_link"
+            or sensor.tag != tag
+            or sensor.get("objtype") != "site"
+            or sensor.get("objname") != "imu"
         ):
             raise ValueError(
-                f"MuJoCo sensor {name} must reference the base_link body origin"
+                f"MuJoCo sensor {name} must sample the base_link-origin IMU site"
             )
 
     try:
@@ -227,6 +233,20 @@ def validate_go2_mjcf_contract(scene_path: str | Path = DEFAULT_GO2_SCENE) -> No
             )
 
     mujoco.mj_forward(model, data)
+    expected_reset_frame_values = {
+        "imu_quat": np.asarray([1.0, 0.0, 0.0, 0.0]),
+        "frame_pos": np.asarray([0.0, 0.0, DEFAULT_BASE_HEIGHT]),
+        "frame_vel": np.zeros(3),
+    }
+    for name, expected in expected_reset_frame_values.items():
+        sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
+        address = int(model.sensor_adr[sensor_id])
+        actual = np.asarray(data.sensordata[address : address + expected.size])
+        if not np.allclose(actual, expected, rtol=0.0, atol=1.0e-12):
+            raise ValueError(
+                f"MuJoCo sensor {name} does not report the canonical base_link "
+                f"reset frame: expected {expected.tolist()}, got {actual.tolist()}"
+            )
     floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     foot_ids = {
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, leg)
@@ -267,4 +287,3 @@ def validate_go2_mjcf_contract(scene_path: str | Path = DEFAULT_GO2_SCENE) -> No
             f"missing contacts for {missing}"
         )
     _VALIDATED_GO2_SCENES.add(scene_path)
-

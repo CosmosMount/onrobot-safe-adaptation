@@ -256,9 +256,12 @@
 
     <accelerometer name="imu_acc" site="imu"/>
     <gyro name="imu_gyro" site="imu"/>
-    <framequat name="imu_quat" objtype="body" objname="base_link"/>
-    <framepos name="frame_pos" objtype="body" objname="base_link"/>
-    <framelinvel name="frame_vel" objtype="body" objname="base_link"/>
+    <!-- MuJoCo body-frame sensors expose the body's inertial frame, not its
+         model frame.  Sample the origin-aligned IMU site so policy WXYZ,
+         position and velocity match the base_link frame used by Isaac. -->
+    <framequat name="imu_quat" objtype="site" objname="imu"/>
+    <framepos name="frame_pos" objtype="site" objname="imu"/>
+    <framelinvel name="frame_vel" objtype="site" objname="imu"/>
   </sensor>
 
   <keyframe>

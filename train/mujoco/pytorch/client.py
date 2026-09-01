@@ -217,6 +217,7 @@ class SDKClient:
             # frozen command transaction.
             self._command.reserve = int(self._command_sequence)
             self._command.crc = self._crc.Crc(self._command)
+            self.state_buffer.expect_command_sequence(self._command_sequence)
             self._publisher.Write(self._command)
             self._commands_published = True
             return int(self._command_sequence)
@@ -225,4 +226,3 @@ class SDKClient:
         # SDK2 Python entities do not expose a stable cross-version close API.
         # Retaining them until process exit also prevents callback use-after-free.
         pass
-

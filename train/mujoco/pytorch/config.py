@@ -46,14 +46,16 @@ def get_config(environment_name):
     # Stand-up completes before the first policy step, so no second blend is
     # applied to the policy action.
     config.policy_blend_seconds = 0.0
-    # Match Isaac's deterministic flat-ground reset validation.  The velocity
-    # and orientation checks are MuJoCo-only settling guards; joint pose, base
-    # height, and foot-surface tolerances are shared contract values.
-    config.reset_joint_tolerance = 1.0e-3
+    # MuJoCo's torque-controlled standing equilibrium is compliant rather than
+    # identical to qpos0.  With the canonical target and reset gains, gravity
+    # settles the stock Go2 model roughly 0.13 rad away at the most-loaded
+    # joint and 0.036 m below qpos0.  These limits still require a tight,
+    # upright four-foot stance, but do not mistake normal PD sag for a failed
+    # reset.  Exact qpos0 remains validated separately by the MJCF contract.
+    config.reset_joint_tolerance = 0.2
     config.reset_max_joint_velocity = 0.25
-    config.reset_angle_tolerance = 1.0e-3
-    config.reset_base_height_tolerance = 2.0e-3
-    config.reset_foot_surface_tolerance = 3.0e-3
+    config.reset_angle_tolerance = 0.08
+    config.reset_base_height_tolerance = 0.05
+    config.reset_foot_surface_tolerance = 0.025
     config.foot_collision_radius = 0.022
     return config
-

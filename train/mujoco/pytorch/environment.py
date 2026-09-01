@@ -90,7 +90,14 @@ class Go2MujocoEnv(Go2Environment):
             environment.fall_consecutive_frames,
             environment.fall_min_base_clearance,
         )
-        self.episode = EpisodeTracker(environment.episode_steps)
+        episode_steps = int(environment.episode_steps)
+        if role == "eval":
+            episode_steps = int(
+                getattr(environment, "evaluation_episode_steps", episode_steps)
+            )
+        if episode_steps < 1:
+            raise ValueError("MuJoCo episode length must be positive")
+        self.episode = EpisodeTracker(episode_steps)
         self._last_tick: int | None = None
         self._generation = 0
         self._last_observation: np.ndarray | None = None
@@ -113,6 +120,7 @@ class Go2MujocoEnv(Go2Environment):
                 after_tick=self._last_tick,
                 timeout=float(self.config.state_timeout),
                 generation=self._generation,
+                command_sequence=expected_command_sequence,
             )
         except StateBufferError as exc:
             raise InvalidTransitionError(str(exc)) from exc
@@ -215,7 +223,7 @@ class Go2MujocoEnv(Go2Environment):
                 )
         return truth_frames
 
-    def _reset_pose_ready(self, state) -> bool:
+    def _reset_pose_diagnostics(self, state) -> dict[str, object]:
         joint_error = np.max(
             np.abs(
                 np.asarray(state.joint_q, dtype=np.float32)
@@ -227,6 +235,7 @@ class Go2MujocoEnv(Go2Environment):
         )
         reset_quaternion = np.asarray(state.imu_quat, dtype=np.float64)
         reset_quaternion_norm = float(np.linalg.norm(reset_quaternion))
+        identity_angle = float("inf")
         orientation_ready = False
         if np.isfinite(reset_quaternion_norm) and reset_quaternion_norm > 1.0e-8:
             identity_angle = 2.0 * np.arccos(
@@ -266,12 +275,68 @@ class Go2MujocoEnv(Go2Environment):
                 <= float(self.config.reset_foot_surface_tolerance)
             )
         )
-        return (
+        ready = (
             orientation_ready
             and joints_ready
             and joints_still
             and height_ready
             and feet_on_ground
+        )
+        return {
+            "ready": ready,
+            "joint_error": float(joint_error),
+            "max_joint_velocity": float(max_joint_velocity),
+            "identity_angle": float(identity_angle),
+            "base_height": float(position[2]),
+            "base_height_error": abs(
+                float(position[2]) - float(self.config.reset_base_height)
+            ),
+            "foot_surface_height": foot_surface_height,
+            "orientation_ready": orientation_ready,
+            "joints_ready": bool(joints_ready),
+            "joints_still": bool(joints_still),
+            "height_ready": bool(height_ready),
+            "feet_on_ground": feet_on_ground,
+        }
+
+    def _reset_pose_ready(self, state) -> bool:
+        return bool(self._reset_pose_diagnostics(state)["ready"])
+
+    def _log_reset_pose_not_ready(self, state, stage: str) -> None:
+        diagnostics = self._reset_pose_diagnostics(state)
+        failed = [
+            name
+            for name in (
+                "orientation_ready",
+                "joints_ready",
+                "joints_still",
+                "height_ready",
+                "feet_on_ground",
+            )
+            if not diagnostics[name]
+        ]
+        foot_heights = np.asarray(
+            diagnostics["foot_surface_height"], dtype=np.float64
+        )
+        logger.warning(
+            "Reset pose not ready after %s; failed=%s, joint_error=%.5f "
+            "(limit %.5f), max_joint_velocity=%.5f (limit %.5f), "
+            "identity_angle=%.5f (limit %.5f), base_height=%.5f, "
+            "height_error=%.5f (limit %.5f), foot_surface_height=%s "
+            "(abs limit %.5f)",
+            stage,
+            ",".join(failed),
+            diagnostics["joint_error"],
+            float(self.config.reset_joint_tolerance),
+            diagnostics["max_joint_velocity"],
+            float(self.config.reset_max_joint_velocity),
+            diagnostics["identity_angle"],
+            float(self.config.reset_angle_tolerance),
+            diagnostics["base_height"],
+            diagnostics["base_height_error"],
+            float(self.config.reset_base_height_tolerance),
+            np.array2string(foot_heights, precision=5, separator=","),
+            float(self.config.reset_foot_surface_tolerance),
         )
 
     def _duration_steps(self, seconds: float) -> int:
@@ -399,7 +464,7 @@ class Go2MujocoEnv(Go2Environment):
         return state
 
     def _hold_reset_pose(self, initial_state):
-        """Verify an exact ordinary reset, with interpolation only as fallback."""
+        """Verify a stable standing reset, with interpolation only as fallback."""
 
         state = initial_state
         # A normal reset now loads canonical qpos0. Return the first verified
@@ -411,6 +476,8 @@ class Go2MujocoEnv(Go2Environment):
             if self._reset_pose_ready(state):
                 return state
             state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
+
+        self._log_reset_pose_not_ready(state, "initial reset settling")
 
         # Recovery fallback for an external simulator that was not reset or a
         # genuinely fallen state. Readiness is measured, never assumed.
@@ -436,6 +503,8 @@ class Go2MujocoEnv(Go2Environment):
                 state = self._publish_and_wait(DEFAULT_JOINT_POSITION)
             if self._reset_pose_ready(state):
                 return state
+
+            self._log_reset_pose_not_ready(state, "stand-up interpolation")
 
             self._auto_reset_simulator(
                 "Go2 did not reach the standing pose after interpolation."

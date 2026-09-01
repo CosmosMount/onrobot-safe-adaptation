@@ -114,6 +114,23 @@ class MujocoFallDetectorTest(unittest.TestCase):
 
 
 class MujocoTransitionContractTest(unittest.TestCase):
+    def test_eval_role_can_use_a_longer_episode_without_changing_contract(self):
+        environment = get_config("test.mujoco")
+        environment.evaluation_episode_steps = 3000
+        config = config_dict.ConfigDict(
+            {"environment": environment, "runner": {"mode": "test"}}
+        )
+
+        env = Go2MujocoEnv(
+            config,
+            client=_FakeClient(),
+            role="eval",
+            reset_controller=SimpleNamespace(reset=lambda: None),
+        )
+
+        self.assertEqual(env.episode.max_steps, 3000)
+        self.assertEqual(environment.episode_steps, 500)
+
     def test_reset_pose_requires_all_four_foot_surfaces_on_ground(self):
         env = _environment()
         state = _state(2)
@@ -147,6 +164,32 @@ class MujocoTransitionContractTest(unittest.TestCase):
         )
         env._training_states_for_frames = lambda frames: [_truth(frames[0].tick)]
         self.assertFalse(env._reset_pose_ready(yawed))
+
+    def test_reset_pose_accepts_stable_torque_controlled_pd_sag(self):
+        env = _environment()
+        settled = _state(
+            2,
+            quaternion=np.asarray(
+                [math.cos(0.0125), math.sin(0.0125), 0.0, 0.0],
+                dtype=np.float32,
+            ),
+        )
+        settled = RobotState(
+            joint_q=settled.joint_q
+            + np.tile(np.asarray([0.02, -0.03, -0.13], dtype=np.float32), 4),
+            joint_dq=settled.joint_dq,
+            imu_gyro=settled.imu_gyro,
+            imu_quat=settled.imu_quat,
+            imu_accelerometer=settled.imu_accelerometer,
+            actuator_torque=settled.actuator_torque,
+            tick=settled.tick,
+            command_sequence=settled.command_sequence,
+        )
+        env._training_states_for_frames = lambda frames: [
+            _truth(frames[0].tick, height=0.253)
+        ]
+
+        self.assertTrue(env._reset_pose_ready(settled))
 
     def test_sdk_bridge_rejects_a_fake_vector_width(self):
         environment = get_config("test.mujoco")

@@ -58,6 +58,7 @@ class StateBuffer:
         self._restart_settle_deadline = 0.0
         self._generation = 0
         self._error: Exception | None = None
+        self._expected_command_sequence: int | None = None
 
     @property
     def generation(self) -> int:
@@ -79,6 +80,24 @@ class StateBuffer:
             raise ValueError("LowState must contain tick")
         tick = int(state.tick)
         with self._condition:
+            command_sequence = getattr(state, "command_sequence", None)
+            if (
+                self._expected_command_sequence is not None
+                and command_sequence is not None
+                and int(command_sequence) != self._expected_command_sequence
+            ):
+                if int(command_sequence) < self._expected_command_sequence:
+                    # A reliable DDS reader may finish delivering the previous
+                    # command after the next command has already been issued.
+                    # It must not consume a tick in the new transaction.
+                    return False
+                self._error = FrameOrderError(
+                    "LowState acknowledged future command sequence "
+                    f"{int(command_sequence)} while waiting for "
+                    f"{self._expected_command_sequence}"
+                )
+                self._condition.notify_all()
+                return False
             now = time.monotonic()
             if now >= self._restart_settle_deadline:
                 self._restart_stale_tick_floor = None
@@ -136,6 +155,24 @@ class StateBuffer:
             self._condition.notify_all()
             return True
 
+    def expect_command_sequence(self, sequence: int) -> None:
+        """Reject delayed samples from commands older than ``sequence``."""
+
+        sequence = int(sequence)
+        if sequence < 1:
+            raise ValueError("expected command sequence must be positive")
+        with self._condition:
+            if (
+                self._expected_command_sequence is not None
+                and sequence <= self._expected_command_sequence
+            ):
+                raise ValueError(
+                    "expected command sequence must increase monotonically: "
+                    f"got {sequence} after {self._expected_command_sequence}"
+                )
+            self._expected_command_sequence = sequence
+            self._condition.notify_all()
+
     def arm_restart(self) -> None:
         """Accept the next rollback as an explicitly requested simulator reset."""
 
@@ -162,6 +199,7 @@ class StateBuffer:
         after_tick: int | None,
         timeout: float,
         generation: int | None = None,
+        command_sequence: int | None = None,
     ) -> list[RobotState]:
         deadline = time.monotonic() + float(timeout)
         count = int(count)
@@ -177,7 +215,12 @@ class StateBuffer:
                 eligible = [
                     frame
                     for frame in self._frames
-                    if after_tick is None or int(frame.tick) > int(after_tick)
+                    if (after_tick is None or int(frame.tick) > int(after_tick))
+                    and (
+                        command_sequence is None
+                        or int(getattr(frame, "command_sequence", -1))
+                        == int(command_sequence)
+                    )
                 ]
                 if len(eligible) >= count:
                     # With an explicit anchor, return the first physics window
@@ -187,8 +230,14 @@ class StateBuffer:
                     return eligible[-count:] if after_tick is None else eligible[:count]
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    sequence_suffix = (
+                        ""
+                        if command_sequence is None
+                        else f" for command sequence {int(command_sequence)}"
+                    )
                     raise StateTimeout(
                         f"Timed out waiting for {count} distinct LowState ticks"
+                        f"{sequence_suffix}"
                     )
                 self._condition.wait(remaining)
 
@@ -351,4 +400,3 @@ class TrainingStateBuffer:
                         "assets/robots/go2/unitree_mujoco_bridge_lockstep.patch."
                     )
                 self._condition.wait(remaining)
-

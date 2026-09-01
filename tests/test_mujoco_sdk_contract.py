@@ -159,6 +159,28 @@ class MujocoSdkContractTest(unittest.TestCase):
         }
         self.assertTrue(foot_ids.issubset(contacts))
 
+    def test_reset_frame_sensors_report_base_link_not_inertial_frame(self):
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(str(DEFAULT_GO2_SCENE))
+        data = mujoco.MjData(model)
+        mujoco.mj_resetData(model, data)
+        mujoco.mj_forward(model, data)
+
+        expected = {
+            "imu_quat": np.asarray([1.0, 0.0, 0.0, 0.0]),
+            "frame_pos": np.asarray([0.0, 0.0, 0.289]),
+            "frame_vel": np.zeros(3),
+        }
+        for name, value in expected.items():
+            sensor_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_SENSOR, name
+            )
+            address = int(model.sensor_adr[sensor_id])
+            np.testing.assert_allclose(
+                data.sensordata[address : address + value.size], value, atol=1e-12
+            )
+
     def test_state_buffer_rejects_duplicate_bridge_tick(self):
         buffer = StateBuffer()
         first = SimpleNamespace(tick=2)
@@ -166,6 +188,26 @@ class MujocoSdkContractTest(unittest.TestCase):
         self.assertTrue(buffer.push(first))
         self.assertFalse(buffer.push(duplicate))
         self.assertIs(buffer.latest_state, first)
+
+    def test_state_buffer_rejects_delayed_previous_command_before_tick_dedup(self):
+        buffer = StateBuffer()
+        anchor = SimpleNamespace(tick=0, command_sequence=653)
+        delayed = SimpleNamespace(tick=2, command_sequence=653)
+        current = [
+            SimpleNamespace(tick=tick, command_sequence=654)
+            for tick in range(2, 22, 2)
+        ]
+        self.assertTrue(buffer.push(anchor))
+        buffer.expect_command_sequence(654)
+        self.assertFalse(buffer.push(delayed))
+        self.assertTrue(all(buffer.push(frame) for frame in current))
+        frames = buffer.wait_for_frames(
+            10,
+            after_tick=0,
+            timeout=0.0,
+            command_sequence=654,
+        )
+        self.assertEqual([frame.tick for frame in frames], list(range(2, 22, 2)))
 
     def test_high_state_stamp_decodes_to_low_state_tick(self):
         message = SimpleNamespace(

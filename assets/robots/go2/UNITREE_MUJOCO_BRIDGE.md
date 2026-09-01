@@ -29,9 +29,15 @@ From the root of that checkout:
 ```sh
 git checkout 4134cb5dc7ff1ba7f484deda48b5274b58694519
 git apply /absolute/path/to/ora-refactor/assets/robots/go2/unitree_mujoco_bridge_lockstep.patch
+git apply /absolute/path/to/ora-refactor/assets/robots/go2/unitree_mujoco_bridge_lossless_publish.patch
 cmake -S simulate -B simulate/build -DCMAKE_BUILD_TYPE=Release
 cmake --build simulate/build --parallel
 ```
+
+The second patch makes each of the ten post-step LowState and HighState frames
+wait for the SDK real-time publisher slot. Without that backpressure, the
+asynchronous publisher can silently skip intermediate frames and the learner
+will time out waiting for ten distinct ticks.
 
 Launch through `python -m train.runner sim`; the runner sets
 `ORSA_STRICT_LOCKSTEP=1`. If launching the executable directly, set the same

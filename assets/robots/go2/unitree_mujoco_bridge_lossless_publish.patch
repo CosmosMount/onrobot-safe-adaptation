@@ -1,0 +1,36 @@
+diff --git a/simulate/src/unitree_sdk2_bridge.h b/simulate/src/unitree_sdk2_bridge.h
+--- a/simulate/src/unitree_sdk2_bridge.h
++++ b/simulate/src/unitree_sdk2_bridge.h
+@@ -3,6 +3,7 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <mutex>
++#include <thread>
+ 
+ #include <mujoco/mujoco.h>
+ 
+@@ -243,7 +244,10 @@ private:
+     {
+         // A nonzero reserve value is an ORSA post-step acknowledgement: this
+         // snapshot was produced by a completed mj_step under that LowCmd.
+-        if(lowstate->trylock()) {
++        while(!lowstate->trylock()) {
++            std::this_thread::yield();
++        }
++        {
+             for(int i(0); i<num_motor_; i++) {
+                 lowstate->msg_.motor_state()[i].q() = mj_data_->sensordata[i];
+                 lowstate->msg_.motor_state()[i].dq() = mj_data_->sensordata[i + num_motor_];
+@@ -282,8 +286,11 @@ private:
+             orsa_set_applied_sequence(lowstate->msg_, applied_sequence);
+             lowstate->unlockAndPublish();
+         }
+ 
+-        if(highstate->trylock()) {
++        while(!highstate->trylock()) {
++            std::this_thread::yield();
++        }
++        {
+             // Tag root truth with the identical simulation clock used by
+             // LowState.tick() and command sequence, allowing Python to reject
+             // delayed HighState samples from an earlier reset generation.
