@@ -33,6 +33,7 @@ from rl_x.algorithms.qsafe.common import (
     validate_safety_rollout_environment,
 )
 from rl_x.algorithms.qsafe.flax import QSafe
+from rl_x.algorithms.qsafe.shadow_diagnostics import ShadowQSafeRecorder
 from rl_x.algorithms.qsafe.flax.projection import resolve_action_projectors
 from rl_x.algorithms.sac_qsafe.flax.checkpoint import (
     load_policy_artifact,
@@ -116,6 +117,19 @@ class SAC_QSafe:
         if self.phase not in ("pretrain", "finetune"):
             raise ValueError("algorithm.phase must be 'pretrain' or 'finetune'.")
         self.qsafe_enabled = bool(config.algorithm.qsafe.enabled)
+        self.qsafe_shadow_enabled = bool(
+            getattr(config.algorithm.qsafe, "shadow_enabled", False)
+        )
+        if self.qsafe_shadow_enabled and self.qsafe_enabled:
+            raise ValueError(
+                "QSafe shadow diagnostics require algorithm.qsafe.enabled=false "
+                "so the observed trajectory is standard SAC."
+            )
+        if self.qsafe_shadow_enabled and self.phase != "finetune":
+            raise ValueError("QSafe shadow diagnostics are finetune-only.")
+        self.qsafe_observer_enabled = (
+            self.qsafe_enabled or self.qsafe_shadow_enabled
+        )
         self.finetune_constraints_enabled = finetune_constraints_enabled(
             self.phase, self.qsafe_enabled
         )
@@ -262,17 +276,45 @@ class SAC_QSafe:
                 self.phase,
                 defer_checkpoint_load=_defer_transfer_load,
             )
-            if self.qsafe_enabled
+            if self.qsafe_observer_enabled
             else None
+        )
+        if (
+            self.qsafe_shadow_enabled
+            and self.phase == "finetune"
+            and not _defer_transfer_load
+        ):
+            checkpoint_path = str(config.algorithm.qsafe.checkpoint_path)
+            if not checkpoint_path:
+                raise ValueError(
+                    "algorithm.qsafe.checkpoint_path is required for shadow diagnostics."
+                )
+            self.qsafe.load(checkpoint_path, load_optimizer=False)
+            self.qsafe.freeze()
+        self._qsafe_shadow_key = jax.random.PRNGKey(
+            np.uint32((int(self.seed) + 0x51AFE) % (2**32))
         )
         self._qsafe_reset_masks = {}
         self._last_qsafe_observations = {}
+        shadow_output = str(
+            getattr(config.algorithm.qsafe, "shadow_output_path", "")
+        )
+        self._qsafe_shadow_recorder = (
+            ShadowQSafeRecorder(
+                shadow_output or Path(run_path) / "qsafe_shadow.npz",
+                self.nr_envs,
+                self.qsafe.epsilon,
+            )
+            if self.qsafe_shadow_enabled
+            else None
+        )
         if self.phase == "finetune" and not _defer_transfer_load:
             self._load_pretrained_policy(str(config.algorithm.pretrained_policy_path))
             self.observation_normalizer.freeze()
             rlx_logger.info(
                 "Transfer loaded actor and observation normalizer"
                 + (", plus frozen QSafe" if self.qsafe_enabled else "")
+                + (", plus non-intervening QSafe observer" if self.qsafe_shadow_enabled else "")
                 + "; task critics, targets, entropy temperature, replay, "
                 "optimizers, and nu start fresh"
             )
@@ -443,7 +485,7 @@ class SAC_QSafe:
         mean, std, epsilon = self._normalizer_parameters()
         rlx_logger.info(
             "Compiling Flax policy"
-            + (" and QSafe action" if self.qsafe_enabled else "")
+            + (" and QSafe action" if self.qsafe_observer_enabled else "")
             + " kernels before rollout"
         )
         deterministic_actions = self._deterministic_action_jit(
@@ -461,7 +503,7 @@ class SAC_QSafe:
             epsilon,
             self.key,
         )
-        if self.qsafe_enabled:
+        if self.qsafe_observer_enabled:
             states, _, applied_candidates, log_probs, _, selection_key = (
                 self._candidate_distribution_jit(
                     self.policy_state.params,
@@ -472,11 +514,6 @@ class SAC_QSafe:
                     self.key,
                 )
             )
-            select = (
-                self.qsafe._select_pretrain_jit
-                if self.phase == "pretrain"
-                else self.qsafe._select_finetune_jit
-            )
             qsafe_states = (
                 jnp.zeros(
                     (nr_envs, self.qsafe.observation_shape[0]),
@@ -485,14 +522,25 @@ class SAC_QSafe:
                 if self.qsafe.version == 2
                 else states
             )
-            selected, _, _ = select(
-                self.qsafe.state.params,
-                qsafe_states,
-                applied_candidates,
-                log_probs,
-                selection_key,
-            )
-            jax.block_until_ready((deterministic_actions, actions, selected))
+            if self.qsafe_enabled:
+                select = (
+                    self.qsafe._select_pretrain_jit
+                    if self.phase == "pretrain"
+                    else self.qsafe._select_finetune_jit
+                )
+                selected, _, _ = select(
+                    self.qsafe.state.params,
+                    qsafe_states,
+                    applied_candidates,
+                    log_probs,
+                    selection_key,
+                )
+                jax.block_until_ready((deterministic_actions, actions, selected))
+            else:
+                q_values = self.qsafe.candidate_values(
+                    qsafe_states, applied_candidates, normalized=True
+                )
+                jax.block_until_ready((deterministic_actions, actions, q_values))
         else:
             jax.block_until_ready((deterministic_actions, actions))
 
@@ -621,6 +669,103 @@ class SAC_QSafe:
             self.get_processed_action(selected_applied_actions),
             metrics,
         )
+
+    def _observe_qsafe_without_intervention(self, states, executed_raw_actions):
+        """Score standard-SAC actions without touching its action/RNG stream."""
+
+        raw_states = jnp.asarray(states, dtype=jnp.float32)
+        mean, std, epsilon = self._normalizer_parameters()
+        (
+            _,
+            raw_candidate_actions,
+            applied_candidate_actions,
+            _,
+            self._qsafe_shadow_key,
+            _,
+        ) = self._candidate_distribution_jit(
+            self.policy_state.params,
+            raw_states,
+            mean,
+            std,
+            epsilon,
+            self._qsafe_shadow_key,
+        )
+        executed_applied = self._jax_project_actions(
+            raw_states, executed_raw_actions
+        )
+        executed_applied = self._host_project(states, executed_applied)
+        if not self._projector_is_jax and self._host_project_actions is not None:
+            nr_envs, nr_candidates = raw_candidate_actions.shape[:2]
+            repeated_states = np.repeat(
+                np.asarray(states, dtype=np.float32)[:, None, :],
+                nr_candidates,
+                axis=1,
+            )
+            projected = self._host_project_actions(
+                repeated_states.reshape((nr_envs * nr_candidates, -1)),
+                jax.device_get(raw_candidate_actions).reshape(
+                    (nr_envs * nr_candidates, -1)
+                ),
+            )
+            applied_candidate_actions = jnp.asarray(
+                projected, dtype=jnp.float32
+            ).reshape(raw_candidate_actions.shape)
+        applied_candidate_actions = applied_candidate_actions.at[:, 0].set(
+            executed_applied
+        )
+        safety_observations = self.qsafe.rollout_observations(
+            np.asarray(states, dtype=np.float32),
+            reset_mask=self._qsafe_reset_masks.pop("shadow", None),
+            stream="shadow",
+        )
+        safety_observations = self.qsafe.normalize_observations(
+            safety_observations
+        )
+        q_values = self.qsafe.candidate_values(
+            safety_observations,
+            applied_candidate_actions,
+            normalized=True,
+        )
+        best_indices = jnp.argmin(q_values, axis=1)
+        batch_indices = jnp.arange(q_values.shape[0])
+        best_actions = applied_candidate_actions[batch_indices, best_indices]
+        best_action_l2 = jnp.linalg.norm(
+            best_actions - applied_candidate_actions[:, 0], axis=-1
+        )
+        absolute_z = jnp.abs(safety_observations)
+        metrics = {
+            "qsafe_shadow/executed_value": jnp.mean(q_values[:, 0]),
+            "qsafe_shadow/candidate_value_min": jnp.min(q_values),
+            "qsafe_shadow/candidate_value_p50": jnp.quantile(q_values, 0.50),
+            "qsafe_shadow/candidate_value_p90": jnp.quantile(q_values, 0.90),
+            "qsafe_shadow/candidate_value_max": jnp.max(q_values),
+            "qsafe_shadow/fallback_fraction": jnp.mean(
+                jnp.all(q_values >= self.qsafe.epsilon, axis=1)
+            ),
+            "qsafe_shadow/executed_rejected_fraction": jnp.mean(
+                q_values[:, 0] >= self.qsafe.epsilon
+            ),
+            "qsafe_shadow/best_action_l2": jnp.mean(best_action_l2),
+            "qsafe_shadow/observation_abs_z_p95": jnp.quantile(
+                absolute_z.reshape((-1,)), 0.95
+            ),
+            "qsafe_shadow/observation_ood_fraction": jnp.mean(
+                absolute_z > 5.0
+            ),
+        }
+        pending = {
+            "candidate_q": np.asarray(jax.device_get(q_values)),
+            "candidate_best_action_l2": np.asarray(
+                jax.device_get(best_action_l2)
+            ),
+            "observation_abs_z_p95": np.quantile(
+                np.asarray(jax.device_get(absolute_z)), 0.95, axis=1
+            ),
+            "observation_ood_fraction": np.mean(
+                np.asarray(jax.device_get(absolute_z)) > 5.0, axis=1
+            ),
+        }
+        return metrics, pending
         
     
     def train(self):
@@ -848,7 +993,7 @@ class SAC_QSafe:
         saving_return_buffer = deque(maxlen=100 * self.nr_envs)
 
         state, _ = self.train_env.reset()
-        if self.qsafe_enabled:
+        if self.qsafe_observer_enabled:
             self.qsafe.clear_rollout_history()
             self._qsafe_reset_masks.clear()
         safety_state = None
@@ -899,6 +1044,7 @@ class SAC_QSafe:
             interaction_env = self.eval_env if is_safety_step else self.train_env
             completed_safety_block = False
             dones_this_rollout = 0
+            shadow_pending = None
             if is_safety_step:
                 action, processed_action, action_safety_metrics = self._sample_policy_candidates(
                     acting_state, phase="pretrain", stream="safety"
@@ -911,7 +1057,14 @@ class SAC_QSafe:
                 action, processed_action = self._sample_unconstrained_action(
                     acting_state, update_normalizer=True
                 )
-                action_safety_metrics = None
+                if self.qsafe_shadow_enabled:
+                    action_safety_metrics, shadow_pending = (
+                        self._observe_qsafe_without_intervention(
+                            acting_state, action
+                        )
+                    )
+                else:
+                    action_safety_metrics = None
             if action_safety_metrics is not None:
                 for key, value in action_safety_metrics.items():
                     safety_metrics_collection.setdefault(key, []).append(value)
@@ -934,6 +1087,9 @@ class SAC_QSafe:
                     )
                 else:
                     state = recovered_state
+                    if self.qsafe_shadow_enabled:
+                        self.qsafe.clear_rollout_history("shadow")
+                        self._qsafe_reset_masks.pop("shadow", None)
                 continue
             failure = extract_failure_signal(info, terminated, self.nr_envs)
             host_action = jax.device_get(action)
@@ -941,9 +1097,15 @@ class SAC_QSafe:
                 info.get("applied_action", host_action), dtype=np.float32
             ).reshape(host_action.shape)
             done = terminated | truncated
-            if self.qsafe_enabled:
+            if self.qsafe_observer_enabled:
                 self._qsafe_reset_masks[
-                    "safety" if is_safety_step else "task"
+                    (
+                        "safety"
+                        if is_safety_step
+                        else "shadow"
+                        if self.qsafe_shadow_enabled
+                        else "task"
+                    )
                 ] = np.asarray(done, dtype=bool)
             actual_next_state = next_state.copy()
             for i, single_done in enumerate(done):
@@ -994,6 +1156,18 @@ class SAC_QSafe:
                 else:
                     safety_state = next_state
             else:
+                if self.qsafe_shadow_enabled:
+                    self._qsafe_shadow_recorder.add(
+                        global_step=global_step,
+                        states=acting_state,
+                        applied_actions=applied_action,
+                        failure=failure,
+                        terminated=terminated,
+                        truncated=truncated,
+                        **shadow_pending,
+                    )
+                    if np.any(done):
+                        self._qsafe_shadow_recorder.flush()
                 offline_replay_buffer.add(
                     state,
                     actual_next_state,
@@ -1306,12 +1480,21 @@ class SAC_QSafe:
                 evaluation_metrics_collection = {}
 
                 self.end_logging()
+                if self.qsafe_shadow_enabled:
+                    self._qsafe_shadow_recorder.flush()
             
             logging_end_time = time.time()
             logging_time_prev = logging_end_time - saving_end_time
 
         if self.save_model:
             self.save("final.model")
+        if self.qsafe_shadow_enabled:
+            report = self._qsafe_shadow_recorder.flush()
+            if report is not None:
+                rlx_logger.info(
+                    f"QSafe shadow diagnostic: {report['fall_episodes']} target "
+                    f"falls, report={self._qsafe_shadow_recorder.report_path}"
+                )
 
 
     def log(self, name, value, step):

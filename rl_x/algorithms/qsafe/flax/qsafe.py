@@ -397,6 +397,21 @@ class QSafe:
             states = self.normalize_observations(states)
         return self._values_jit(self.state.params, states, actions)
 
+    def candidate_values(self, states, candidate_actions, normalized=False):
+        """Score a [batch, candidates, action] pool without selecting an action."""
+
+        if self.version == 2 and not normalized:
+            states = self.normalize_observations(states)
+        states = jnp.asarray(states, dtype=jnp.float32)
+        candidate_actions = jnp.asarray(candidate_actions, dtype=jnp.float32)
+        nr_envs, nr_candidates = candidate_actions.shape[:2]
+        repeated_states = jnp.repeat(states[:, None, :], nr_candidates, axis=1)
+        return self._values_jit(
+            self.state.params,
+            repeated_states.reshape((nr_envs * nr_candidates, -1)),
+            candidate_actions.reshape((nr_envs * nr_candidates, -1)),
+        ).reshape((nr_envs, nr_candidates))
+
     def _select_kernel(
         self,
         params,

@@ -113,4 +113,10 @@ def get_config(algorithm_name):
     # sampling from simulator and QSafe construction randomness.
     config.qsafe.paired_candidate_evaluation = False
     config.qsafe.eval_candidate_seed = 0
+    # Target-domain diagnostic only: load the frozen QSafe and score the exact
+    # standard-SAC action plus an independent candidate pool, but never let it
+    # select or modify the action sent to the environment. This is deliberately
+    # separate from qsafe.enabled so the SQRL treatment remains unchanged.
+    config.qsafe.shadow_enabled = False
+    config.qsafe.shadow_output_path = ""
     return config
