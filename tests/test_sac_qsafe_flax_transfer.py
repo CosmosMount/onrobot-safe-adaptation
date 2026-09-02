@@ -417,7 +417,7 @@ def test_squashed_gaussian_log_probability_matches_torch_before_projection():
     assert not np.allclose(actual, wrong_projected_correction)
 
 
-def test_flax_finetune_qsafe_preserves_candidate_zero_until_rejected():
+def test_flax_v2_finetune_qsafe_preserves_candidate_zero_until_rejected():
     class ActionRisk:
         @staticmethod
         def apply(params, states, actions):
@@ -425,6 +425,7 @@ def test_flax_finetune_qsafe_preserves_candidate_zero_until_rejected():
             return actions[..., :1]
 
     qsafe = object.__new__(QSafe)
+    qsafe.version = 2
     qsafe.epsilon = 0.5
     qsafe.network = ActionRisk()
     states = jnp.zeros((3, 2), dtype=jnp.float32)
@@ -456,3 +457,39 @@ def test_flax_finetune_qsafe_preserves_candidate_zero_until_rejected():
     assert float(metrics["qsafe/safety_intervention_fraction"]) == pytest.approx(
         2 / 3
     )
+
+
+def test_flax_legacy_finetune_qsafe_uses_original_equation3_sampling():
+    class ActionRisk:
+        @staticmethod
+        def apply(params, states, actions):
+            del params, states
+            return actions[..., :1]
+
+    qsafe = object.__new__(QSafe)
+    qsafe.version = 1
+    qsafe.epsilon = 0.5
+    candidates = jnp.asarray(
+        [
+            [[0.1], [0.2], [0.3]],
+            [[0.9], [0.2], [0.1]],
+            [[0.9], [0.8], [0.95]],
+        ],
+        dtype=jnp.float32,
+    )
+    log_probabilities = jnp.asarray(
+        [[-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0]],
+        dtype=jnp.float32,
+    )
+    qsafe.network = ActionRisk()
+
+    _, selected, _ = qsafe._select_kernel(
+        None,
+        jnp.zeros((3, 2), dtype=jnp.float32),
+        candidates,
+        log_probabilities,
+        jax.random.PRNGKey(0),
+        pretrain=False,
+    )
+
+    np.testing.assert_array_equal(np.asarray(selected), np.asarray([1, 1, 1]))

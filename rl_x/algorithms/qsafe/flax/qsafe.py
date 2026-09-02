@@ -435,6 +435,15 @@ class QSafe:
         if pretrain:
             scores = jnp.where(safe_mask, q_values, -jnp.inf)
             selected = jnp.argmax(scores, axis=1)
+        elif self.version == 1:
+            # Preserve the original SQRL Equation-3 implementation used by
+            # the successfully completed legacy policy/QSafe pretrain and
+            # fine-tune experiments: mask unsafe candidates, then sample the
+            # retained set according to the task-policy log probabilities.
+            logits = candidate_log_probs.reshape((nr_envs, nr_candidates))
+            logits = jnp.where(safe_mask, logits, -jnp.inf)
+            logits = jnp.where(fallback[:, None], jnp.zeros_like(logits), logits)
+            selected = jax.random.categorical(selection_key, logits, axis=-1)
         else:
             # Candidate actions are already IID task-policy samples. Selecting
             # the first safe proposal is exact finite rejection sampling and

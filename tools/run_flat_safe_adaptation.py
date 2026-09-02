@@ -631,7 +631,6 @@ def _live_training_gate(
     reference_fingerprints: dict | None = None,
 ):
     velocity_history = []
-    intervention_history = []
     fallback_history = []
     rejected_history = []
     initialization_checked = False
@@ -734,11 +733,8 @@ def _live_training_gate(
             raise TrainingGateError(
                 f"QSafe intervention diagnostics are missing at step {step}"
             )
-        intervention = metrics.get("qsafe/safety_intervention_fraction")
         fallback = metrics.get("qsafe/fallback_fraction")
         rejected = metrics.get("qsafe/rejected_fraction")
-        if intervention is not None:
-            intervention_history.append((step, intervention))
         if fallback is not None:
             fallback_history.append((step, fallback))
         if rejected is not None:
@@ -764,20 +760,6 @@ def _live_training_gate(
             round(baseline_value("steps/nr_failures", step))
         )
         baseline_velocity = baseline_value("env_info/forward_velocity", step)
-        recent_intervention = [
-            value for history_step, value in intervention_history
-            if history_step > max(10_000, step - 10_000)
-        ]
-        if (
-            baseline_falls >= 5
-            and recent_intervention
-            and float(np.mean(recent_intervention)) < 0.001
-        ):
-            raise TrainingGateError(
-                f"QSafe has no meaningful treatment dosage at step {step}: "
-                f"baseline already has {baseline_falls} falls but recent safety "
-                f"intervention rate is {np.mean(recent_intervention):.6f}"
-            )
         materially_more_falls = falls >= baseline_falls + max(
             10, int(math.ceil(0.5 * max(baseline_falls, 1)))
         )

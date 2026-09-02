@@ -343,6 +343,19 @@ class QSafe:
                 safe_mask, q_values, torch.full_like(q_values, -torch.inf)
             )
             selected = boundary_scores.argmax(dim=1)
+        elif phase == "finetune" and self.version == 1:
+            # Preserve the original SQRL Equation-3 implementation used to
+            # produce and validate the legacy policy/QSafe checkpoint pair.
+            logits = candidate_log_probs.reshape(nr_envs, nr_candidates)
+            masked_logits = torch.where(
+                safe_mask, logits, torch.full_like(logits, -torch.inf)
+            )
+            masked_logits = torch.where(
+                fallback[:, None], torch.zeros_like(masked_logits), masked_logits
+            )
+            selected = torch.distributions.Categorical(
+                logits=masked_logits
+            ).sample()
         elif phase == "finetune":
             # Candidates are already IID samples from the task policy.  The
             # first accepted sample is therefore rejection sampling from

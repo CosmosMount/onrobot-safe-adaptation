@@ -77,17 +77,18 @@ class _SelectingQSafe:
         return states
 
 
-def test_finetune_qsafe_preserves_candidate_zero_until_it_is_rejected():
+def test_v2_finetune_qsafe_preserves_candidate_zero_until_it_is_rejected():
     class ActionRisk(torch.nn.Module):
         def forward(self, states, actions):
             del states
             return actions[..., :1]
 
     qsafe = object.__new__(QSafe)
-    qsafe.version = 1
+    qsafe.version = 2
     qsafe.phase = "finetune"
     qsafe.epsilon = 0.5
     qsafe.online = ActionRisk()
+    qsafe.observation_normalizer = _IdentityNormalizer()
     states = torch.zeros((3, 2))
     candidates = torch.tensor(
         [
@@ -110,6 +111,36 @@ def test_finetune_qsafe_preserves_candidate_zero_until_it_is_rejected():
     )
     assert metrics["qsafe/action_change_fraction"] == pytest.approx(2 / 3)
     assert metrics["qsafe/safety_intervention_fraction"] == pytest.approx(2 / 3)
+
+
+def test_legacy_finetune_qsafe_uses_original_equation3_sampling():
+    class ActionRisk(torch.nn.Module):
+        def forward(self, states, actions):
+            del states
+            return actions[..., :1]
+
+    qsafe = object.__new__(QSafe)
+    qsafe.version = 1
+    qsafe.phase = "finetune"
+    qsafe.epsilon = 0.5
+    qsafe.online = ActionRisk()
+    candidates = torch.tensor(
+        [
+            [[0.1], [0.2], [0.3]],
+            [[0.9], [0.2], [0.1]],
+            [[0.9], [0.8], [0.95]],
+        ]
+    )
+    log_probabilities = torch.tensor(
+        [[-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0], [-10.0, -1.0, 0.0]]
+    )
+    torch.manual_seed(0)
+
+    _, selected, _ = qsafe.select_safe_action(
+        torch.zeros((3, 2)), candidates, log_probabilities
+    )
+
+    torch.testing.assert_close(selected, torch.tensor([2, 2, 1]))
 
 
 def _action_sampling_model():
