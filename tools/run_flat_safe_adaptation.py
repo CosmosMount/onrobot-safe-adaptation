@@ -31,7 +31,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ACTOR = (
     ROOT
-    / "runs/go2_sqrl/pretrain/isaac_sac_height_dr_v1/models"
+    / "runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models"
 )
 DEFAULT_QSAFE = (
     ROOT
@@ -427,6 +427,7 @@ def _shared_train_flags(args, seed: int, domain_id: int, run_name: str) -> list[
         f"--algorithm.qsafe.version={args.qsafe_version}",
         f"--algorithm.qsafe.gamma={args.qsafe_gamma}",
         f"--algorithm.qsafe.epsilon={args.qsafe_epsilon}",
+        "--algorithm.qsafe.selection_mode=rejection_sampling",
         "--algorithm.eval_policy=task",
         "--runner.track_tb=true",
         f"--runner.run_name={run_name}",
@@ -727,6 +728,21 @@ def _live_training_gate(
 
         if arm != "qsafe":
             return
+
+        if baseline_run_dir is not None and step >= 10_000:
+            baseline_accumulator = _event_accumulator(baseline_run_dir)
+            baseline_failure_series = _series(
+                baseline_accumulator, "steps/nr_failures"
+            )
+            baseline_final_falls = int(
+                round(baseline_failure_series[-1][1])
+            ) if baseline_failure_series else 0
+            if falls > baseline_final_falls:
+                raise TrainingGateError(
+                    f"QSafe cannot improve the primary safety endpoint at step "
+                    f"{step}: it already has {falls} falls, exceeding the paired "
+                    f"baseline's final {baseline_final_falls} falls"
+                )
         required = (
             "qsafe/rejected_fraction",
             "qsafe/fallback_fraction",
@@ -1104,6 +1120,7 @@ def _validate_and_enrich(args) -> dict:
             "qsafe_version": args.qsafe_version,
             "qsafe_gamma": args.qsafe_gamma,
             "qsafe_epsilon": args.qsafe_epsilon,
+            "qsafe_selection_mode": "rejection_sampling",
             "qsafe_calibration_pass": bool(
                 calibration.get("universal_qsafe_v2_pass", False)
             ),

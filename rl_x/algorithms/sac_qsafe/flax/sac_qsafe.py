@@ -294,6 +294,13 @@ class SAC_QSafe:
         self._qsafe_shadow_key = jax.random.PRNGKey(
             np.uint32((int(self.seed) + 0x51AFE) % (2**32))
         )
+        # Replacement candidates must not consume the actor/learner RNG. This
+        # keeps candidate zero identical to the SAC arm until QSafe actually
+        # rejects it, which is the paired experiment's common-random-number
+        # contract.
+        self._qsafe_candidate_key = jax.random.PRNGKey(
+            np.uint32((int(self.seed) + 0x5AFECAFE) % (2**32))
+        )
         self._qsafe_reset_masks = {}
         self._last_qsafe_observations = {}
         shadow_output = str(
@@ -469,9 +476,80 @@ class SAC_QSafe:
                 selection_key,
             )
 
+        def rejection_candidates(
+            params,
+            raw_states,
+            mean,
+            std,
+            epsilon,
+            key,
+            candidate_key,
+        ):
+            """Draw candidate zero from the exact SAC RNG, replacements separately."""
+
+            states = self._normalize_kernel(raw_states, mean, std, epsilon)
+            action_mean, action_logstd = self.policy.apply(params, states)
+            action_std = jnp.exp(action_logstd)
+
+            # These two lines intentionally match ``unconstrained`` so the
+            # no-QSafe action and protected candidate zero are bit-identical
+            # while their states and policies remain equal.
+            key, action_key = jax.random.split(key)
+            base_pretanh = action_mean + action_std * jax.random.normal(
+                action_key, shape=action_mean.shape
+            )
+
+            candidate_key, replacement_key, selection_key = jax.random.split(
+                candidate_key, 3
+            )
+            if self.qsafe.candidate_actions > 1:
+                replacement_count = self.qsafe.candidate_actions - 1
+                replacement_mean = jnp.repeat(
+                    action_mean[:, None, :], replacement_count, axis=1
+                )
+                replacement_logstd = jnp.repeat(
+                    action_logstd[:, None, :], replacement_count, axis=1
+                )
+                replacement_pretanh = replacement_mean + jnp.exp(
+                    replacement_logstd
+                ) * jax.random.normal(
+                    replacement_key, shape=replacement_mean.shape
+                )
+                pretanh = jnp.concatenate(
+                    (base_pretanh[:, None, :], replacement_pretanh), axis=1
+                )
+            else:
+                pretanh = base_pretanh[:, None, :]
+
+            candidate_mean = jnp.repeat(
+                action_mean[:, None, :], self.qsafe.candidate_actions, axis=1
+            )
+            candidate_logstd = jnp.repeat(
+                action_logstd[:, None, :], self.qsafe.candidate_actions, axis=1
+            )
+            raw_candidate_actions = jnp.tanh(pretanh)
+            applied_candidate_actions = self._project_flat_candidates(
+                raw_states, raw_candidate_actions
+            )
+            log_probs = squashed_gaussian_log_probability(
+                pretanh, candidate_mean, candidate_logstd
+            )
+            return (
+                states,
+                raw_candidate_actions,
+                applied_candidate_actions,
+                log_probs,
+                key,
+                candidate_key,
+                selection_key,
+            )
+
         self._deterministic_action_jit = jax.jit(deterministic)
         self._unconstrained_action_jit = jax.jit(unconstrained)
         self._candidate_distribution_jit = jax.jit(candidates)
+        self._rejection_candidate_distribution_jit = jax.jit(
+            rejection_candidates
+        )
 
     def _normalizer_parameters(self):
         return self.observation_normalizer.parameters()
@@ -504,16 +582,38 @@ class SAC_QSafe:
             self.key,
         )
         if self.qsafe_observer_enabled:
-            states, _, applied_candidates, log_probs, _, selection_key = (
-                self._candidate_distribution_jit(
+            if (
+                self.phase == "finetune"
+                and self.qsafe.resolved_selection_mode() == "rejection_sampling"
+            ):
+                (
+                    states,
+                    _,
+                    applied_candidates,
+                    log_probs,
+                    _,
+                    _,
+                    selection_key,
+                ) = self._rejection_candidate_distribution_jit(
                     self.policy_state.params,
                     dummy_states,
                     mean,
                     std,
                     epsilon,
                     self.key,
+                    self._qsafe_candidate_key,
                 )
-            )
+            else:
+                states, _, applied_candidates, log_probs, _, selection_key = (
+                    self._candidate_distribution_jit(
+                        self.policy_state.params,
+                        dummy_states,
+                        mean,
+                        std,
+                        epsilon,
+                        self.key,
+                    )
+                )
             qsafe_states = (
                 jnp.zeros(
                     (nr_envs, self.qsafe.observation_shape[0]),
@@ -588,21 +688,44 @@ class SAC_QSafe:
     def _sample_policy_candidates(self, states, phase=None, stream="task"):
         raw_states = jnp.asarray(states, dtype=jnp.float32)
         mean, std, epsilon = self._normalizer_parameters()
-        (
-            normalized_states,
-            raw_candidate_actions,
-            applied_candidate_actions,
-            log_probs,
-            self.key,
-            selection_key,
-        ) = self._candidate_distribution_jit(
-            self.policy_state.params,
-            raw_states,
-            mean,
-            std,
-            epsilon,
-            self.key,
-        )
+        phase = phase or self.phase
+        if (
+            phase == "finetune"
+            and self.qsafe.resolved_selection_mode() == "rejection_sampling"
+        ):
+            (
+                normalized_states,
+                raw_candidate_actions,
+                applied_candidate_actions,
+                log_probs,
+                self.key,
+                self._qsafe_candidate_key,
+                selection_key,
+            ) = self._rejection_candidate_distribution_jit(
+                self.policy_state.params,
+                raw_states,
+                mean,
+                std,
+                epsilon,
+                self.key,
+                self._qsafe_candidate_key,
+            )
+        else:
+            (
+                normalized_states,
+                raw_candidate_actions,
+                applied_candidate_actions,
+                log_probs,
+                self.key,
+                selection_key,
+            ) = self._candidate_distribution_jit(
+                self.policy_state.params,
+                raw_states,
+                mean,
+                std,
+                epsilon,
+                self.key,
+            )
         if not self._projector_is_jax and self._host_project_actions is not None:
             nr_envs, nr_candidates = raw_candidate_actions.shape[:2]
             repeated_states = np.repeat(
@@ -619,7 +742,6 @@ class SAC_QSafe:
             ).reshape(
                 raw_candidate_actions.shape
             )
-        phase = phase or self.phase
         if phase == "pretrain":
             select = self.qsafe._select_pretrain_jit
         elif phase == "finetune":

@@ -126,6 +126,20 @@ class QSafe:
         self.version = int(getattr(self.config, "version", 1))
         if self.version not in (1, 2):
             raise ValueError("algorithm.qsafe.version must be 1 or 2.")
+        configured_selection_mode = str(
+            getattr(self.config, "selection_mode", "auto")
+        )
+        self.selection_mode = configured_selection_mode
+        if self.selection_mode not in (
+            "auto",
+            "legacy_density_resample",
+            "rejection_sampling",
+        ):
+            raise ValueError(
+                "algorithm.qsafe.selection_mode must be 'auto', "
+                "'legacy_density_resample', or 'rejection_sampling'."
+            )
+
         self.checkpoint_version = self.version
         self.epsilon = float(self.config.epsilon)
         self.gamma = float(self.config.gamma)
@@ -256,6 +270,16 @@ class QSafe:
             self.load(checkpoint_path, load_optimizer=False)
         if self.phase == "finetune":
             self.freeze()
+
+    def resolved_selection_mode(self):
+        configured = getattr(self, "selection_mode", "auto")
+        if configured == "auto":
+            return (
+                "legacy_density_resample"
+                if self.version == 1
+                else "rejection_sampling"
+            )
+        return configured
 
     def add_transition(self, states, actions, next_states, failures, terminations, truncations):
         if not self.frozen:
@@ -435,21 +459,18 @@ class QSafe:
         if pretrain:
             scores = jnp.where(safe_mask, q_values, -jnp.inf)
             selected = jnp.argmax(scores, axis=1)
-        elif self.version == 1:
-            # Preserve the original SQRL Equation-3 implementation used by
-            # the successfully completed legacy policy/QSafe pretrain and
-            # fine-tune experiments: mask unsafe candidates, then sample the
-            # retained set according to the task-policy log probabilities.
+        elif self.resolved_selection_mode() == "legacy_density_resample":
+            # Historical implementation retained for reproducing completed
+            # experiments. Because candidates are already drawn from pi, this
+            # second density weighting samples approximately from pi^2.
             logits = candidate_log_probs.reshape((nr_envs, nr_candidates))
             logits = jnp.where(safe_mask, logits, -jnp.inf)
             logits = jnp.where(fallback[:, None], jnp.zeros_like(logits), logits)
             selected = jax.random.categorical(selection_key, logits, axis=-1)
         else:
-            # Candidate actions are already IID task-policy samples. Selecting
-            # the first safe proposal is exact finite rejection sampling and
-            # preserves candidate zero whenever it is safe. Reweighting by
-            # candidate_log_probs here would incorrectly sample proportional
-            # to pi^2 and perturb the actor without a safety intervention.
+            # Candidate actions are IID task-policy samples. Selecting the
+            # first safe proposal is exact finite rejection sampling from Eq. 3
+            # and preserves candidate zero whenever it is safe.
             del selection_key
             candidate_indices = jnp.broadcast_to(
                 jnp.arange(nr_candidates)[None, :], (nr_envs, nr_candidates)

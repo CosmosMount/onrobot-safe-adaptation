@@ -107,6 +107,20 @@ class QSafe:
         self.version = int(getattr(self.config, "version", 1))
         if self.version not in (1, 2):
             raise ValueError("algorithm.qsafe.version must be 1 or 2.")
+        configured_selection_mode = str(
+            getattr(self.config, "selection_mode", "auto")
+        )
+        self.selection_mode = configured_selection_mode
+        if self.selection_mode not in (
+            "auto",
+            "legacy_density_resample",
+            "rejection_sampling",
+        ):
+            raise ValueError(
+                "algorithm.qsafe.selection_mode must be 'auto', "
+                "'legacy_density_resample', or 'rejection_sampling'."
+            )
+
         self.checkpoint_version = self.version
         self.epsilon = float(self.config.epsilon)
         self.gamma = float(self.config.gamma)
@@ -207,6 +221,16 @@ class QSafe:
             self.load(checkpoint_path, load_optimizer=False)
         if self.phase == "finetune":
             self.freeze()
+
+    def resolved_selection_mode(self):
+        configured = getattr(self, "selection_mode", "auto")
+        if configured == "auto":
+            return (
+                "legacy_density_resample"
+                if self.version == 1
+                else "rejection_sampling"
+            )
+        return configured
 
     def add_transition(self, states, actions, next_states, failures, terminations, truncations):
         if not self.frozen:
@@ -343,9 +367,13 @@ class QSafe:
                 safe_mask, q_values, torch.full_like(q_values, -torch.inf)
             )
             selected = boundary_scores.argmax(dim=1)
-        elif phase == "finetune" and self.version == 1:
-            # Preserve the original SQRL Equation-3 implementation used to
-            # produce and validate the legacy policy/QSafe checkpoint pair.
+        elif (
+            phase == "finetune"
+            and self.resolved_selection_mode() == "legacy_density_resample"
+        ):
+            # Historical implementation retained for reproducing completed
+            # experiments. The second policy-density weighting changes the
+            # already sampled candidate distribution from pi toward pi^2.
             logits = candidate_log_probs.reshape(nr_envs, nr_candidates)
             masked_logits = torch.where(
                 safe_mask, logits, torch.full_like(logits, -torch.inf)
@@ -357,12 +385,8 @@ class QSafe:
                 logits=masked_logits
             ).sample()
         elif phase == "finetune":
-            # Candidates are already IID samples from the task policy.  The
-            # first accepted sample is therefore rejection sampling from
-            # pi(a|s) conditioned on QSafe < epsilon.  Weighting these samples
-            # by their policy density a second time would instead approximate
-            # pi(a|s)^2 and would change the actor even when candidate zero is
-            # safe.
+            # Candidates are IID samples from the task policy. The first
+            # accepted sample is exact finite rejection sampling from Eq. 3.
             candidate_indices = torch.arange(
                 nr_candidates, device=candidate_actions.device
             )[None, :].expand(nr_envs, -1)

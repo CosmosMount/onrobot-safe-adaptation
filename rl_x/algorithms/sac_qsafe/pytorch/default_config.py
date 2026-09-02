@@ -89,6 +89,11 @@ def get_config(algorithm_name):
     config.qsafe.tau = 0.005
     config.qsafe.buffer_size = 100000
     config.qsafe.batch_size = 256
+    # ``auto`` preserves historical checkpoints: legacy-v1 uses the old
+    # density-resampling implementation while v2 uses exact rejection
+    # sampling.  Experiments may explicitly select ``rejection_sampling`` for
+    # a legacy critic without changing or retraining that critic.
+    config.qsafe.selection_mode = "auto"
     # The paper does not publish the finite rejection pool size.  The verified
     # Go2 reproduction uses 100 candidates and ten recent complete rollouts.
     config.qsafe.candidate_actions = 100

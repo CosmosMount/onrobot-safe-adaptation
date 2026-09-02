@@ -31,7 +31,7 @@ def _args():
 
 def test_defaults_reuse_the_verified_v9_flat_artifacts():
     assert DEFAULT_ACTOR.name == "models"
-    assert DEFAULT_ACTOR.parent.name == "isaac_sac_height_dr_v1"
+    assert DEFAULT_ACTOR.parent.name == "isaac_sqrl_height_dr_v1"
     assert DEFAULT_QSAFE.name == "qsafe.model"
     assert DEFAULT_QSAFE.parent.parent.name == "isaac_sqrl_height_dr_v1"
 
@@ -53,6 +53,7 @@ def test_paired_train_commands_only_toggle_qsafe():
     assert "--algorithm.finetune_actor_update_interval=10" in baseline
     assert "--algorithm.task_utd_ratio=1.0" in baseline
     assert "--algorithm.alpha_init=0.0002" in baseline
+    assert "--algorithm.qsafe.selection_mode=rejection_sampling" in baseline
     assert "--algorithm.eval_policy=task" in baseline
     assert "--environment.action_profile=legacy_v1" in _task_flags()
     assert "--environment.foot_clearance_reward_scale=0.0" in _task_flags()

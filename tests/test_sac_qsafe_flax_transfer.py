@@ -493,3 +493,88 @@ def test_flax_legacy_finetune_qsafe_uses_original_equation3_sampling():
     )
 
     np.testing.assert_array_equal(np.asarray(selected), np.asarray([1, 1, 1]))
+
+
+def test_flax_legacy_critic_can_use_equation3_rejection_sampling():
+    class ActionRisk:
+        @staticmethod
+        def apply(params, states, actions):
+            del params, states
+            return actions[..., :1]
+
+    qsafe = object.__new__(QSafe)
+    qsafe.version = 1
+    qsafe.selection_mode = "rejection_sampling"
+    qsafe.epsilon = 0.5
+    qsafe.network = ActionRisk()
+    candidates = jnp.asarray(
+        [
+            [[0.1], [0.2], [0.3]],
+            [[0.9], [0.2], [0.1]],
+            [[0.9], [0.8], [0.95]],
+        ],
+        dtype=jnp.float32,
+    )
+    selected_actions, selected, metrics = qsafe._select_kernel(
+        None,
+        jnp.zeros((3, 2), dtype=jnp.float32),
+        candidates,
+        jnp.zeros((3, 3), dtype=jnp.float32),
+        jax.random.PRNGKey(0),
+        pretrain=False,
+    )
+
+    np.testing.assert_array_equal(np.asarray(selected), np.asarray([0, 1, 1]))
+    np.testing.assert_allclose(
+        np.asarray(selected_actions).reshape(-1), np.asarray([0.1, 0.2, 0.8])
+    )
+    assert float(metrics["qsafe/action_change_fraction"]) == pytest.approx(2 / 3)
+
+
+def test_flax_rejection_pool_candidate_zero_matches_sac_rng_exactly():
+    class GaussianPolicy:
+        @staticmethod
+        def apply(params, states):
+            del params
+            return jnp.zeros((states.shape[0], 2)), jnp.full(
+                (states.shape[0], 2), -0.4
+            )
+
+    model = object.__new__(SAC_QSafe)
+    model.policy = GaussianPolicy()
+    model.qsafe = SimpleNamespace(candidate_actions=4)
+    model._jax_project_actions = lambda states, actions: actions
+    model._build_action_kernels()
+
+    states = jnp.zeros((2, 3), dtype=jnp.float32)
+    mean = jnp.zeros((1, 3), dtype=jnp.float32)
+    std = jnp.ones((1, 3), dtype=jnp.float32)
+    actor_key = jax.random.PRNGKey(17)
+    candidate_key = jax.random.PRNGKey(29)
+    unconstrained, next_actor_key = model._unconstrained_action_jit(
+        None, states, mean, std, 1e-8, actor_key
+    )
+    (
+        _,
+        candidates,
+        _,
+        _,
+        paired_next_actor_key,
+        _,
+        _,
+    ) = model._rejection_candidate_distribution_jit(
+        None,
+        states,
+        mean,
+        std,
+        1e-8,
+        actor_key,
+        candidate_key,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(candidates[:, 0]), np.asarray(unconstrained)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(paired_next_actor_key), np.asarray(next_actor_key)
+    )

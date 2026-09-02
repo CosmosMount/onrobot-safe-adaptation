@@ -61,9 +61,12 @@ transferred from pre-training. The task critics and targets, entropy
 temperature, `D_offline`, every optimizer state, and the safety multiplier
 `nu` are initialized from scratch. Every
 fine-tuning interaction uses the projected policy from Eq. 3. Candidate actions
-are sampled from the original policy, unsafe candidates are masked, and the
-remaining candidates are importance-sampled using their original policy log
-probabilities; if none is safe, the minimum-risk candidate is used. The actor
+are sampled from the original policy and the first candidate below the safety
+threshold is accepted, which is finite rejection sampling from the actor
+conditioned on safety; if none is safe, the minimum-risk candidate is used. The
+historical double-density selector remains available as
+`qsafe.selection_mode=legacy_density_resample` for experiment reproduction.
+The actor
 is updated with Eq. 4 using an unconstrained differentiable policy sample, while
 the task critic still uses task reward only. QSafe has no trainable optimizer in
 this phase. Setting `qsafe.enabled=false` is the SAC ablation: it disables both

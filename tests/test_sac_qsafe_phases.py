@@ -143,6 +143,38 @@ def test_legacy_finetune_qsafe_uses_original_equation3_sampling():
     torch.testing.assert_close(selected, torch.tensor([2, 2, 1]))
 
 
+def test_legacy_critic_can_use_equation3_rejection_sampling():
+    class ActionRisk(torch.nn.Module):
+        def forward(self, states, actions):
+            del states
+            return actions[..., :1]
+
+    qsafe = object.__new__(QSafe)
+    qsafe.version = 1
+    qsafe.selection_mode = "rejection_sampling"
+    qsafe.phase = "finetune"
+    qsafe.epsilon = 0.5
+    qsafe.online = ActionRisk()
+    candidates = torch.tensor(
+        [
+            [[0.1], [0.2], [0.3]],
+            [[0.9], [0.2], [0.1]],
+            [[0.9], [0.8], [0.95]],
+        ]
+    )
+    selected_actions, selected, metrics = qsafe.select_safe_action(
+        torch.zeros((3, 2)),
+        candidates,
+        torch.zeros((3, 3)),
+    )
+
+    torch.testing.assert_close(selected, torch.tensor([0, 1, 1]))
+    torch.testing.assert_close(
+        selected_actions.reshape(-1), torch.tensor([0.1, 0.2, 0.8])
+    )
+    assert metrics["qsafe/action_change_fraction"] == pytest.approx(2 / 3)
+
+
 def _action_sampling_model():
     model = object.__new__(SAC_QSafe)
     model.device = torch.device("cpu")
