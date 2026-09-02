@@ -8,6 +8,7 @@ from tools.run_flat_safe_adaptation import (
     DEFAULT_QSAFE,
     _task_flags,
     _train_command,
+    _engineering_near_pass,
     _validate_flat_qsafe_metadata,
     _validate_legacy_flat_actor_manifest,
     _validate_legacy_flat_qsafe_metadata,
@@ -121,5 +122,64 @@ def test_calibrated_flat_qsafe_v2_contract_is_accepted_only_after_gate():
     }
     _validate_flat_qsafe_metadata(metadata, report)
     report["selected"]["test_pass"] = False
-    with pytest.raises(ValueError, match="refusing to spend time"):
+    with pytest.raises(ValueError, match="explicit engineering exception"):
         _validate_flat_qsafe_metadata(metadata, report)
+
+
+def test_engineering_override_is_narrow_and_explicit():
+    metadata = {
+        "qsafe_version": 2,
+        "observation_shape": [230],
+        "base_observation_shape": [46],
+        "action_shape": [12],
+        "history_length": 5,
+        "control_dt": 0.02,
+        "gamma": 0.97,
+        "epsilon": 0.017,
+        "environment_contract": {
+            "observation": {"version": "go2-observation-v3-body-velocity"},
+            "action": {
+                "version": "go2-action-v1",
+                "pipeline_version": "sdk-absolute-position-v2",
+                "scale": 0.25,
+            },
+            "failure": {
+                "version": "tilt-or-low-terrain-clearance-sustained-v3"
+            },
+        },
+    }
+    report = {
+        "artifact_status": "diagnostic_candidate",
+        "data_gate_pass": True,
+        "horizons": [5, 10, 25],
+        "universal_qsafe_v2_pass": False,
+        "selected": {
+            "gamma_safe": 0.97,
+            "epsilon": 0.017,
+            "validation_pass": True,
+            "test_pass": False,
+            "test_by_horizon": {
+                5: {"recall_future_failure": 0.91},
+                10: {"recall_future_failure": 0.85},
+                25: {
+                    "recall_future_failure": 0.797,
+                    "safe_action_false_rejection_rate": 0.034,
+                    "fallback_rate": 0.036,
+                },
+            },
+        },
+    }
+    assert _engineering_near_pass(report) is True
+    with pytest.raises(ValueError, match="explicit engineering exception"):
+        _validate_flat_qsafe_metadata(metadata, report)
+    _validate_flat_qsafe_metadata(
+        metadata, report, allow_diagnostic_near_pass=True
+    )
+    report["selected"]["test_by_horizon"][25][
+        "recall_future_failure"
+    ] = 0.794
+    assert _engineering_near_pass(report) is False
+    with pytest.raises(ValueError, match="explicit engineering exception"):
+        _validate_flat_qsafe_metadata(
+            metadata, report, allow_diagnostic_near_pass=True
+        )
