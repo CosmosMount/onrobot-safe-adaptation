@@ -24,6 +24,7 @@ from rl_x.algorithms.qsafe.common import (
 )
 from rl_x.algorithms.sac_qsafe.pytorch.default_config import get_config
 from tools.run_universal_qsafe_actor_stage import high_v2_training_command
+from tools.run_flat_safe_adaptation import TrainingGateError, _live_training_gate
 from tools.run_sqrl_ablation import (
     build_parser as build_ablation_parser,
     mujoco_sac_train_command,
@@ -75,6 +76,32 @@ def test_sqrl_defaults_match_paper_settings():
     assert config.qsafe.gamma == pytest.approx(0.7)
     assert config.qsafe.paired_candidate_evaluation is False
     assert config.evaluation_results_path == ""
+
+
+def test_flat_live_gate_stops_three_early_immobile_windows(tmp_path):
+    gate = _live_training_gate("no_qsafe", tmp_path)
+
+    for step, velocity in ((6_000, 0.03), (7_000, 0.01)):
+        gate(
+            {
+                "steps/nr_env_steps": step,
+                "steps/nr_critic_updates": step - 1_000,
+                "steps/nr_actor_updates": 0,
+                "steps/nr_alpha_updates": 0,
+                "env_info/forward_velocity": velocity,
+            }
+        )
+
+    with pytest.raises(TrainingGateError, match="locomotion collapsed"):
+        gate(
+            {
+                "steps/nr_env_steps": 8_000,
+                "steps/nr_critic_updates": 7_000,
+                "steps/nr_actor_updates": 0,
+                "steps/nr_alpha_updates": 0,
+                "env_info/forward_velocity": 0.02,
+            }
+        )
 
 
 def test_zero_shot_uses_the_sqrl_projected_policy_on_flat_ground():

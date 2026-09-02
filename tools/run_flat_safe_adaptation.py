@@ -699,12 +699,16 @@ def _live_training_gate(
         velocity = metrics.get("env_info/forward_velocity", float("nan"))
         if math.isfinite(velocity):
             velocity_history.append((step, velocity))
-        if step >= 30_000:
+        # Actor updates do not begin until 10k.  Three consecutive near-zero
+        # windows after the first 5k therefore indicate a real environment or
+        # action-selection collapse, not normal actor adaptation.  Stop early
+        # instead of wasting the remainder of a long robot-in-the-loop run.
+        if step >= 5_000:
             recent_velocity = [value for _, value in velocity_history[-3:]]
             if len(recent_velocity) == 3 and max(recent_velocity) < 0.10:
                 raise TrainingGateError(
                     f"{arm} locomotion collapsed: the last three logged velocities "
-                    f"at/after 30k are {recent_velocity} m/s"
+                    f"at/after 5k are {recent_velocity} m/s"
                 )
 
         falls = int(metrics.get("steps/nr_failures", 0))

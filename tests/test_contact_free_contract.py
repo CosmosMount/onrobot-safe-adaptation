@@ -505,6 +505,40 @@ def test_automatic_reset_retries_a_dropped_x11_key():
     assert environment._generation == 1
 
 
+def test_stuck_flat_truncation_physically_resets_but_healthy_motion_does_not():
+    environment = object.__new__(Go2SDKMujocoEnv)
+    environment.config = SimpleNamespace(
+        terrain_profile="flat",
+        auto_reset_after_stuck=True,
+    )
+    resets = []
+    logical_resets = []
+    physical_observation = np.asarray([2.0], dtype=np.float32)
+
+    environment._auto_reset_simulator = lambda reason: resets.append(reason)
+    environment.reset = lambda: (physical_observation[None, :], {})
+    environment._logical_reset = lambda observation: (
+        logical_resets.append(np.asarray(observation).copy())
+        or np.asarray(observation).copy()
+    )
+
+    stuck_observation = environment._reset_after_truncation(
+        np.asarray([1.0], dtype=np.float32),
+        stuck=True,
+    )
+    np.testing.assert_array_equal(stuck_observation, physical_observation)
+    assert resets == ["Stuck flat-ground episode completed."]
+    assert logical_resets == []
+
+    moving_observation = np.asarray([3.0], dtype=np.float32)
+    returned = environment._reset_after_truncation(
+        moving_observation,
+        stuck=False,
+    )
+    np.testing.assert_array_equal(returned, moving_observation)
+    assert len(logical_resets) == 1
+
+
 def test_auto_reset_arms_home_before_reset_and_skips_crouch_trajectory():
     events = []
 

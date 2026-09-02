@@ -26,6 +26,11 @@ def get_config(environment_name):
     config.manual_reset_timeout = -1.0
     config.auto_reset_on_start = True
     config.auto_reset_after_fall = True
+    # A flat-ground time-limit normally keeps the physical trajectory
+    # continuous.  A non-falling but immobile terminal state is different: if
+    # it is only logically reset, the next episode starts in the same stuck
+    # posture and can remain there indefinitely.
+    config.auto_reset_after_stuck = True
     config.fall_auto_reset_delay_seconds = 1.0
     config.auto_reset_timeout_seconds = 10.0
     # Re-arm tick rollback detection and retry the software reset request if

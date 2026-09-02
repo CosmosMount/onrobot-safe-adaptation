@@ -411,6 +411,17 @@ class Go2SDKMujocoEnv:
         self.episode.reset()
         return np.asarray(observation, dtype=np.float32).copy()
 
+    def _reset_after_truncation(self, observation, *, stuck: bool):
+        """Apply episodic reset semantics without resetting healthy flat motion."""
+
+        if str(self.config.terrain_profile) == "single_step_up":
+            self._auto_reset_simulator("Step-scene episode completed.")
+            return self.reset()[0][0]
+        if bool(stuck) and bool(self.config.auto_reset_after_stuck):
+            self._auto_reset_simulator("Stuck flat-ground episode completed.")
+            return self.reset()[0][0]
+        return self._logical_reset(observation)
+
     def step(self, actions):
         action = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_SIZE)[0]
         blend_seconds = float(self.config.policy_blend_seconds)
@@ -750,11 +761,11 @@ class Go2SDKMujocoEnv:
             }
             if terminated:
                 observation = self._manual_failure_reset()
-            elif str(self.config.terrain_profile) == "single_step_up":
-                self._auto_reset_simulator("Step-scene episode completed.")
-                observation = self.reset()[0][0]
             else:
-                observation = self._logical_reset(observation)
+                observation = self._reset_after_truncation(
+                    observation,
+                    stuck=bool(stuck),
+                )
             info["episode_return"] = np.asarray(
                 [terminal_info["episode_return"]], dtype=np.float32
             )
