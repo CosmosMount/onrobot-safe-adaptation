@@ -7,9 +7,7 @@ from .sdk_client import SDKClient
 
 def create_train_and_eval_env(config):
     client = SDKClient(config.environment.domain_id, config.environment.interface)
-    reset_controller = MujocoResetController(
-        window_title=config.environment.mujoco_window_title
-    )
+    reset_controller = MujocoResetController(config.environment.domain_id)
     train_env = Go2SDKMujocoEnv(
         config, client=client, role="train", reset_controller=reset_controller
     )

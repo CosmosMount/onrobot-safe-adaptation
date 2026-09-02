@@ -27,8 +27,34 @@ from src.environments.go2_sqrl.common.specs import (
 from src.environments.go2_sqrl.common.types import RobotState, TrainingState
 from src.environments.go2_sqrl.sdk2_mujoco.env import Go2SDKMujocoEnv
 from src.environments.go2_sqrl.sdk2_mujoco.default_config import get_config
+from src.environments.go2_sqrl.sdk2_mujoco.reset_controller import (
+    MujocoResetController,
+)
 from src.environments.go2_sqrl.sdk2_mujoco.sdk_client import decode_low_state
 from src.environments.go2_sqrl.sdk2_mujoco.state_buffer import StateBuffer
+
+
+def test_mujoco_reset_controller_uses_domain_scoped_software_channel(monkeypatch):
+    sent = []
+
+    class DatagramClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def sendto(self, payload, path):
+            sent.append((payload, path))
+
+    monkeypatch.setattr(
+        "src.environments.go2_sqrl.sdk2_mujoco.reset_controller.socket.socket",
+        lambda *_args: DatagramClient(),
+    )
+    controller = MujocoResetController(domain_id=32)
+    controller.reset()
+
+    assert sent == [(b"reset", str(controller.socket_path))]
 
 
 def _fake_low_state():

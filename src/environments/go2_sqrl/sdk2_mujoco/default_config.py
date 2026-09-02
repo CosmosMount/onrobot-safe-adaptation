@@ -28,11 +28,9 @@ def get_config(environment_name):
     config.auto_reset_after_fall = True
     config.fall_auto_reset_delay_seconds = 1.0
     config.auto_reset_timeout_seconds = 10.0
-    # X11 synthetic key events can occasionally be dropped by the visible
-    # simulator window. Re-arm tick rollback detection and retry the shortcut
-    # instead of terminating a long online run on one missed event.
+    # Re-arm tick rollback detection and retry the software reset request if
+    # the simulator does not acknowledge it with a fresh physics epoch.
     config.auto_reset_attempts = 3
-    config.mujoco_window_title = "MuJoCo"
     # Two-stage linear stand-up copied from the proven Go2 controller in the
     # reference repository: current pose -> folded/crouched keyframe -> home.
     config.standup_pose_1 = [

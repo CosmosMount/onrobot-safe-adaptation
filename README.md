@@ -26,6 +26,12 @@ The simulator command locates the existing `unitree_mujoco` checkout under the
 adjacent `modules/` directory. Override that location only when necessary with
 `UNITREE_MUJOCO_ROOT=/path/to/unitree_mujoco`.
 
+The SDK training reset path is software-controlled and does not synthesize
+keyboard input. Run `python tools/patch_unitree_mujoco_software_reset.py` and
+rebuild the sibling checkout's `simulate/build/unitree_mujoco` binary. The
+training process sends a domain-scoped local reset request; the simulator
+services it in the physics thread with `mj_resetDataKeyframe(home)`.
+
 ## Environment Setup 
 
 ### Installation

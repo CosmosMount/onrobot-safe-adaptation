@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,10 @@ from .config import (
     PROJECT_ROOT,
     RUN_PRESETS,
     find_unitree_mujoco_root,
+)
+from .environments.go2_sqrl.sdk2_mujoco.reset_controller import (
+    SOFTWARE_RESET_SIGNAL,
+    reset_socket_path,
 )
 
 
@@ -44,8 +49,30 @@ def _simulator_command(args) -> int:
         "-n",
         args.interface,
     ]
+    reset_path = reset_socket_path(args.domain_id)
+    reset_path.unlink(missing_ok=True)
+    reset_server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    reset_server.bind(str(reset_path))
+    reset_server.settimeout(0.2)
     print("Starting:", " ".join(command), flush=True)
-    return subprocess.run(command, cwd=simulate, env=environment, check=False).returncode
+    process = subprocess.Popen(command, cwd=simulate, env=environment)
+    try:
+        while process.poll() is None:
+            try:
+                request = reset_server.recv(64)
+            except socket.timeout:
+                continue
+            if request != b"reset":
+                print(
+                    f"Ignoring unknown MuJoCo control request: {request!r}",
+                    flush=True,
+                )
+                continue
+            process.send_signal(SOFTWARE_RESET_SIGNAL)
+        return process.wait()
+    finally:
+        reset_server.close()
+        reset_path.unlink(missing_ok=True)
 
 
 def _artifact_flags(

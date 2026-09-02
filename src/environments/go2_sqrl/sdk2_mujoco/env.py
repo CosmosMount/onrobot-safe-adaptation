@@ -103,9 +103,7 @@ class Go2SDKMujocoEnv:
         self.action_space = self.single_action_space
         self.client = client or SDKClient(environment.domain_id, environment.interface)
         if reset_controller is None and isinstance(self.client, SDKClient):
-            reset_controller = MujocoResetController(
-                window_title=environment.mujoco_window_title
-            )
+            reset_controller = MujocoResetController(environment.domain_id)
         self.reset_controller = reset_controller
         self.action_contract = action_profile(environment.action_profile)
         self.action_mapper = ActionMapper(
@@ -280,8 +278,8 @@ class Go2SDKMujocoEnv:
                     )
         else:
             raise RuntimeError(
-                f"MuJoCo received {attempts} automatic reset key attempts, but "
-                "no simulator tick restart was observed."
+                f"MuJoCo received {attempts} software reset requests, but no "
+                "simulator tick restart was observed."
             ) from last_timeout
         self._last_tick = None
         self.fall_detector.reset()
