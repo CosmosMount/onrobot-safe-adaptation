@@ -578,3 +578,105 @@ def test_flax_rejection_pool_candidate_zero_matches_sac_rng_exactly():
     np.testing.assert_array_equal(
         np.asarray(paired_next_actor_key), np.asarray(next_actor_key)
     )
+
+
+def test_legacy_shadow_observer_uses_actor_normalized_state():
+    captured = {}
+
+    class LegacyQSafe:
+        version = 1
+        epsilon = 0.1
+
+        @staticmethod
+        def candidate_values(states, actions, normalized=False):
+            captured["states"] = np.asarray(states)
+            captured["normalized"] = normalized
+            return jnp.zeros(actions.shape[:2], dtype=jnp.float32)
+
+        @staticmethod
+        def rollout_observations(*args, **kwargs):
+            raise AssertionError("legacy shadow must not use raw rollout observations")
+
+    model = object.__new__(SAC_QSafe)
+    model.policy_state = SimpleNamespace(params=None)
+    model.qsafe = LegacyQSafe()
+    model._qsafe_shadow_key = jax.random.PRNGKey(0)
+    model._qsafe_reset_masks = {}
+    model._projector_is_jax = True
+    model._host_project_actions = None
+    model._normalizer_parameters = lambda: (
+        jnp.zeros((1, 2), dtype=jnp.float32),
+        jnp.ones((1, 2), dtype=jnp.float32),
+        jnp.asarray(1e-8, dtype=jnp.float32),
+    )
+    normalized_states = jnp.asarray([[3.0, -2.0]], dtype=jnp.float32)
+    candidates = jnp.zeros((1, 2, 1), dtype=jnp.float32)
+    model._candidate_distribution_jit = lambda *args: (
+        normalized_states,
+        candidates,
+        candidates,
+        jnp.zeros((1, 2), dtype=jnp.float32),
+        jax.random.PRNGKey(1),
+        jax.random.PRNGKey(2),
+    )
+    model._jax_project_actions = lambda states, actions: actions
+    model._host_project = lambda states, actions: actions
+
+    model._observe_qsafe_without_intervention(
+        np.asarray([[10.0, 20.0]], dtype=np.float32),
+        jnp.zeros((1, 1), dtype=jnp.float32),
+    )
+
+    np.testing.assert_array_equal(captured["states"], normalized_states)
+    assert captured["normalized"] is True
+
+
+def test_stochastic_task_evaluation_bypasses_qsafe_candidates():
+    model = object.__new__(SAC_QSafe)
+    calls = []
+    model._sample_deterministic_action = lambda states: (
+        calls.append("deterministic"),
+        "deterministic_action",
+    )
+    model._sample_unconstrained_action = lambda states: (
+        calls.append("stochastic"),
+        "stochastic_action",
+    )
+    model._sample_policy_candidates = lambda states, stream: (
+        calls.append(("safe", stream)),
+        "safe_action",
+        {"qsafe/fallback_fraction": jnp.asarray(0.25)},
+    )
+
+    action, metrics = model._sample_evaluation_action(None, "stochastic_task")
+
+    assert action == "stochastic_action"
+    assert metrics == {}
+    assert calls == ["stochastic"]
+
+
+def test_safe_evaluation_returns_selection_metrics():
+    model = object.__new__(SAC_QSafe)
+    model._sample_policy_candidates = lambda states, stream: (
+        "raw_action",
+        "safe_action",
+        {"qsafe/fallback_fraction": jnp.asarray(0.25)},
+    )
+
+    action, metrics = model._sample_evaluation_action(None, "safe")
+
+    assert action == "safe_action"
+    assert float(metrics["qsafe/fallback_fraction"]) == pytest.approx(0.25)
+
+
+def test_flax_msgpack_accepts_json_normalized_calibration_horizon_keys():
+    report = {"selected": {"test_by_horizon": {5: {"recall": 0.8}}}}
+    normalized = sac_qsafe_module.json.loads(
+        sac_qsafe_module.json.dumps(report)
+    )
+
+    restored = flax.serialization.msgpack_restore(
+        flax.serialization.msgpack_serialize(normalized)
+    )
+
+    assert restored["selected"]["test_by_horizon"]["5"]["recall"] == 0.8

@@ -48,7 +48,9 @@ def get_config(algorithm_name):
     config.logging_frequency = 50000
     config.evaluation_frequency = -1
     config.evaluation_episodes = 10
-    config.eval_policy = "safe"  # safe, task
+    # Flax target diagnostics additionally support stochastic_task for a
+    # fixed-actor action-selection A/B. PyTorch collection keeps using task.
+    config.eval_policy = "safe"  # safe, task, stochastic_task (Flax only)
     # Optional machine-readable episode results for paired protection and
     # milestone evaluations. Empty keeps ordinary evaluation side-effect free.
     config.evaluation_results_path = ""

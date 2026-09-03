@@ -1,0 +1,431 @@
+{
+  "dataset": {
+    "contract": {
+      "action": {
+        "armature": 0.0,
+        "backend_offset_semantics": "shared_default_position",
+        "control_dt": 0.02,
+        "default_position": [
+          0.0,
+          0.8999999761581421,
+          -1.7999999523162842,
+          0.0,
+          0.8999999761581421,
+          -1.7999999523162842,
+          0.0,
+          0.8999999761581421,
+          -1.7999999523162842,
+          0.0,
+          0.8999999761581421,
+          -1.7999999523162842
+        ],
+        "effort_limit": 23.5,
+        "joint_damping": 0.0,
+        "joint_friction": 0.0,
+        "joint_order": [
+          "FR_hip",
+          "FR_thigh",
+          "FR_calf",
+          "FL_hip",
+          "FL_thigh",
+          "FL_calf",
+          "RR_hip",
+          "RR_thigh",
+          "RR_calf",
+          "RL_hip",
+          "RL_thigh",
+          "RL_calf"
+        ],
+        "kd": 0.5,
+        "kp": 25.0,
+        "max_target_rate": 12.0,
+        "pipeline_version": "sdk-absolute-position-v2",
+        "scale": 0.25,
+        "size": 12,
+        "target_semantics": "absolute_joint_position",
+        "velocity_limit": 1000.0,
+        "version": "go2-action-v1"
+      },
+      "action_shape": [
+        12
+      ],
+      "base_observation_shape": [
+        46
+      ],
+      "control_dt": 0.02,
+      "dataset_version": 2,
+      "failure": {
+        "aggregation": "tilt_or_low_base",
+        "angle_threshold": 0.8,
+        "consecutive_frames": 5,
+        "external_contact_sensor": false,
+        "frame_dt": 0.002,
+        "frame_unit": "physics_frames",
+        "min_base_clearance": 0.18,
+        "signal": [
+          "imu_quaternion_roll_pitch",
+          "base_clearance_above_local_terrain"
+        ],
+        "version": "tilt-or-low-terrain-clearance-sustained-v3"
+      },
+      "history_length": 5,
+      "observation": {
+        "body_velocity": {
+          "frame": "body",
+          "indices": [
+            27,
+            30
+          ],
+          "source": "proprioceptive_velocity_estimator"
+        },
+        "joint_order": [
+          "FR_hip",
+          "FR_thigh",
+          "FR_calf",
+          "FL_hip",
+          "FL_thigh",
+          "FL_calf",
+          "RR_hip",
+          "RR_thigh",
+          "RR_calf",
+          "RL_hip",
+          "RL_thigh",
+          "RL_calf"
+        ],
+        "quaternion_order": "WXYZ",
+        "size": 46,
+        "velocity_estimator": {
+          "external_contact_sensor": false,
+          "inputs": [
+            "joint_q",
+            "joint_dq",
+            "imu_gyro",
+            "imu_quat",
+            "imu_accelerometer"
+          ],
+          "policy_visible": true,
+          "version": "contact-free-robust-kf-v1"
+        },
+        "version": "go2-observation-v3-body-velocity"
+      },
+      "safety_observation_shape": [
+        230
+      ]
+    },
+    "path": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/qsafe_datasets/legacy_v1_diagnostic/source_sqrl_noise15",
+    "selected_trajectories": 140,
+    "selected_transitions": 68300,
+    "split": "all",
+    "statistics": {
+      "by_split": {
+        "test": {
+          "fall": 9,
+          "stuck": 20,
+          "success": 107,
+          "trajectories": 140,
+          "transitions": 68300
+        },
+        "train": {
+          "fall": 0,
+          "stuck": 0,
+          "success": 0,
+          "trajectories": 0,
+          "transitions": 0
+        },
+        "validation": {
+          "fall": 0,
+          "stuck": 0,
+          "success": 0,
+          "trajectories": 0,
+          "transitions": 0
+        }
+      },
+      "fall": 9,
+      "stuck": 20,
+      "success": 107,
+      "trajectories": 140,
+      "transitions": 68300
+    }
+  },
+  "diagnostic_version": 1,
+  "discount_context": {
+    "10": {
+      "gamma_power": 0.028247524899999984,
+      "physical_seconds": 0.2
+    },
+    "25": {
+      "gamma_power": 0.00013410686196639628,
+      "physical_seconds": 0.5
+    },
+    "5": {
+      "gamma_power": 0.16806999999999994,
+      "physical_seconds": 0.1
+    }
+  },
+  "interpretation": {
+    "partial_separation_not_enough_for_all_horizons": "The critic only separates some horizons. A threshold can change intervention frequency but cannot create missing ranking information.",
+    "retrain_qsafe": "No requested horizon meets the ranking/false-rejection gate; do not continue SAC fine-tuning with this checkpoint.",
+    "threshold_only_candidate": "All requested horizons separate imminent-fall and normal states; validate the proposed threshold on held-out trajectories before use."
+  },
+  "qsafe": {
+    "checkpoint_epsilon": 0.1,
+    "evaluated_epsilon": 0.1,
+    "metadata": {
+      "action_shape": [
+        12
+      ],
+      "checkpoint_version": 1,
+      "epsilon": 0.1,
+      "gamma": 0.7,
+      "max_trajectories": 10,
+      "nr_hidden_units": 256,
+      "observation_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45
+      ],
+      "observation_shape": [
+        46
+      ]
+    },
+    "optimizer_updates": 171,
+    "output_activation": "tanh",
+    "path": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models/qsafe.model",
+    "sha256": "774edbfded5ac4732b7ad22951c620774a5d43c07b5b08c1a982d20078283e73"
+  },
+  "results": {
+    "source": {
+      "all_scores": {
+        "max": 0.5023192763328552,
+        "mean": 0.03115508784941784,
+        "median": 0.02839763183146715,
+        "min": -0.13647103309631348,
+        "p10": -0.012833706103265285,
+        "p90": 0.0745368294417858,
+        "p95": 0.09512081854045384,
+        "p99": 0.15929224744439058,
+        "samples": 68300,
+        "std": 0.039948147443472755
+      },
+      "decision": "retrain_qsafe",
+      "horizons": [
+        {
+          "all_non_imminent": {
+            "max": 0.5023192763328552,
+            "mean": 0.031086425829300764,
+            "median": 0.028377462178468704,
+            "min": -0.13647103309631348,
+            "p10": -0.012835836224257945,
+            "p90": 0.07437150627374649,
+            "p95": 0.0948537446558475,
+            "p99": 0.1583962288498882,
+            "samples": 68255,
+            "std": 0.03975622778635893
+          },
+          "current_epsilon": {
+            "normal_false_rejection_rate": 0.03726717557251909,
+            "recall_imminent_fall": 0.6666666666666666,
+            "threshold": 0.1
+          },
+          "horizon_steps": 5,
+          "imminent_fall": {
+            "max": 0.4488033652305603,
+            "mean": 0.13530011414032844,
+            "median": 0.11543901264667511,
+            "min": -0.05731331929564476,
+            "p10": 0.018148776888847352,
+            "p90": 0.3247628211975098,
+            "p95": 0.42442964911460856,
+            "p99": 0.4487107479572296,
+            "samples": 45,
+            "std": 0.11808648797911012
+          },
+          "normal_group_used": "transitions_from_complete_no_fall_episodes",
+          "normal_safe_episodes": {
+            "max": 0.5023192763328552,
+            "mean": 0.03039185624134519,
+            "median": 0.02810729295015335,
+            "min": -0.13380704820156097,
+            "p10": -0.012481745984405277,
+            "p90": 0.07222154885530471,
+            "p95": 0.09095002077519887,
+            "p99": 0.15329385593533518,
+            "samples": 65500,
+            "std": 0.03840389180036123
+          },
+          "roc_auc": 0.825714673452078,
+          "separable_gate": {
+            "passed": false,
+            "requirements": "ROC-AUC >= 0.80, recall >= 0.80, normal false rejection <= 0.20"
+          },
+          "threshold_at_minimum_80pct_recall": {
+            "normal_false_rejection_rate": 0.37170992366412214,
+            "recall_imminent_fall": 0.8,
+            "threshold": 0.038106512278318405
+          }
+        },
+        {
+          "all_non_imminent": {
+            "max": 0.5023192763328552,
+            "mean": 0.031034844019899543,
+            "median": 0.02836647816002369,
+            "min": -0.13647103309631348,
+            "p10": -0.012836201302707195,
+            "p90": 0.07430688366293907,
+            "p95": 0.09474725648760794,
+            "p99": 0.15801989004015932,
+            "samples": 68210,
+            "std": 0.03961339096789327
+          },
+          "current_epsilon": {
+            "normal_false_rejection_rate": 0.03726717557251909,
+            "recall_imminent_fall": 0.5111111111111111,
+            "threshold": 0.1
+          },
+          "horizon_steps": 10,
+          "imminent_fall": {
+            "max": 0.4488033652305603,
+            "mean": 0.12228655019878513,
+            "median": 0.10122460871934891,
+            "min": -0.05731331929564476,
+            "p10": 0.003983062459155919,
+            "p90": 0.31751391291618364,
+            "p95": 0.4044778719544409,
+            "p99": 0.4486160257458687,
+            "samples": 90,
+            "std": 0.11604037580932017
+          },
+          "normal_group_used": "transitions_from_complete_no_fall_episodes",
+          "normal_safe_episodes": {
+            "max": 0.5023192763328552,
+            "mean": 0.03039185624134519,
+            "median": 0.02810729295015335,
+            "min": -0.13380704820156097,
+            "p10": -0.012481745984405277,
+            "p90": 0.07222154885530471,
+            "p95": 0.09095002077519887,
+            "p99": 0.15329385593533518,
+            "samples": 65500,
+            "std": 0.03840389180036123
+          },
+          "roc_auc": 0.8038115351993215,
+          "separable_gate": {
+            "passed": false,
+            "requirements": "ROC-AUC >= 0.80, recall >= 0.80, normal false rejection <= 0.20"
+          },
+          "threshold_at_minimum_80pct_recall": {
+            "normal_false_rejection_rate": 0.3324732824427481,
+            "recall_imminent_fall": 0.8,
+            "threshold": 0.04137705639004707
+          }
+        },
+        {
+          "all_non_imminent": {
+            "max": 0.5023192763328552,
+            "mean": 0.03086993375364419,
+            "median": 0.028318360447883606,
+            "min": -0.13647103309631348,
+            "p10": -0.012853454053401945,
+            "p90": 0.0740819826722145,
+            "p95": 0.09417589083313942,
+            "p99": 0.1564090904593465,
+            "samples": 68075,
+            "std": 0.03923941555814119
+          },
+          "current_epsilon": {
+            "normal_false_rejection_rate": 0.03726717557251909,
+            "recall_imminent_fall": 0.49333333333333335,
+            "threshold": 0.1
+          },
+          "horizon_steps": 25,
+          "imminent_fall": {
+            "max": 0.4488033652305603,
+            "mean": 0.1174300437151558,
+            "median": 0.09821101278066635,
+            "min": -0.06444098055362701,
+            "p10": 0.006208281777799131,
+            "p90": 0.2931426584720611,
+            "p95": 0.33618401288986205,
+            "p99": 0.4368183314800262,
+            "samples": 225,
+            "std": 0.10539513684909615
+          },
+          "normal_group_used": "transitions_from_complete_no_fall_episodes",
+          "normal_safe_episodes": {
+            "max": 0.5023192763328552,
+            "mean": 0.03039185624134519,
+            "median": 0.02810729295015335,
+            "min": -0.13380704820156097,
+            "p10": -0.012481745984405277,
+            "p90": 0.07222154885530471,
+            "p95": 0.09095002077519887,
+            "p99": 0.15329385593533518,
+            "samples": 65500,
+            "std": 0.03840389180036123
+          },
+          "roc_auc": 0.7984795250212045,
+          "separable_gate": {
+            "passed": false,
+            "requirements": "ROC-AUC >= 0.80, recall >= 0.80, normal false rejection <= 0.20"
+          },
+          "threshold_at_minimum_80pct_recall": {
+            "normal_false_rejection_rate": 0.4050229007633588,
+            "recall_imminent_fall": 0.8,
+            "threshold": 0.03533731773495674
+          }
+        }
+      ],
+      "normalizer": {
+        "count": 300032,
+        "enabled": true,
+        "epsilon": 1e-08,
+        "name": "source",
+        "path": "/home/xyz/code/works/onrobot-safe-adaptation/runs/go2_sqrl/pretrain/isaac_sqrl_height_dr_v1/models/policy.model",
+        "sha256": "1e78ed22d6ee18719c44f8643777598f3c5c604b53b09af262d1a851116315ce"
+      }
+    }
+  }
+}

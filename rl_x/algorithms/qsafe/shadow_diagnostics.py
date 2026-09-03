@@ -41,8 +41,59 @@ def _roc_auc(positives: np.ndarray, negatives: np.ndarray) -> float | None:
     return float(np.mean((wins + 0.5 * ties) / ordered.size))
 
 
-def build_shadow_report(arrays: dict[str, np.ndarray], epsilon: float) -> dict:
+def _threshold_report(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    epsilon: float,
+    candidate_scores: np.ndarray,
+) -> dict:
+    """Threshold metrics for legacy Q values that are not probabilities."""
+
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    labels = np.asarray(labels, dtype=bool).reshape(-1)
+    candidates = np.asarray(candidate_scores, dtype=np.float64)
+    if scores.shape != labels.shape or not scores.size:
+        raise ValueError("Scores and labels must be non-empty aligned vectors.")
+    if candidates.ndim != 2 or candidates.shape[0] != scores.size:
+        raise ValueError("candidate_scores must have shape [samples, candidates].")
+    if not np.all(np.isfinite(scores)) or not np.all(np.isfinite(candidates)):
+        raise ValueError("QSafe scores must be finite.")
+    positives = labels
+    rejected = scores >= float(epsilon)
+    return {
+        "recall_future_failure": (
+            float(np.mean(rejected[positives])) if np.any(positives) else float("nan")
+        ),
+        "safe_action_false_rejection_rate": (
+            float(np.mean(rejected[~positives]))
+            if np.any(~positives)
+            else float("nan")
+        ),
+        "fallback_rate": float(
+            np.mean(np.all(candidates >= float(epsilon), axis=1))
+        ),
+        "epsilon": float(epsilon),
+        "samples": int(labels.size),
+        "positive_rate": float(np.mean(labels)),
+        # ECE and Brier scores have probability semantics and are deliberately
+        # undefined for the legacy tanh value head.
+        "ece": None,
+        "brier_score": None,
+        "constant_failure_rate_brier": None,
+        "brier_improvement": None,
+    }
+
+
+def build_shadow_report(
+    arrays: dict[str, np.ndarray],
+    epsilon: float,
+    *,
+    score_semantics: str = "probability",
+) -> dict:
     """Compare QSafe scores before target-domain falls and on normal episodes."""
+
+    if score_semantics not in ("probability", "tanh_value"):
+        raise ValueError("score_semantics must be 'probability' or 'tanh_value'.")
 
     required = {
         "env_index",
@@ -114,12 +165,20 @@ def build_shadow_report(arrays: dict[str, np.ndarray], epsilon: float) -> dict:
         normal_mask = safe_episode if np.any(safe_episode) else ~labels
         positive_scores = scores[labels]
         normal_scores = scores[normal_mask]
-        report = calibration_report(
-            scores,
-            labels.astype(np.float32),
-            epsilon,
-            candidate_probabilities=candidate_q,
-        )
+        if score_semantics == "probability":
+            report = calibration_report(
+                scores,
+                labels.astype(np.float32),
+                epsilon,
+                candidate_probabilities=candidate_q,
+            )
+        else:
+            report = _threshold_report(
+                scores,
+                labels,
+                epsilon,
+                candidate_q,
+            )
         report.update(
             imminent_fall_scores=_summary(positive_scores),
             normal_scores=_summary(normal_scores),
@@ -145,6 +204,7 @@ def build_shadow_report(arrays: dict[str, np.ndarray], epsilon: float) -> dict:
             "enough_target_falls" if fall_episode_count >= 5 else "insufficient_target_falls"
         ),
         "epsilon_unchanged": float(epsilon),
+        "score_semantics": score_semantics,
         "transitions": int(scores.size),
         "fall_episodes": int(fall_episode_count),
         "complete_safe_episodes": int(complete_safe_episode_count),
@@ -176,11 +236,19 @@ def build_shadow_report(arrays: dict[str, np.ndarray], epsilon: float) -> dict:
 class ShadowQSafeRecorder:
     """Record frozen-QSafe scores without changing the action sent to the env."""
 
-    def __init__(self, path: str | Path, nr_envs: int, epsilon: float):
+    def __init__(
+        self,
+        path: str | Path,
+        nr_envs: int,
+        epsilon: float,
+        *,
+        score_semantics: str = "probability",
+    ):
         self.path = Path(path)
         self.report_path = self.path.with_suffix(".report.json")
         self.nr_envs = int(nr_envs)
         self.epsilon = float(epsilon)
+        self.score_semantics = score_semantics
         self.episode_ids = np.zeros(self.nr_envs, dtype=np.int64)
         self._records: dict[str, list[np.ndarray]] = {}
 
@@ -189,10 +257,12 @@ class ShadowQSafeRecorder:
         *,
         global_step: int,
         states,
+        next_states,
         applied_actions,
         failure,
         terminated,
         truncated,
+        candidate_actions,
         candidate_q,
         candidate_best_action_l2,
         observation_abs_z_p95,
@@ -209,10 +279,14 @@ class ShadowQSafeRecorder:
             "env_index": np.arange(self.nr_envs, dtype=np.int32),
             "episode_id": self.episode_ids.copy(),
             "state": np.asarray(states, dtype=np.float32),
+            "next_state": np.asarray(next_states, dtype=np.float32),
             "applied_action": np.asarray(applied_actions, dtype=np.float32),
             "failure": np.asarray(failure, dtype=bool),
             "done": done,
             "executed_q": candidate_q[:, 0],
+            "candidate_actions": np.asarray(
+                candidate_actions, dtype=np.float32
+            ),
             "candidate_q": candidate_q,
             "candidate_best_action_l2": np.asarray(
                 candidate_best_action_l2, dtype=np.float32
@@ -238,7 +312,11 @@ class ShadowQSafeRecorder:
         if not self._records:
             return None
         arrays = self.arrays()
-        report = build_shadow_report(arrays, self.epsilon)
+        report = build_shadow_report(
+            arrays,
+            self.epsilon,
+            score_semantics=self.score_semantics,
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp.npz")
         np.savez_compressed(temporary, **arrays)

@@ -374,7 +374,11 @@ def _candidate_rank(reports):
 
 def train(args):
     dataset = SafetyTrajectoryDataset(args.dataset)
-    dataset.validate_isolation()
+    nonisolated_diagnostic = bool(
+        getattr(args, "allow_nonisolated_diagnostic_data", False)
+    )
+    if not nonisolated_diagnostic:
+        dataset.validate_isolation()
     statistics = dataset.statistics()
     minimum_outcomes = {
         "train": int(args.min_train_outcomes),
@@ -471,6 +475,7 @@ def train(args):
     report = {
         "dataset": str(Path(args.dataset).resolve()),
         "statistics": statistics,
+        "split_isolation_enforced": not nonisolated_diagnostic,
         "data_gate_pass": data_gate,
         "horizon_steps": int(primary_horizon),
         "horizons": list(horizons),
@@ -490,7 +495,10 @@ def train(args):
             "test_pass": test_pass,
         },
         "universal_qsafe_v2_pass": bool(
-            data_gate and validation_pass and test_pass
+            not nonisolated_diagnostic
+            and data_gate
+            and validation_pass
+            and test_pass
         ),
     }
     report["status"] = (
@@ -498,7 +506,7 @@ def train(args):
     )
     report["artifact_status"] = (
         "calibrated_candidate"
-        if validation_pass and test_pass
+        if not nonisolated_diagnostic and validation_pass and test_pass
         else "diagnostic_candidate"
     )
     qsafe.calibration_report = report
@@ -533,6 +541,15 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("gpu", "cpu"), default="gpu")
     parser.add_argument("--allow-incomplete-data", action="store_true")
+    parser.add_argument(
+        "--allow-nonisolated-diagnostic-data",
+        action="store_true",
+        help=(
+            "Permit train/validation/test trajectories from one behavior actor "
+            "for a target-fit diagnostic only. The resulting artifact can never "
+            "receive universal-QSafe PASS status."
+        ),
+    )
     parser.add_argument("--diagnostic-continue", action="store_true")
     parser.add_argument(
         "--checkpoint-name",

@@ -50,10 +50,12 @@ def test_shadow_recorder_writes_recoverable_npz_and_report(tmp_path: Path):
         recorder.add(
             global_step=step,
             states=np.zeros((1, 2), dtype=np.float32),
+            next_states=np.ones((1, 2), dtype=np.float32),
             applied_actions=np.zeros((1, 1), dtype=np.float32),
             failure=np.asarray([step == 2]),
             terminated=np.asarray([step == 2]),
             truncated=np.asarray([False]),
+            candidate_actions=np.zeros((1, 2, 1), dtype=np.float32),
             candidate_q=np.asarray([[0.2, 0.05]], dtype=np.float32),
             candidate_best_action_l2=np.asarray([0.4], dtype=np.float32),
             observation_abs_z_p95=np.asarray([1.2], dtype=np.float32),
@@ -67,4 +69,22 @@ def test_shadow_recorder_writes_recoverable_npz_and_report(tmp_path: Path):
     assert report["transitions"] == 3
     with np.load(path) as arrays:
         assert arrays["candidate_q"].shape == (3, 2)
+        assert arrays["candidate_actions"].shape == (3, 2, 1)
+        assert arrays["next_state"].shape == (3, 2)
         assert arrays["failure"].tolist() == [False, False, True]
+
+
+def test_shadow_report_supports_legacy_tanh_scores():
+    arrays = _synthetic_arrays()
+    arrays["executed_q"] = arrays["executed_q"] - 0.2
+    arrays["candidate_q"] = arrays["candidate_q"] - 0.2
+
+    report = build_shadow_report(
+        arrays,
+        epsilon=0.1,
+        score_semantics="tanh_value",
+    )
+
+    assert report["score_semantics"] == "tanh_value"
+    assert report["horizons"]["25"]["ece"] is None
+    assert report["horizons"]["25"]["roc_auc"] == 1.0

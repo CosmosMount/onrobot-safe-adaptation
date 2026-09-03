@@ -311,6 +311,11 @@ class SAC_QSafe:
                 shadow_output or Path(run_path) / "qsafe_shadow.npz",
                 self.nr_envs,
                 self.qsafe.epsilon,
+                score_semantics=(
+                    "probability"
+                    if self.qsafe.output_activation == "sigmoid"
+                    else "tanh_value"
+                ),
             )
             if self.qsafe_shadow_enabled
             else None
@@ -685,6 +690,24 @@ class SAC_QSafe:
         applied_actions = self._host_project(states, applied_actions)
         return raw_actions, self.get_processed_action(applied_actions)
 
+    def _sample_evaluation_action(self, states, eval_policy):
+        """Sample an evaluation action while keeping policy weights frozen."""
+
+        if eval_policy == "task":
+            _, processed_action = self._sample_deterministic_action(states)
+            return processed_action, {}
+        if eval_policy == "stochastic_task":
+            _, processed_action = self._sample_unconstrained_action(states)
+            return processed_action, {}
+        if eval_policy == "safe":
+            _, processed_action, safety_metrics = self._sample_policy_candidates(
+                states, stream="eval"
+            )
+            return processed_action, safety_metrics
+        raise ValueError(
+            "algorithm.eval_policy must be 'task', 'stochastic_task', or 'safe'"
+        )
+
     def _sample_policy_candidates(self, states, phase=None, stream="task"):
         raw_states = jnp.asarray(states, dtype=jnp.float32)
         mean, std, epsilon = self._normalizer_parameters()
@@ -798,7 +821,7 @@ class SAC_QSafe:
         raw_states = jnp.asarray(states, dtype=jnp.float32)
         mean, std, epsilon = self._normalizer_parameters()
         (
-            _,
+            normalized_states,
             raw_candidate_actions,
             applied_candidate_actions,
             _,
@@ -835,14 +858,20 @@ class SAC_QSafe:
         applied_candidate_actions = applied_candidate_actions.at[:, 0].set(
             executed_applied
         )
-        safety_observations = self.qsafe.rollout_observations(
-            np.asarray(states, dtype=np.float32),
-            reset_mask=self._qsafe_reset_masks.pop("shadow", None),
-            stream="shadow",
-        )
-        safety_observations = self.qsafe.normalize_observations(
-            safety_observations
-        )
+        if self.qsafe.version == 1:
+            # Legacy QSafe was trained on the actor-normalized 46D state. Keep
+            # the non-intervening observer on exactly the same input contract
+            # as the active selector in ``_sample_policy_candidates``.
+            safety_observations = normalized_states
+        else:
+            safety_observations = self.qsafe.rollout_observations(
+                np.asarray(states, dtype=np.float32),
+                reset_mask=self._qsafe_reset_masks.pop("shadow", None),
+                stream="shadow",
+            )
+            safety_observations = self.qsafe.normalize_observations(
+                safety_observations
+            )
         q_values = self.qsafe.candidate_values(
             safety_observations,
             applied_candidate_actions,
@@ -876,6 +905,9 @@ class SAC_QSafe:
             ),
         }
         pending = {
+            "candidate_actions": np.asarray(
+                jax.device_get(applied_candidate_actions), dtype=np.float32
+            ),
             "candidate_q": np.asarray(jax.device_get(q_values)),
             "candidate_best_action_l2": np.asarray(
                 jax.device_get(best_action_l2)
@@ -1282,6 +1314,7 @@ class SAC_QSafe:
                     self._qsafe_shadow_recorder.add(
                         global_step=global_step,
                         states=acting_state,
+                        next_states=actual_next_state,
                         applied_actions=applied_action,
                         failure=failure,
                         terminated=terminated,
@@ -1691,8 +1724,11 @@ class SAC_QSafe:
             payload["qsafe_normalizer_metadata"] = (
                 self.qsafe.observation_normalizer.metadata()
             )
-            payload["qsafe_calibration_report"] = dict(
-                self.qsafe.calibration_report
+            # Flax restores msgpack with strict string map keys. Offline
+            # calibration reports index horizons with integers, so normalize
+            # the report through JSON before embedding it in a checkpoint.
+            payload["qsafe_calibration_report"] = json.loads(
+                json.dumps(self.qsafe.calibration_report)
             )
         model_file_path = os.path.join(self.save_path, model_file_name)
         with open(model_file_path, "wb") as model_file:
@@ -1819,12 +1855,15 @@ class SAC_QSafe:
     def test(self, episodes):
         self.set_eval_mode()
         eval_policy = str(self.config.algorithm.eval_policy)
-        if eval_policy not in ("task", "safe"):
-            raise ValueError("algorithm.eval_policy must be 'task' or 'safe'")
+        if eval_policy not in ("task", "stochastic_task", "safe"):
+            raise ValueError(
+                "algorithm.eval_policy must be 'task', 'stochastic_task', or 'safe'"
+            )
         if eval_policy == "safe" and not self.qsafe_enabled:
             raise ValueError("Safe evaluation requires algorithm.qsafe.enabled=true")
         gait_results = []
         episode_records = []
+        suite_qsafe_values = {}
         for i in range(episodes):
             done = False
             episode_return = 0
@@ -1835,18 +1874,20 @@ class SAC_QSafe:
             estimated_forward_velocity_sum = 0.0
             velocity_estimation_error_sum = 0.0
             target_velocity_error_sum = 0.0
+            episode_qsafe_values = {}
             gait_metrics = GaitEvaluationMetrics()
             state, _ = self.eval_env.reset()
             if self.qsafe_enabled:
                 self.qsafe.clear_rollout_history("eval")
                 self._qsafe_reset_masks.pop("eval", None)
             while not done:
-                if eval_policy == "task":
-                    _, processed_action = self._sample_deterministic_action(state)
-                else:
-                    _, processed_action, _ = self._sample_policy_candidates(
-                        state, stream="eval"
-                    )
+                processed_action, safety_metrics = self._sample_evaluation_action(
+                    state, eval_policy
+                )
+                for key, value in safety_metrics.items():
+                    scalar = float(np.mean(np.asarray(jax.device_get(value))))
+                    episode_qsafe_values.setdefault(key, []).append(scalar)
+                    suite_qsafe_values.setdefault(key, []).append(scalar)
                 try:
                     state, reward, terminated, truncated, info = self.eval_env.step(
                         jax.device_get(processed_action)
@@ -1942,6 +1983,10 @@ class SAC_QSafe:
                         if forward_velocity_samples
                         else float("nan")
                     ),
+                    "qsafe_metrics": {
+                        key: float(np.mean(values))
+                        for key, values in episode_qsafe_values.items()
+                    },
                     **gait_result,
                 }
             )
@@ -1954,6 +1999,10 @@ class SAC_QSafe:
                 "episodes": episode_records,
                 "policy": eval_policy,
                 "checkpoint": str(self.config.runner.load_model),
+                "qsafe_metrics": {
+                    key: float(np.mean(values))
+                    for key, values in suite_qsafe_values.items()
+                },
             }
             temporary = destination.with_suffix(destination.suffix + ".tmp")
             temporary.write_text(
